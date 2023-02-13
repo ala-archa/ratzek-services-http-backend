@@ -5,3 +5,5 @@ ipset_shaper_name: shaper
 ipset_acl_name: acl
 http_listen: 0.0.0.0:8888
 bytes_unlimited_limit: 5000000
+
+blacklisted_macs: []
