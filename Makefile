@@ -10,5 +10,8 @@ debug-build:
 release-build:
 	cargo build --release
 
-generate-release:
-	git tag v$(convco version --bump)
+release-prepare:
+	set-cargo-version ./Cargo.toml `convco version --bump`
+
+release:
+	git tag v`convco version --bump`
