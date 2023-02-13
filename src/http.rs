@@ -117,7 +117,7 @@ async fn client_register(config: Data<Config>, req: HttpRequest) -> Result<Strin
 
     info!("Request from {}:{}", client_ip, client_addr.port());
 
-    let ipset_acl = crate::ipset::IPSet::new(&config.ipset_shaper_name);
+    let ipset_acl = crate::ipset::IPSet::new(&config.ipset_acl_name);
 
     if let Err(err) = ipset_acl.add(&client_ip) {
         error!("Unable to add client to ACL ipset: {}", err);

@@ -65,9 +65,14 @@ impl IPSet {
     }
 
     pub fn add(&self, entry: &str) -> Result<()> {
-        let _ = std::process::Command::new("ipset")
+        let r = std::process::Command::new("ipset")
             .args(&["add", &self.name, entry])
             .output()?;
+
+        if !r.status.success() {
+            bail!("Got non-zero exit code")
+        }
+
         Ok(())
     }
 }
