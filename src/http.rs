@@ -71,7 +71,7 @@ async fn client_get(config: Data<Config>, req: HttpRequest) -> Result<String, AP
 
     info!("Request from {}", client_ip);
 
-    let ipset_acl = crate::ipset::IPSet::new(&config.ipset_shaper_name);
+    let ipset_acl = crate::ipset::IPSet::new(&config.ipset_acl_name);
     let acl_entries = match ipset_acl.entries() {
         Ok(v) => v,
         Err(err) => {
