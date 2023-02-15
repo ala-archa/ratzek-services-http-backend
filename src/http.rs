@@ -51,18 +51,25 @@ struct ServiceInfo {
     pub internet_clients_connected: usize,
 }
 
+fn client_ip(req: &HttpRequest) -> Option<String> {
+    req.headers()
+        .get("x-real-ip")
+        .map(|v| v.to_str().ok().map(|v| v.to_string()))
+        .flatten()
+        .or_else(|| req.peer_addr().map(|v| v.ip().to_string()))
+}
+
 #[get("/api/v1/client")]
 async fn client_get(config: Data<Config>, req: HttpRequest) -> Result<String, APIError> {
-    let client_addr = match req.peer_addr() {
+    let client_ip = match client_ip(&req) {
         Some(v) => v,
         None => {
             error!("Unable to get client IP");
             return Err(APIError::InternalError);
         }
     };
-    let client_ip = client_addr.ip().to_string();
 
-    info!("Request from {}:{}", client_ip, client_addr.port());
+    info!("Request from {}", client_ip);
 
     let ipset_acl = crate::ipset::IPSet::new(&config.ipset_shaper_name);
     let acl_entries = match ipset_acl.entries() {
@@ -106,16 +113,15 @@ async fn client_get(config: Data<Config>, req: HttpRequest) -> Result<String, AP
 
 #[post("/api/v1/client")]
 async fn client_register(config: Data<Config>, req: HttpRequest) -> Result<String, APIError> {
-    let client_addr = match req.peer_addr() {
+    let client_ip = match client_ip(&req) {
         Some(v) => v,
         None => {
             error!("Unable to get client IP");
             return Err(APIError::InternalError);
         }
     };
-    let client_ip = client_addr.ip().to_string();
 
-    info!("Request from {}:{}", client_ip, client_addr.port());
+    info!("Request from {}", client_ip);
 
     let ipset_acl = crate::ipset::IPSet::new(&config.ipset_acl_name);
 
