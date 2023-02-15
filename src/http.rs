@@ -35,7 +35,8 @@ impl actix_web::error::ResponseError for APIError {
 struct ClientConnectionInfo {
     pub bytes_sent: usize,
     pub bytes_unlimited_limit: usize,
-    pub shaper_reset_timeout: u64,
+    pub shaper_reset_secs: u64,
+    pub connection_forget_secs: u64,
 }
 
 #[derive(Serialize)]
@@ -89,16 +90,17 @@ async fn client_get(config: Data<Config>, req: HttpRequest) -> Result<String, AP
         }
     };
 
-    let is_user_in_acl = acl_entries.iter().any(|v| v.ip == client_ip);
-    let internet_connection_status = if is_user_in_acl {
+    let acl_info = acl_entries.iter().find(|v| v.ip == client_ip);
+    let internet_connection_status = if let Some(acl_info) = acl_info {
         let shaper_info = shaper_entries.iter().find(|v| v.ip == client_ip);
 
         InternetConnectionStatus::Connected(ClientConnectionInfo {
             bytes_sent: shaper_info.and_then(|v| v.bytes).unwrap_or_default(),
             bytes_unlimited_limit: config.bytes_unlimited_limit,
-            shaper_reset_timeout: shaper_info
+            shaper_reset_secs: shaper_info
                 .and_then(|v| v.timeout.map(|v| v.as_secs()))
                 .unwrap_or_default(),
+            connection_forget_secs: acl_info.timeout.map(|v| v.as_secs()).unwrap_or_default(),
         })
     } else {
         InternetConnectionStatus::Inactive
