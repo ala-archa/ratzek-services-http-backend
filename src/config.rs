@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +35,7 @@ pub struct Config {
     pub bytes_unlimited_limit: usize,
     // TODO not implemented
     pub blacklisted_macs: Vec<String>,
+    pub wide_network_ip: IpAddr,
 }
 
 impl Config {

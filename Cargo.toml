@@ -25,3 +25,5 @@ slog-syslog = { path = "custom-vendored/slog-syslog" }
 
 actix-web = "4.3"
 derive_more = "0.99"
+surge-ping = "0.7"
+tokio = "1.25"
