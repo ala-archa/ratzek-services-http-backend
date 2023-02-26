@@ -8,6 +8,7 @@ use actix_web::{
     HttpRequest, HttpResponse,
 };
 use derive_more::{Display, Error};
+use dhcpd_parser::parser::LeasesMethods;
 use serde::Serialize;
 use slog_scope::{error, info};
 use tokio::sync::Mutex;
@@ -63,9 +64,11 @@ fn client_ip(req: &HttpRequest) -> Option<String> {
         .or_else(|| req.peer_addr().map(|v| v.ip().to_string()))
 }
 
-#[get("/api/v1/client")]
-async fn client_get(state: Data<Arc<Mutex<State>>>, req: HttpRequest) -> Result<String, APIError> {
-    let client_ip = match client_ip(&req) {
+async fn client(
+    state: Data<Arc<Mutex<State>>>,
+    req: &HttpRequest,
+) -> std::result::Result<(String, String), APIError> {
+    let client_ip = match client_ip(req) {
         Some(v) => v,
         None => {
             error!("Unable to get client IP");
@@ -77,8 +80,33 @@ async fn client_get(state: Data<Arc<Mutex<State>>>, req: HttpRequest) -> Result<
 
     let state = state.lock().await;
 
-    let ipset_acl = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
-    let acl_entries = match ipset_acl.entries() {
+    let dhcp_lease = match crate::dhcp::Dhcp::of_ip(&state.config().dhcpd_leases, &client_ip) {
+        Ok(v) => v,
+        Err(err) => {
+            error!("{}", err);
+            return Err(APIError::InternalError);
+        }
+    };
+
+    let client_mac = match dhcp_lease.hardware {
+        Some(v) => v.mac.to_lowercase(),
+        None => {
+            error!("Client's MAC not defined in DHCP leases file");
+            return Err(APIError::InternalError);
+        }
+    };
+
+    Ok((client_ip, client_mac))
+}
+
+#[get("/api/v1/client")]
+async fn client_get(state: Data<Arc<Mutex<State>>>, req: HttpRequest) -> Result<String, APIError> {
+    let (client_ip, client_mac) = client(state.clone(), &req).await?;
+
+    let state = state.lock().await;
+
+    let ipset_shaper = crate::ipset::IPSet::new(&state.config().ipset_shaper_name);
+    let shaper_entries = match ipset_shaper.entries() {
         Ok(v) => v,
         Err(err) => {
             error!("Unable to get ipset list: {}", err);
@@ -86,8 +114,23 @@ async fn client_get(state: Data<Arc<Mutex<State>>>, req: HttpRequest) -> Result<
         }
     };
 
-    let ipset_shaper = crate::ipset::IPSet::new(&state.config().ipset_shaper_name);
-    let shaper_entries = match ipset_shaper.entries() {
+    if state
+        .config()
+        .blacklisted_macs
+        .iter()
+        .map(|v| v.to_lowercase())
+        .any(|v| v == client_mac)
+    {
+        let resp = ServiceInfo {
+            internet_clients_connected: shaper_entries.len(),
+            internet_connection_status: InternetConnectionStatus::ClientBlacklisted,
+            is_internet_available: state.wide_network_available(),
+        };
+        return Ok(serde_json::ser::to_string(&resp).unwrap());
+    }
+
+    let ipset_acl = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
+    let acl_entries = match ipset_acl.entries() {
         Ok(v) => v,
         Err(err) => {
             error!("Unable to get ipset list: {}", err);
@@ -124,17 +167,21 @@ async fn client_register(
     state: Data<Arc<Mutex<State>>>,
     req: HttpRequest,
 ) -> Result<String, APIError> {
-    let client_ip = match client_ip(&req) {
-        Some(v) => v,
-        None => {
-            error!("Unable to get client IP");
-            return Err(APIError::InternalError);
-        }
-    };
-
-    info!("Request from {}", client_ip);
+    let (client_ip, client_mac) = client(state.clone(), &req).await?;
 
     let state = state.lock().await;
+
+    if state
+        .config()
+        .blacklisted_macs
+        .iter()
+        .map(|v| v.to_lowercase())
+        .any(|v| v == client_mac)
+    {
+        error!("Blacklisted client attempted to register");
+        return Err(APIError::InternalError);
+    }
+
     let ipset_acl = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
 
     if let Err(err) = ipset_acl.add(&client_ip) {
@@ -143,4 +190,55 @@ async fn client_register(
     }
 
     Ok(String::new())
+}
+
+#[derive(Serialize)]
+struct DhcpRecord {
+    pub ip: String,
+    pub mac: Option<String>,
+    pub hostname: Option<String>,
+    pub client_hostname: Option<String>,
+    pub vendor_class_identifier: Option<String>,
+    pub starts: Option<String>,
+    pub ends: Option<String>,
+    pub acl: Option<crate::ipset::Entry>,
+    pub shaper: Option<crate::ipset::Entry>,
+}
+
+#[get("/api/v1/dhcp")]
+async fn dhcp_leases(state: Data<Arc<Mutex<State>>>) -> Result<String, APIError> {
+    let state = state.lock().await;
+
+    let ipset_acl = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
+    let ipset_shaper = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
+
+    let mut leases = Vec::new();
+    for lease in crate::dhcp::Dhcp::read(&state.config().dhcpd_leases)
+        .map_err(|_| APIError::InternalError)?
+        .all()
+    {
+        let record = DhcpRecord {
+            mac: lease.hardware.map(|v| v.mac),
+            hostname: lease.hostname,
+            client_hostname: lease.client_hostname,
+            vendor_class_identifier: lease.vendor_class_identifier,
+            starts: lease.dates.starts.map(|v| v.to_string()),
+            ends: lease.dates.ends.map(|v| v.to_string()),
+            acl: ipset_acl
+                .entries()
+                .map_err(|_| APIError::InternalError)?
+                .into_iter()
+                .find(|acl| acl.ip == lease.ip),
+            shaper: ipset_shaper
+                .entries()
+                .map_err(|_| APIError::InternalError)?
+                .into_iter()
+                .find(|acl| acl.ip == lease.ip),
+            ip: lease.ip,
+        };
+
+        leases.push(record)
+    }
+
+    Ok(serde_json::ser::to_string(&leases).unwrap())
 }

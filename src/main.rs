@@ -8,6 +8,7 @@ use slog_scope::error;
 use tokio::sync::Mutex;
 
 mod config;
+mod dhcp;
 mod http;
 mod ipset;
 mod state;
@@ -76,6 +77,7 @@ impl Application {
                         .app_data(web::Data::new(state.clone()))
                         .service(http::client_get)
                         .service(http::client_register)
+                        .service(http::dhcp_leases)
                 })
                 .bind(&http_listen)?
                 .run()

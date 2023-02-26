@@ -33,9 +33,12 @@ pub struct Config {
     pub ipset_acl_name: String,
     pub http_listen: String,
     pub bytes_unlimited_limit: usize,
-    // TODO not implemented
-    pub blacklisted_macs: Vec<String>,
     pub wide_network_ip: IpAddr,
+    pub dhcpd_leases: std::path::PathBuf,
+    #[serde(default)]
+    pub blacklisted_macs: Vec<String>,
+    #[serde(default)]
+    pub whitelisted_macs: Vec<String>,
 }
 
 impl Config {

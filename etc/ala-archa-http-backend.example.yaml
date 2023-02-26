@@ -8,4 +8,4 @@ bytes_unlimited_limit: 5000000
 
 wide_network_ip: 8.8.8.8
 
-blacklisted_macs: []
+dhcpd_leases: /var/lib/dhcp/dhcpd.leases

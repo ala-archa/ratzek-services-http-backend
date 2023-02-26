@@ -1,7 +1,8 @@
 use anyhow::{anyhow, bail, Result};
+use serde::Serialize;
 use std::{collections::VecDeque, process::Stdio};
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct Entry {
     pub ip: String,
     pub timeout: Option<std::time::Duration>,
