@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "ala-archa-http-backend"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "actix-web",
  "anyhow",
@@ -462,7 +462,7 @@ dependencies = [
 [[package]]
 name = "dhcpd_parser"
 version = "0.4.3"
-source = "git+https://github.com/ala-archa/dhcpd-parser#200b33348f27c0a5fb90da50409c1c4c3989c5b3"
+source = "git+https://github.com/ala-archa/dhcpd-parser#be7fb4115b47094b772fdcdeb624f4ccd7ed7bac"
 
 [[package]]
 name = "digest"

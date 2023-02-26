@@ -189,6 +189,21 @@ async fn client_register(
         return Err(APIError::InternalError);
     }
 
+    if state
+        .config()
+        .no_shaping_macs
+        .iter()
+        .map(|v| v.to_lowercase())
+        .any(|v| v == client_mac)
+    {
+        let ipset_no_shape = crate::ipset::IPSet::new(&state.config().ipset_no_shape_name);
+
+        if let Err(err) = ipset_no_shape.add(&client_ip) {
+            error!("Unable to add client to no_shape ipset: {}", err);
+            return Err(APIError::InternalError);
+        }
+    }
+
     Ok(String::new())
 }
 

@@ -31,6 +31,7 @@ pub struct Config {
     pub log_level: LogLevel,
     pub ipset_shaper_name: String,
     pub ipset_acl_name: String,
+    pub ipset_no_shape_name: String,
     pub http_listen: String,
     pub bytes_unlimited_limit: usize,
     pub wide_network_ip: IpAddr,
@@ -38,7 +39,7 @@ pub struct Config {
     #[serde(default)]
     pub blacklisted_macs: Vec<String>,
     #[serde(default)]
-    pub whitelisted_macs: Vec<String>,
+    pub no_shaping_macs: Vec<String>,
 }
 
 impl Config {
