@@ -271,7 +271,7 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
     metrics.push(
         PrometheusMetric::build()
             .with_name("ratzek_internet_available")
-            .with_metric_type(MetricType::Counter)
+            .with_metric_type(MetricType::Gauge)
             .with_help("Flag of wide internet availability")
             .build()
             .render_and_append_instance(
@@ -282,7 +282,7 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
     metrics.push(
         PrometheusMetric::build()
             .with_name("ratzek_clients_in_acl")
-            .with_metric_type(MetricType::Counter)
+            .with_metric_type(MetricType::Gauge)
             .with_help("Number of clients in ACL")
             .build()
             .render_and_append_instance(
@@ -301,7 +301,7 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
     metrics.push(
         PrometheusMetric::build()
             .with_name("ratzek_clients_in_shaper")
-            .with_metric_type(MetricType::Counter)
+            .with_metric_type(MetricType::Gauge)
             .with_help("Number of clients in shaper")
             .build()
             .render_and_append_instance(
@@ -330,7 +330,7 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
         metrics.push(
             PrometheusMetric::build()
                 .with_name(&format!("ratzek_dhcp_leases_{}", name))
-                .with_metric_type(MetricType::Counter)
+                .with_metric_type(MetricType::Gauge)
                 .with_help(&format!("Number of {} DHCP leases", name))
                 .build()
                 .render_and_append_instance(
