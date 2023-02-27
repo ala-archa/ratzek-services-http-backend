@@ -462,7 +462,7 @@ dependencies = [
 [[package]]
 name = "dhcpd_parser"
 version = "0.4.3"
-source = "git+https://github.com/ala-archa/dhcpd-parser#be7fb4115b47094b772fdcdeb624f4ccd7ed7bac"
+source = "git+https://github.com/ala-archa/dhcpd-parser#cf3804606d009b118350c0b8f4b3b29088f745b1"
 
 [[package]]
 name = "digest"
