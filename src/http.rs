@@ -257,3 +257,89 @@ async fn dhcp_leases(state: Data<Arc<Mutex<State>>>) -> Result<String, APIError>
 
     Ok(serde_json::ser::to_string(&leases).unwrap())
 }
+
+#[get("/metrics")]
+async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, APIError> {
+    use prometheus_exporter_base::prelude::*;
+
+    let state = state.lock().await;
+
+    let ipset_acl = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
+    let ipset_shaper = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
+
+    let mut metrics = Vec::new();
+    metrics.push(
+        PrometheusMetric::build()
+            .with_name("ratzek_internet_available")
+            .with_metric_type(MetricType::Counter)
+            .with_help("Flag of wide internet availability")
+            .build()
+            .render_and_append_instance(
+                &PrometheusInstance::new().with_value(state.wide_network_available() as i8),
+            )
+            .render(),
+    );
+    metrics.push(
+        PrometheusMetric::build()
+            .with_name("ratzek_clients_in_acl")
+            .with_metric_type(MetricType::Counter)
+            .with_help("Number of clients in ACL")
+            .build()
+            .render_and_append_instance(
+                &PrometheusInstance::new().with_value(
+                    ipset_acl
+                        .entries()
+                        .map_err(|err| {
+                            error!("failed to get ACL entries: {}", err);
+                            APIError::InternalError
+                        })?
+                        .len(),
+                ),
+            )
+            .render(),
+    );
+    metrics.push(
+        PrometheusMetric::build()
+            .with_name("ratzek_clients_in_shaper")
+            .with_metric_type(MetricType::Counter)
+            .with_help("Number of clients in shaper")
+            .build()
+            .render_and_append_instance(
+                &PrometheusInstance::new().with_value(
+                    ipset_shaper
+                        .entries()
+                        .map_err(|err| {
+                            error!("failed to get shaper entries: {}", err);
+                            APIError::InternalError
+                        })?
+                        .len(),
+                ),
+            )
+            .render(),
+    );
+
+    let leases = crate::dhcp::Dhcp::read(&state.config().dhcpd_leases)
+        .map_err(|_| APIError::InternalError)?
+        .all();
+
+    for (name, state) in [
+        ("free", dhcpd_parser::leases::BindingState::Free),
+        ("active", dhcpd_parser::leases::BindingState::Active),
+        ("abandoned", dhcpd_parser::leases::BindingState::Abandoned),
+    ] {
+        metrics.push(
+            PrometheusMetric::build()
+                .with_name(&format!("ratzek_dhcp_leases_{}", name))
+                .with_metric_type(MetricType::Counter)
+                .with_help(&format!("Number of {} DHCP leases", name))
+                .build()
+                .render_and_append_instance(
+                    &PrometheusInstance::new()
+                        .with_value(leases.iter().filter(|v| v.binding_state == state).count()),
+                )
+                .render(),
+        )
+    }
+
+    Ok(metrics.join(""))
+}

@@ -28,3 +28,4 @@ derive_more = "0.99"
 surge-ping = "0.7"
 tokio = "1.25"
 dhcpd_parser = { git = "https://github.com/ala-archa/dhcpd-parser" }
+prometheus_exporter_base = "1.4"

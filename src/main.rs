@@ -78,6 +78,7 @@ impl Application {
                         .service(http::client_get)
                         .service(http::client_register)
                         .service(http::dhcp_leases)
+                        .service(http::prometheus_exporter)
                 })
                 .bind(&http_listen)?
                 .run()
