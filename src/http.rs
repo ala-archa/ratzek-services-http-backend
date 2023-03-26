@@ -265,7 +265,7 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
     let state = state.lock().await;
 
     let ipset_acl = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
-    let ipset_shaper = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
+    let ipset_shaper = crate::ipset::IPSet::new(&state.config().ipset_shaper_name);
 
     let mut metrics = Vec::new();
     metrics.push(
