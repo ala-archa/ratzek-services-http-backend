@@ -2,7 +2,7 @@
 authors = ["Evgenii Lepikhin <e.lepikhin@corp.mail.ru>"]
 edition = "2021"
 name = "ala-archa-http-backend"
-version = "0.1.8"
+version = "0.1.9"
 
 [profile.release]
 # Release compile-time optimizations
