@@ -24,7 +24,22 @@ impl State {
     }
 
     pub async fn update(&mut self) {
-        let r = surge_ping::ping(self.config.wide_network_ip, &[1, 2, 3])
+        let ping_client = match surge_ping::Client::new(&surge_ping::Config::new()) {
+            Ok(v) => v,
+            Err(err) => {
+                slog_scope::error!("Unable to initialize pinger: {err}");
+                return;
+            }
+        };
+        let mut pinger = ping_client
+            .pinger(
+                self.config.wide_network_ip,
+                surge_ping::PingIdentifier::from(1),
+            )
+            .await;
+        pinger.timeout(std::time::Duration::from_secs(10));
+        let r = pinger
+            .ping(surge_ping::PingSequence::from(1), &[1, 2, 3])
             .await
             .is_ok();
 
