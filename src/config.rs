@@ -40,6 +40,7 @@ pub struct Config {
     pub blacklisted_macs: Vec<String>,
     #[serde(default)]
     pub no_shaping_macs: Vec<String>,
+    pub hostap_control_path: std::path::PathBuf,
 }
 
 impl Config {

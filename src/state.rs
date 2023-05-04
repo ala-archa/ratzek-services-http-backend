@@ -1,10 +1,13 @@
+use anyhow::{anyhow, Result};
 use slog_scope::info;
+use std::process::Stdio;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub struct State {
     config: crate::config::Config,
     is_wide_network_available: bool,
+    active_wifi_stations: usize,
 }
 
 impl State {
@@ -12,6 +15,7 @@ impl State {
         Self {
             config: config.clone(),
             is_wide_network_available: false,
+            active_wifi_stations: 0,
         }
     }
 
@@ -19,11 +23,34 @@ impl State {
         self.is_wide_network_available
     }
 
+    pub fn active_wifi_stations(&self) -> usize {
+        self.active_wifi_stations
+    }
+
     pub fn config(&self) -> &crate::config::Config {
         &self.config
     }
 
-    pub async fn update(&mut self) {
+    fn update_wifi_stations(&mut self) -> Result<()> {
+        let output = std::process::Command::new("hostapd_cli")
+            .args(&[
+                "-p",
+                &self.config().hostap_control_path.to_string_lossy(),
+                "list_sta",
+            ])
+            .stdout(Stdio::piped())
+            .output()?;
+
+        let output = String::from_utf8(output.stdout)
+            .map_err(|err| anyhow!("Decode command output: {}", err))?;
+
+        self.active_wifi_stations = output.lines().count();
+        info!("active_wifi_stations = {}", self.active_wifi_stations);
+
+        Ok(())
+    }
+
+    async fn update_is_wide_network_available(&mut self) {
         let ping_client = match surge_ping::Client::new(&surge_ping::Config::new()) {
             Ok(v) => v,
             Err(err) => {
@@ -46,6 +73,14 @@ impl State {
         info!("is_wide_network_available = {r}");
 
         self.is_wide_network_available = r
+    }
+
+    pub async fn update(&mut self) {
+        self.update_is_wide_network_available().await;
+
+        if let Err(err) = self.update_wifi_stations() {
+            slog_scope::error!("Unable to calculate number of active wifi stations: {err}");
+        }
     }
 }
 

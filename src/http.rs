@@ -55,6 +55,7 @@ struct ServiceInfo {
     pub internet_connection_status: InternetConnectionStatus,
     pub internet_clients_connected: usize,
     pub is_internet_available: bool,
+    pub active_wifi_stations: usize,
 }
 
 fn client_ip(req: &HttpRequest) -> Option<String> {
@@ -125,6 +126,7 @@ async fn client_get(state: Data<Arc<Mutex<State>>>, req: HttpRequest) -> Result<
             internet_clients_connected: shaper_entries.len(),
             internet_connection_status: InternetConnectionStatus::ClientBlacklisted,
             is_internet_available: state.wide_network_available(),
+            active_wifi_stations: state.active_wifi_stations(),
         };
         return Ok(serde_json::ser::to_string(&resp).unwrap());
     }
@@ -158,6 +160,7 @@ async fn client_get(state: Data<Arc<Mutex<State>>>, req: HttpRequest) -> Result<
         internet_clients_connected: shaper_entries.len(),
         internet_connection_status,
         is_internet_available: state.wide_network_available(),
+        active_wifi_stations: state.active_wifi_stations(),
     };
     Ok(serde_json::ser::to_string(&resp).unwrap())
 }
@@ -279,6 +282,19 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
             )
             .render(),
     );
+
+    metrics.push(
+        PrometheusMetric::build()
+            .with_name("ratzek_active_wifi_stations")
+            .with_metric_type(MetricType::Gauge)
+            .with_help("Number of active Wifi stations")
+            .build()
+            .render_and_append_instance(
+                &PrometheusInstance::new().with_value(state.active_wifi_stations()),
+            )
+            .render(),
+    );
+
     metrics.push(
         PrometheusMetric::build()
             .with_name("ratzek_clients_in_acl")
