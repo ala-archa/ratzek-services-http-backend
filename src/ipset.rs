@@ -22,7 +22,7 @@ impl IPSet {
 
     pub fn entries(&self) -> Result<Vec<Entry>> {
         let output = std::process::Command::new("ipset")
-            .args(&["save", &self.name])
+            .args(["save", &self.name])
             .stdout(Stdio::piped())
             .output()?;
 
@@ -67,7 +67,7 @@ impl IPSet {
 
     pub fn add(&self, entry: &str) -> Result<()> {
         let r = std::process::Command::new("ipset")
-            .args(&["add", &self.name, entry])
+            .args(["add", &self.name, entry])
             .output()?;
 
         if !r.status.success() {
