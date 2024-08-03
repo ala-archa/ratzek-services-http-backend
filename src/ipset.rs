@@ -65,10 +65,13 @@ impl IPSet {
         Ok(result)
     }
 
-    pub fn add(&self, entry: &str) -> Result<()> {
-        let r = std::process::Command::new("ipset")
-            .args(["add", &self.name, entry])
-            .output()?;
+    pub fn add(&self, entry: &str, timeout: Option<u64>) -> Result<()> {
+        let mut args = vec!["add".to_owned(), self.name.clone(), entry.to_owned()];
+        if let Some(timeout) = timeout {
+            args.push("timeout".to_owned());
+            args.push(format!("{}", timeout))
+        }
+        let r = std::process::Command::new("ipset").args(args).output()?;
 
         if !r.status.success() {
             bail!("Got non-zero exit code")
