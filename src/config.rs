@@ -1,7 +1,6 @@
-use std::net::IpAddr;
-
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::{collections::HashSet, net::IpAddr};
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub enum LogLevel {
@@ -39,7 +38,9 @@ pub struct Config {
     #[serde(default)]
     pub blacklisted_macs: Vec<String>,
     #[serde(default)]
-    pub no_shaping_macs: Vec<String>,
+    pub no_shaping_ips: HashSet<String>,
+    pub no_shaping_timeout: u64,
+    pub shaping_timeout: u64,
 }
 
 impl Config {

@@ -50,6 +50,12 @@ enum InternetConnectionStatus {
     ClientBlacklisted,
 }
 
+#[derive(PartialEq)]
+enum Client {
+    Whitelist,
+    Mac(String),
+}
+
 #[derive(Serialize)]
 struct ServiceInfo {
     pub internet_connection_status: InternetConnectionStatus,
@@ -70,7 +76,7 @@ async fn with_client<CB, Fut>(
     cb: CB,
 ) -> Result<String, APIError>
 where
-    CB: FnOnce(String, String) -> Fut,
+    CB: FnOnce(String, Client) -> Fut,
     Fut: Future<Output = Result<String, APIError>>,
 {
     let client_ip = match client_ip(req) {
@@ -81,7 +87,17 @@ where
         }
     };
 
-    info!("Request from {}", client_ip);
+    info!("Request from {}: {}", client_ip, req.uri());
+
+    let is_no_shape = {
+        let state = state.lock().await;
+        state.config().no_shaping_ips.contains(&client_ip)
+    };
+    if is_no_shape {
+        info!("Client is in no_shape list");
+        slog_scope::logger().new(slog::slog_o!("client_ip" => client_ip.clone()));
+        return cb(client_ip, Client::Whitelist).await;
+    }
 
     let dhcp_lease = {
         let state = state.lock().await;
@@ -106,7 +122,7 @@ where
         &slog_scope::logger().new(
             slog::slog_o!("client_ip" => client_ip.clone(), "client_mac" => client_mac.clone()),
         ),
-        || cb(client_ip, client_mac),
+        || cb(client_ip, Client::Mac(client_mac)),
     )
     .await
 }
@@ -116,7 +132,8 @@ async fn client_get(state: Data<Arc<Mutex<State>>>, req: HttpRequest) -> Result<
     with_client(
         state.clone(),
         &req,
-        |client_ip: String, client_mac: String| async move {
+        |client_ip: String, client: Client| async move {
+            info!("Client requested service info");
             let state = state.lock().await;
 
             let ipset_shaper = crate::ipset::IPSet::new(&state.config().ipset_shaper_name);
@@ -128,19 +145,21 @@ async fn client_get(state: Data<Arc<Mutex<State>>>, req: HttpRequest) -> Result<
                 }
             };
 
-            if state
-                .config()
-                .blacklisted_macs
-                .iter()
-                .map(|v| v.to_lowercase())
-                .any(|v| v == client_mac)
-            {
-                let resp = ServiceInfo {
-                    internet_clients_connected: shaper_entries.len(),
-                    internet_connection_status: InternetConnectionStatus::ClientBlacklisted,
-                    is_internet_available: state.wide_network_available(),
-                };
-                return Ok(serde_json::ser::to_string(&resp).unwrap());
+            if let Client::Mac(client_mac) = client {
+                if state
+                    .config()
+                    .blacklisted_macs
+                    .iter()
+                    .map(|v| v.to_lowercase())
+                    .any(|v| v == client_mac)
+                {
+                    let resp = ServiceInfo {
+                        internet_clients_connected: shaper_entries.len(),
+                        internet_connection_status: InternetConnectionStatus::ClientBlacklisted,
+                        is_internet_available: state.wide_network_available(),
+                    };
+                    return Ok(serde_json::ser::to_string(&resp).unwrap());
+                }
             }
 
             let ipset_acl = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
@@ -190,43 +209,49 @@ async fn client_register(
     with_client(
         state.clone(),
         &req,
-        |client_ip: String, client_mac: String| async move {
-            info!("Client requested registration",);
+        |client_ip: String, client: Client| async move {
+            info!("Client requested registration");
 
             let state = state.lock().await;
 
-            if state
-                .config()
-                .blacklisted_macs
-                .iter()
-                .map(|v| v.to_lowercase())
-                .any(|v| v == client_mac)
-            {
-                error!("Blacklisted client attempted to register");
-                return Err(APIError::InternalError);
-            }
-
             let ipset_acl = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
 
-            if let Err(err) = ipset_acl.add(&client_ip) {
+            let (ipset_shaper, ipset_name, timeout) = match client {
+                Client::Whitelist => {
+                    let ipset_no_shape =
+                        crate::ipset::IPSet::new(&state.config().ipset_no_shape_name);
+                    (
+                        ipset_no_shape,
+                        "no_shape",
+                        Some(state.config().no_shaping_timeout),
+                    )
+                }
+                Client::Mac(mac) => {
+                    if state
+                        .config()
+                        .blacklisted_macs
+                        .iter()
+                        .map(|v| v.to_lowercase())
+                        .any(|v| v == mac)
+                    {
+                        error!("Blacklisted client attempted to register");
+                        return Err(APIError::InternalError);
+                    }
+                    let ipset_shaper = crate::ipset::IPSet::new(&state.config().ipset_shaper_name);
+                    (ipset_shaper, "shaper", Some(state.config().shaping_timeout))
+                }
+            };
+
+            info!("Adding {client_ip} to ACL ipset");
+            if let Err(err) = ipset_acl.add(&client_ip, timeout) {
                 error!("Unable to add client to ACL ipset: {}", err);
                 return Err(APIError::InternalError);
             }
 
-            if state
-                .config()
-                .no_shaping_macs
-                .iter()
-                .map(|v| v.to_lowercase())
-                .any(|v| v == client_mac)
-            {
-                info!("Adding client to no_shape list");
-                let ipset_no_shape = crate::ipset::IPSet::new(&state.config().ipset_no_shape_name);
-
-                if let Err(err) = ipset_no_shape.add(&client_ip) {
-                    error!("Unable to add client to no_shape ipset: {}", err);
-                    return Err(APIError::InternalError);
-                }
+            info!("Adding {client_ip} to {ipset_name} ipset");
+            if let Err(err) = ipset_shaper.add(&client_ip, timeout) {
+                error!("Unable to add client to {:?} ipset: {}", ipset_name, err);
+                return Err(APIError::InternalError);
             }
 
             Ok(String::new())
@@ -250,6 +275,7 @@ struct DhcpRecord {
 
 #[get("/api/v1/dhcp")]
 async fn dhcp_leases(state: Data<Arc<Mutex<State>>>) -> Result<String, APIError> {
+    info!("Client requested DHCP leases");
     let state = state.lock().await;
 
     let ipset_acl = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
@@ -289,6 +315,8 @@ async fn dhcp_leases(state: Data<Arc<Mutex<State>>>) -> Result<String, APIError>
 #[get("/metrics")]
 async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, APIError> {
     use prometheus_exporter_base::prelude::*;
+
+    info!("Client requested prometheus exporter data");
 
     let state = state.lock().await;
 
