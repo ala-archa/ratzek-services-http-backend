@@ -38,14 +38,23 @@ impl State {
             )
             .await;
         pinger.timeout(std::time::Duration::from_secs(10));
-        let r = pinger
-            .ping(surge_ping::PingSequence::from(1), &[1, 2, 3])
-            .await
-            .is_ok();
+        let mut success = false;
+        for seq in 0..3 {
+            if pinger
+                .ping(surge_ping::PingSequence::from(seq), &[1, 2, 3])
+                .await
+                .is_ok()
+            {
+                success = true;
+                break;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
 
-        info!("is_wide_network_available = {r}");
+        info!("is_wide_network_available = {success}");
 
-        self.is_wide_network_available = r
+        self.is_wide_network_available = success
     }
 }
 
