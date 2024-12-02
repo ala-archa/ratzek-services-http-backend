@@ -1,3 +1,4 @@
+---
 
 log_level: Info
 
@@ -15,3 +16,22 @@ speedtest:
   crontab: "0 15 */8 * * *"
 
 dhcpd_leases: /var/lib/dhcp/dhcpd.leases
+
+persistent_state_path: /var/tmp/ala-archa-http-backend.state
+
+telegram:
+  bot_token: "123456:ABC-asdasdasdasd"
+
+mobile_provider:
+  update_tariff_command: |
+    ssh ratzek-internet@10.11.1.1 '/interface lte at-chat lte1 wait=yes input="AT+CUSD=1,\"*255#\",15"'
+  get_balance_command: |
+    ssh ratzek-internet@10.11.1.1 '/interface lte at-chat lte1 wait=yes input="AT+CUSD=1,\"*100#\",15"'
+  get_balance_crontab: "0 16 */8 * * *"
+  low_balance_threshold: 1200
+  low_download_speed_threshold: 1000000
+  min_update_tariff_interval: 1w
+  telegram_chat_ids:
+    - 123456789
+    - 987654321
+  phone_number: '+996 702 457 912'

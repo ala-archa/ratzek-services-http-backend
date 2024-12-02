@@ -8,8 +8,10 @@ mod config;
 mod dhcp;
 mod http;
 mod ipset;
+mod mobile_provider;
 mod speedtest;
 mod state;
+mod telegram;
 
 const CONFIG_DEFAULT_PATH: &str = "/etc/ala-archa-http-backend.yaml";
 

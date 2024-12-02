@@ -156,7 +156,11 @@ async fn client_get(state: Data<Arc<Mutex<State>>>, req: HttpRequest) -> Result<
                     let resp = ServiceInfo {
                         internet_clients_connected: shaper_entries.len(),
                         internet_connection_status: InternetConnectionStatus::ClientBlacklisted,
-                        is_internet_available: state.wide_network_available(),
+                        is_internet_available: state
+                            .persistent_state()
+                            .await
+                            .is_wide_network_available
+                            .unwrap_or(false),
                     };
                     return Ok(serde_json::ser::to_string(&resp).unwrap());
                 }
@@ -193,7 +197,11 @@ async fn client_get(state: Data<Arc<Mutex<State>>>, req: HttpRequest) -> Result<
             let resp = ServiceInfo {
                 internet_clients_connected: shaper_entries.len(),
                 internet_connection_status,
-                is_internet_available: state.wide_network_available(),
+                is_internet_available: state
+                    .persistent_state()
+                    .await
+                    .is_wide_network_available
+                    .unwrap_or(false),
             };
             Ok(serde_json::ser::to_string(&resp).unwrap())
         },
@@ -323,6 +331,8 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
     let ipset_acl = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
     let ipset_shaper = crate::ipset::IPSet::new(&state.config().ipset_shaper_name);
 
+    let persistent_state = state.persistent_state().await;
+
     let mut metrics = Vec::new();
     metrics.push(
         PrometheusMetric::build()
@@ -331,12 +341,13 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
             .with_help("Flag of wide internet availability")
             .build()
             .render_and_append_instance(
-                &PrometheusInstance::new().with_value(state.wide_network_available() as i8),
+                &PrometheusInstance::new()
+                    .with_value(persistent_state.is_wide_network_available.unwrap_or(false) as i8),
             )
             .render(),
     );
 
-    if let Some(speedtest_result) = state.speedtest_result() {
+    if let Some(speedtest_result) = persistent_state.speedtest {
         metrics.push(
             PrometheusMetric::build()
                 .with_name("ratzek_speedtest_download")
@@ -367,6 +378,33 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
                 .build()
                 .render_and_append_instance(
                     &PrometheusInstance::new().with_value(speedtest_result.ping),
+                )
+                .render(),
+        );
+    }
+
+    if let Some(balance) = persistent_state.balance {
+        metrics.push(
+            PrometheusMetric::build()
+                .with_name("ratzek_isp_balance")
+                .with_metric_type(MetricType::Gauge)
+                .with_help("ISP balance")
+                .build()
+                .render_and_append_instance(&PrometheusInstance::new().with_value(balance))
+                .render(),
+        );
+    }
+
+    if let Some(last_tariff_update) = persistent_state.last_tariff_update {
+        metrics.push(
+            PrometheusMetric::build()
+                .with_name("ratzek_last_tariff_update")
+                .with_metric_type(MetricType::Gauge)
+                .with_help("Last tariff update")
+                .build()
+                .render_and_append_instance(
+                    &PrometheusInstance::new()
+                        .with_value((last_tariff_update - chrono::Utc::now()).num_seconds()),
                 )
                 .render(),
         );

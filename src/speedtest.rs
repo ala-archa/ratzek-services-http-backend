@@ -1,6 +1,6 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Serialize, Default, Debug, Clone)]
 pub struct SpeedTest {
     pub download: f64,
     pub upload: f64,

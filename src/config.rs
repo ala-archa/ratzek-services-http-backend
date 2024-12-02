@@ -55,6 +55,11 @@ pub struct Config {
     pub shaping_timeout: u64,
     pub speedtest: SpeedTest,
     pub ping: Ping,
+    #[serde(default)]
+    pub telegram: Option<crate::telegram::Telegram>,
+    #[serde(default)]
+    pub mobile_provider: Option<crate::mobile_provider::MobileProvider>,
+    pub persistent_state_path: std::path::PathBuf,
 }
 
 impl Config {
