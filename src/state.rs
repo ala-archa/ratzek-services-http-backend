@@ -37,7 +37,7 @@ async fn check_is_wide_internet_available(config: &crate::config::Ping) -> bool 
 pub struct State {
     config: crate::config::Config,
     is_wide_network_available: bool,
-    speedtest: SpeedTest,
+    speedtest: Option<SpeedTest>,
     scheduler: tokio_cron_scheduler::JobScheduler,
 }
 
@@ -47,10 +47,10 @@ impl State {
 
         let is_wide_network_available = check_is_wide_internet_available(&config.ping).await;
         let speedtest = match SpeedTest::run(&config.speedtest).await {
-            Ok(speedtest) => speedtest,
+            Ok(speedtest) => Some(speedtest),
             Err(err) => {
                 error!("Unable to run speedtest: {err}");
-                SpeedTest::default()
+                None
             }
         };
 
@@ -93,7 +93,7 @@ impl State {
                             match SpeedTest::run(&config).await {
                                 Ok(speedtest) => {
                                     let mut state = state1.lock().await;
-                                    state.speedtest = speedtest
+                                    state.speedtest = Some(speedtest)
                                 }
                                 Err(err) => {
                                     error!("Unable to run speedtest: {err}");
@@ -112,7 +112,7 @@ impl State {
         self.is_wide_network_available
     }
 
-    pub fn speedtest_result(&self) -> &SpeedTest {
+    pub fn speedtest_result(&self) -> &Option<SpeedTest> {
         &self.speedtest
     }
 
