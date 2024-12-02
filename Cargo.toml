@@ -26,6 +26,7 @@ slog-syslog = { path = "custom-vendored/slog-syslog" }
 actix-web = "4.3"
 derive_more = "0.99"
 surge-ping = "0.7"
-tokio = "1.25"
+tokio = { version = "1.25", features = ["process"] }
 dhcpd_parser = { git = "https://github.com/ala-archa/dhcpd-parser" }
 prometheus_exporter_base = "1.4"
+tokio-cron-scheduler = "0.13.0"

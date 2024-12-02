@@ -26,6 +26,19 @@ impl From<LogLevel> for slog::Level {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+pub struct SpeedTest {
+    pub speedtest_cli_path: std::path::PathBuf,
+    pub server: String,
+    pub crontab: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Ping {
+    pub server: IpAddr,
+    pub crontab: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub log_level: LogLevel,
     pub ipset_shaper_name: String,
@@ -33,7 +46,6 @@ pub struct Config {
     pub ipset_no_shape_name: String,
     pub http_listen: String,
     pub bytes_unlimited_limit: usize,
-    pub wide_network_ip: IpAddr,
     pub dhcpd_leases: std::path::PathBuf,
     #[serde(default)]
     pub blacklisted_macs: Vec<String>,
@@ -41,6 +53,8 @@ pub struct Config {
     pub no_shaping_ips: HashSet<String>,
     pub no_shaping_timeout: u64,
     pub shaping_timeout: u64,
+    pub speedtest: SpeedTest,
+    pub ping: Ping,
 }
 
 impl Config {

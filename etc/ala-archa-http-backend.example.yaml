@@ -6,6 +6,12 @@ ipset_acl_name: acl
 http_listen: 0.0.0.0:8888
 bytes_unlimited_limit: 5000000
 
-wide_network_ip: 8.8.8.8
+ping:
+  server: 1.1.1.1
+  crontab: "0 * * * * *"
+speedtest:
+  speedtest_cli_path: /usr/local/bin/speedtest
+  server: 5308
+  crontab: "0 15 */8 * * *"
 
 dhcpd_leases: /var/lib/dhcp/dhcpd.leases

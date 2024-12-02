@@ -1,16 +1,14 @@
-use std::sync::Arc;
-
 use actix_web::web;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use slog::{o, Drain};
 use slog_scope::error;
-use tokio::sync::Mutex;
 
 mod config;
 mod dhcp;
 mod http;
 mod ipset;
+mod speedtest;
 mod state;
 
 const CONFIG_DEFAULT_PATH: &str = "/etc/ala-archa-http-backend.yaml";
@@ -70,8 +68,7 @@ impl Application {
             }
             CommandLine::Run => {
                 let http_listen = config.http_listen.clone();
-                let state = Arc::new(Mutex::new(crate::state::State::new(&config)));
-                crate::state::ticker(state.clone());
+                let state = crate::state::State::new(&config).await?;
                 actix_web::HttpServer::new(move || {
                     actix_web::App::new()
                         .app_data(web::Data::new(state.clone()))

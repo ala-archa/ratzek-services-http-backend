@@ -335,6 +335,42 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
             )
             .render(),
     );
+
+    let speedtest_result = state.speedtest_result();
+    metrics.push(
+        PrometheusMetric::build()
+            .with_name("ratzek_speedtest_download")
+            .with_metric_type(MetricType::Gauge)
+            .with_help("Speedtest download speed")
+            .build()
+            .render_and_append_instance(
+                &PrometheusInstance::new().with_value(speedtest_result.download),
+            )
+            .render(),
+    );
+    metrics.push(
+        PrometheusMetric::build()
+            .with_name("ratzek_speedtest_upload")
+            .with_metric_type(MetricType::Gauge)
+            .with_help("Speedtest upload speed")
+            .build()
+            .render_and_append_instance(
+                &PrometheusInstance::new().with_value(speedtest_result.upload),
+            )
+            .render(),
+    );
+    metrics.push(
+        PrometheusMetric::build()
+            .with_name("ratzek_speedtest_ping")
+            .with_metric_type(MetricType::Gauge)
+            .with_help("Speedtest ping speed")
+            .build()
+            .render_and_append_instance(
+                &PrometheusInstance::new().with_value(speedtest_result.ping),
+            )
+            .render(),
+    );
+
     metrics.push(
         PrometheusMetric::build()
             .with_name("ratzek_clients_in_acl")
