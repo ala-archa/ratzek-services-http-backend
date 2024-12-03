@@ -7,6 +7,9 @@ clean:
 debug-build:
 	cargo build
 
+fastdev-build:
+	cargo build --profile fastdev
+
 release-build:
 	cargo build --release
 

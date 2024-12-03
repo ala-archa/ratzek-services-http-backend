@@ -12,7 +12,6 @@ ping:
   crontab: "0 * * * * *"
 speedtest:
   speedtest_cli_path: /usr/local/bin/speedtest
-  server: 5308
   crontab: "0 15 */8 * * *"
 
 dhcpd_leases: /var/lib/dhcp/dhcpd.leases
@@ -21,17 +20,25 @@ persistent_state_path: /var/tmp/ala-archa-http-backend.state
 
 telegram:
   bot_token: "123456:ABC-asdasdasdasd"
+  retry_crontab: "30 */5 * * * *"
+  message_timeout: 24h
 
 mobile_provider:
   update_tariff_command: |
-    ssh ratzek-internet@10.11.1.1 '/interface lte at-chat lte1 wait=yes input="AT+CUSD=1,\"*255#\",15"'
+    ssh ratzek-services@10.11.1.1 '/interface lte at-chat lte1 wait=yes input="AT+CUSD=1,\"*255#\",15"'
+  # Перед работой, необходимой переключить Ошку в режим английского языка:
+  # ssh ratzek-services@10.11.1.1 '/interface lte at-chat lte1 wait=yes input="AT+CUSD=1,\"*177*3#\",15"'
   get_balance_command: |
-    ssh ratzek-internet@10.11.1.1 '/interface lte at-chat lte1 wait=yes input="AT+CUSD=1,\"*100#\",15"'
-  get_balance_crontab: "0 16 */8 * * *"
+    ssh ratzek-services@10.11.1.1 '/interface lte at-chat lte1 wait=yes input="AT+CUSD=1,\"*100#\",15"'
+  get_balance_crontab: "0 20 13 * * *"
   low_balance_threshold: 1200
   low_download_speed_threshold: 1000000
   min_update_tariff_interval: 1w
   telegram_chat_ids:
-    - 123456789
-    - 987654321
+    - "123456789"
+    - "-100987654321"
   phone_number: '+996 702 457 912'
+  get_balance_retry_count: 3
+  get_balance_retry_interval: 5s
+  restart_lte_command: |
+    ssh ratzek-services@10.11.1.1 '/interface disable lte1; delay 10; /interface enable lte1; delay 10'

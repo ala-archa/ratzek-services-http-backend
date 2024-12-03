@@ -9,6 +9,7 @@ mod dhcp;
 mod http;
 mod ipset;
 mod mobile_provider;
+mod persistent_state;
 mod speedtest;
 mod state;
 mod telegram;

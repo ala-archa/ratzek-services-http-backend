@@ -12,6 +12,12 @@ strip = true
 opt-level = "z"
 codegen-units = 1
 
+[profile.fastdev]
+
+inherits = "dev"
+opt-level = 0
+debug = false
+
 [dependencies]
 anyhow = "1.0"
 clap = {version = "4.0", features = ["derive"]}

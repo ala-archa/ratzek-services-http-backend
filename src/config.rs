@@ -28,7 +28,6 @@ impl From<LogLevel> for slog::Level {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SpeedTest {
     pub speedtest_cli_path: std::path::PathBuf,
-    pub server: String,
     pub crontab: String,
 }
 
