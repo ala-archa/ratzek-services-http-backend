@@ -54,7 +54,7 @@ pub struct MobileProvider {
 }
 
 impl MobileProvider {
-    async fn get_balance(&self) -> Result<f64> {
+    async fn get_balance_once(&self) -> Result<f64> {
         let output = tokio::process::Command::new("bash")
             .arg("-c")
             .arg(&self.get_balance_command)
@@ -93,6 +93,34 @@ impl MobileProvider {
         Ok(balance)
     }
 
+    pub async fn get_balance(&self) -> Result<f64> {
+        let mut balance = None;
+        for _ in 0..self.get_balance_retry_count {
+            match self.get_balance_once().await {
+                Ok(v) => {
+                    balance = Some(v);
+                    break;
+                }
+                Err(err) => {
+                    error!("Failed to get balance: {:?}", err);
+                }
+            }
+            tokio::time::sleep(self.get_balance_retry_interval).await;
+        }
+
+        // restart LTE after getting balance
+        let output = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(&self.restart_lte_command)
+            .output()
+            .await;
+        if let Err(err) = output {
+            error!("Failed to restart LTE: {:?}", err);
+        }
+
+        balance.ok_or_else(|| anyhow::anyhow!("Failed to get balance"))
+    }
+
     async fn alert_balance(
         &self,
         persistent_state: &crate::persistent_state::PersistentStateGuard,
@@ -128,36 +156,7 @@ impl MobileProvider {
         persistent_state: &crate::persistent_state::PersistentStateGuard,
         telegram: &Option<crate::telegram::Telegram>,
     ) -> Result<f64> {
-        let mut balance = None;
-        for _ in 0..self.get_balance_retry_count {
-            match self.get_balance().await {
-                Ok(v) => {
-                    balance = Some(v);
-                    break;
-                }
-                Err(err) => {
-                    error!("Failed to get balance: {:?}", err);
-                }
-            }
-            tokio::time::sleep(self.get_balance_retry_interval).await;
-        }
-
-        // restart LTE after getting balance
-        let output = tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg(&self.restart_lte_command)
-            .output()
-            .await;
-        if let Err(err) = output {
-            error!("Failed to restart LTE: {:?}", err);
-        }
-
-        let balance = match balance {
-            Some(v) => v,
-            None => {
-                return Err(anyhow::anyhow!("Failed to get balance"));
-            }
-        };
+        let balance = self.get_balance().await?;
 
         if balance < self.low_balance_threshold {
             if let Some(telegram) = telegram {

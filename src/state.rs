@@ -1,4 +1,5 @@
 use crate::speedtest::SpeedTest;
+use anyhow::bail;
 use slog_scope::{error, info};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -42,7 +43,7 @@ pub struct State {
 }
 
 impl State {
-    async fn init_cronjobs(state: Arc<Mutex<Self>>) -> anyhow::Result<()> {
+    pub async fn init_cronjobs(state: Arc<Mutex<Self>>) -> anyhow::Result<()> {
         use tokio_cron_scheduler::Job;
         let state1 = state.clone();
         let state_guard = state.lock().await;
@@ -179,84 +180,40 @@ impl State {
         Ok(())
     }
 
-    async fn schedule_update_persistent_state(state: Arc<Mutex<Self>>) {
-        let state = state.clone();
-        let config = {
-            let state_guard = state.lock().await;
-            state_guard.config.clone()
-        };
-        let persistent_state = {
-            let state_guard = state.lock().await;
-            state_guard.persistent_state.clone()
-        };
-        let is_wide_network_available = check_is_wide_internet_available(&config.ping).await;
-        let (speedtest, last_speedtest_check) = if let Some(ref last_speetest_check) =
-            persistent_state.get().await.last_speedtest_check
-        {
-            if chrono::Utc::now() - last_speetest_check < chrono::Duration::hours(1) {
-                info!("Speedtest check was run less than 1 hour ago");
-                let persistent_state = persistent_state.get().await;
-                (
-                    persistent_state.speedtest,
-                    persistent_state.last_speedtest_check,
-                )
-            } else {
-                match SpeedTest::run(&config.speedtest).await {
-                    Ok(speedtest) => (Some(speedtest), Some(chrono::Utc::now())),
-                    Err(err) => {
-                        error!("Unable to run speedtest: {err}");
-                        let persistent_state = persistent_state.get().await;
-                        (
-                            persistent_state.speedtest,
-                            persistent_state.last_speedtest_check,
-                        )
-                    }
-                }
-            }
-        } else {
-            match SpeedTest::run(&config.speedtest).await {
-                Ok(speedtest) => (Some(speedtest), Some(chrono::Utc::now())),
-                Err(err) => {
-                    error!("Unable to run speedtest: {err}");
-                    let persistent_state = persistent_state.get().await;
-                    (
-                        persistent_state.speedtest,
-                        persistent_state.last_speedtest_check,
-                    )
-                }
-            }
-        };
-
+    pub async fn get_balance(&self) -> anyhow::Result<f64> {
+        let config = self.config.clone();
         let balance = match config.mobile_provider {
-            Some(ref provider) => match provider
-                .get_and_alert_balance(&persistent_state, &config.telegram)
-                .await
-            {
-                Ok(balance) => Some(balance),
-                Err(err) => {
-                    error!("Unable to get balance: {err}");
-                    None
-                }
-            },
-            None => None,
+            Some(ref provider) => provider.get_balance().await?,
+            None => bail!("Section mobile_provider is not defined in configuration"),
         };
-        let state = state.clone();
-        tokio::spawn(async move {
-            let r = state
-                .lock()
-                .await
-                .persistent_state
-                .update(|persistent_state| {
-                    persistent_state.is_wide_network_available = Some(is_wide_network_available);
-                    persistent_state.speedtest = speedtest;
-                    persistent_state.last_speedtest_check = last_speedtest_check;
-                    persistent_state.balance = balance;
-                })
-                .await;
-            if let Err(err) = r {
-                error!("Unable to update persistent state: {err}");
-            }
-        });
+        let r = self
+            .persistent_state
+            .update(|persistent_state| {
+                persistent_state.balance = Some(balance);
+            })
+            .await;
+        if let Err(err) = r {
+            error!("Unable to update persistent state: {err}");
+        }
+
+        Ok(balance)
+    }
+
+    pub async fn get_speedtest(&self) -> anyhow::Result<crate::speedtest::SpeedTest> {
+        let config = self.config.clone();
+        let speedtest = SpeedTest::run(&config.speedtest).await?;
+        let speedtest1 = speedtest.clone();
+        let r = self
+            .persistent_state
+            .update(|persistent_state| {
+                persistent_state.speedtest = Some(speedtest1);
+            })
+            .await;
+        if let Err(err) = r {
+            error!("Unable to update persistent state: {err}");
+        }
+
+        Ok(speedtest)
     }
 
     pub async fn new(config: &crate::config::Config) -> anyhow::Result<Arc<Mutex<Self>>> {
@@ -269,11 +226,6 @@ impl State {
             ),
             scheduler: JobScheduler::new().await?,
         }));
-
-        // Закомменчено, надо вынести в командную строчку
-        // Self::schedule_update_persistent_state(state.clone()).await;
-
-        Self::init_cronjobs(state.clone()).await?;
 
         Ok(state)
     }

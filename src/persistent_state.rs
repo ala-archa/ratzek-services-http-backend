@@ -15,8 +15,6 @@ pub struct TelegramMessage {
 pub struct PersistentState {
     pub is_wide_network_available: Option<bool>,
     pub speedtest: Option<SpeedTest>,
-    #[serde(default)]
-    pub last_speedtest_check: Option<chrono::DateTime<chrono::Utc>>,
     pub last_tariff_update: Option<chrono::DateTime<chrono::Utc>>,
     pub balance: Option<f64>,
     #[serde(default)]
@@ -45,6 +43,7 @@ impl PersistentState {
 #[derive(Clone)]
 pub struct PersistentStateGuard {
     persistent_state_path: std::path::PathBuf,
+    last_read_time: Arc<Mutex<chrono::DateTime<chrono::Utc>>>,
     state: Arc<Mutex<PersistentState>>,
 }
 
@@ -52,7 +51,30 @@ impl PersistentStateGuard {
     pub fn load_from_yaml(path: &std::path::Path) -> Self {
         Self {
             persistent_state_path: path.to_path_buf(),
+            last_read_time: Arc::new(Mutex::new(chrono::Utc::now())),
             state: Arc::new(Mutex::new(PersistentState::load_from_yaml(path))),
+        }
+    }
+
+    async fn is_changed_on_disk(&self) -> bool {
+        let metadata = match std::fs::metadata(&self.persistent_state_path) {
+            Ok(metadata) => metadata,
+            Err(_) => return false,
+        };
+        let last_modified = match metadata.modified() {
+            Ok(last_modified) => last_modified,
+            Err(_) => return false,
+        };
+        let last_read_time = self.last_read_time.lock().await;
+        chrono::DateTime::<chrono::Utc>::from(last_modified) > *last_read_time
+    }
+
+    async fn reload(&self) {
+        if self.is_changed_on_disk().await {
+            let state = PersistentState::load_from_yaml(&self.persistent_state_path);
+            let mut state_guard = self.state.lock().await;
+            *state_guard = state;
+            (*self.last_read_time.lock().await) = chrono::Utc::now();
         }
     }
 
@@ -60,6 +82,7 @@ impl PersistentStateGuard {
     where
         F: FnOnce(&mut PersistentState) -> R,
     {
+        self.reload().await;
         let mut state = self.state.lock().await;
         let r = f(&mut state);
         let content = serde_yaml::to_string(&*state)?;
@@ -68,6 +91,7 @@ impl PersistentStateGuard {
     }
 
     pub async fn get(&self) -> PersistentState {
+        self.reload().await;
         self.state.lock().await.clone()
     }
 }

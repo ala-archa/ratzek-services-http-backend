@@ -16,6 +16,14 @@ mod telegram;
 
 const CONFIG_DEFAULT_PATH: &str = "/etc/ala-archa-http-backend.yaml";
 
+#[derive(Subcommand)]
+enum GetCommand {
+    /// Get and update balance
+    Balance,
+    /// Measure and update Speedtest
+    Speedtest,
+}
+
 // Example of subcommands
 #[derive(Subcommand)]
 enum CommandLine {
@@ -23,6 +31,9 @@ enum CommandLine {
     DumpConfig,
     /// Run HTTP server
     Run,
+    /// Update state
+    #[command(subcommand)]
+    Get(GetCommand),
 }
 
 /// Ala-Archa HTTP backend
@@ -72,6 +83,7 @@ impl Application {
             CommandLine::Run => {
                 let http_listen = config.http_listen.clone();
                 let state = crate::state::State::new(&config).await?;
+                crate::state::State::init_cronjobs(state.clone()).await?;
                 actix_web::HttpServer::new(move || {
                     actix_web::App::new()
                         .app_data(web::Data::new(state.clone()))
@@ -84,6 +96,34 @@ impl Application {
                 .run()
                 .await?;
                 Ok(())
+            }
+            CommandLine::Get(GetCommand::Balance) => {
+                let state = crate::state::State::new(&config).await?;
+                let state_guard = state.lock().await;
+                let balance = state_guard.get_balance().await;
+
+                match balance {
+                    Ok(balance) => {
+                        println!("{}", balance);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            CommandLine::Get(GetCommand::Speedtest) => {
+                let state = crate::state::State::new(&config).await?;
+                let state_guard = state.lock().await;
+                let speedtest = state_guard.get_speedtest().await;
+
+                match speedtest {
+                    Ok(speedtest) => {
+                        let speedtest = serde_yaml::to_string(&speedtest)
+                            .with_context(|| "Failed to dump speedtest")?;
+                        println!("{}", speedtest);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                }
             }
         }
     }
