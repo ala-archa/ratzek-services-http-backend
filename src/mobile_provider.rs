@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use slog_scope::{error, info};
 
-fn decode_hex_to_ucs2(hex: &str) -> Result<String> {
+fn decode_ucs2_in_hex(hex: &str) -> Result<String> {
     // Cut string to fit 4-byte chunks
     let hex = if hex.len() % 4 != 0 {
         let len = hex.len() - hex.len() % 4;
@@ -12,11 +12,6 @@ fn decode_hex_to_ucs2(hex: &str) -> Result<String> {
     } else {
         hex.to_string()
     };
-
-    // check if hex string is of 4-byte chunks
-    if hex.len() % 4 != 0 {
-        return Err(anyhow::anyhow!("Hex string length is not a multiple of 4"));
-    }
 
     // Преобразуем hex-строку в байты
     let bytes = (0..hex.len())
@@ -33,6 +28,27 @@ fn decode_hex_to_ucs2(hex: &str) -> Result<String> {
 
     String::from_utf16(&utf16_data)
         .map_err(|err| anyhow::anyhow!("Failed to convert UCS-2 to UTF-8: {err}"))
+}
+
+fn decode_utf8_in_hex(hex: &str) -> Result<String> {
+    // Cut string to fit 2-byte chunks
+    let hex = if hex.len() % 2 != 0 {
+        let len = hex.len() - hex.len() % 2;
+        let mut hex = hex.to_string();
+        hex.truncate(len);
+        hex
+    } else {
+        hex.to_string()
+    };
+
+    // Преобразуем hex-строку в байты
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .map_err(|err| anyhow::anyhow!("Failed to parse hex string: {err}"))?;
+
+    String::from_utf8(bytes).map_err(|err| anyhow::anyhow!("Failed to read UTF-8: {err}"))
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -68,7 +84,7 @@ impl MobileProvider {
         let line = output
             .lines()
             .map(str::trim)
-            .find(|line| line.starts_with("+CUSD: 0,\""))
+            .find(|line| line.starts_with("+CUSD: "))
             .ok_or_else(|| anyhow::anyhow!("Failed to find balance in output"))?;
         // split line by double quotes and get second part
         let message = line
@@ -76,21 +92,51 @@ impl MobileProvider {
             .nth(1)
             .ok_or_else(|| anyhow::anyhow!("Failed to extract message from line"))?;
         slog_scope::info!("Got encoded balance message: {}", message);
-        let message = decode_hex_to_ucs2(message)?;
-        slog_scope::info!("Got decoded balance message: {}", message);
-        // extract number from message which looks like: Баланс 548.08 с. ...
-        let balance = message
-            .split_whitespace()
-            .nth(2)
-            .ok_or_else(|| anyhow::anyhow!("Failed to extract balance from message"))?
-            .trim();
-        slog_scope::info!("Got balance: {}", balance);
+        let message_variants = vec![decode_ucs2_in_hex(message), decode_utf8_in_hex(message)]
+            .into_iter()
+            .filter_map(|result| match result {
+                Ok(v) => Some(v),
+                Err(err) => {
+                    error!("Failed to decode message: {:?}", err);
+                    None
+                }
+            })
+            .collect::<Vec<String>>();
+        for message in message_variants {
+            slog_scope::info!("Got decoded balance message: {}", message);
+            // extract number from message which looks like: Баланс 548.08 с. ...
+            let balance = if message.starts_with("Баланс ") {
+                message
+                    .split_whitespace()
+                    .nth(1)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to extract balance from message"))?
+                    .trim()
+                // extract number from message which looks like: You have 398.08 som.
+            } else if message.starts_with("You have ") {
+                message
+                    .split_whitespace()
+                    .nth(2)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to extract balance from message"))?
+                    .trim()
+            } else {
+                error!("Failed to extract balance from message: unexpected message prefix");
+                continue;
+            };
 
-        let balance = balance
-            .parse()
-            .map_err(|err| anyhow::anyhow!("Failed to parse balance: {err}"))?;
+            slog_scope::info!("Got balance: {}", balance);
 
-        Ok(balance)
+            match balance
+                .parse()
+                .map_err(|err| anyhow::anyhow!("Failed to parse balance: {err}"))
+            {
+                Ok(v) => return Ok(v),
+                Err(err) => {
+                    error!("Failed to parse balance: {:?}", err);
+                }
+            }
+        }
+
+        anyhow::bail!("Unable to extract balance from operator response")
     }
 
     pub async fn get_balance(&self) -> Result<f64> {
@@ -230,11 +276,31 @@ impl MobileProvider {
 #[test]
 fn test_ucs2_decoder() {
     let input = "04110430043b0430043d04410020003500340038002e0030003800200441002e002000310030003000300020043f044104380445043e043b043e04330438044704350441043a0438044500200442043504410442043e04320020002a00330034003100230020003500200441043e043c00200432002004340435043d044c";
-    let output = decode_hex_to_ucs2(input).unwrap();
+    let output = decode_ucs2_in_hex(input).unwrap();
     println!("{}", output);
     assert_eq!(
         output,
         "Баланс 548.08 с. 1000 психологических тестов *341# 5 сом в день"
+    );
+}
+
+// Dec 07 13:20:20 ratzek ratzek-services-http-backend[406]: Got balance output:   output: OK
+//                                                                     +CREG: 1, 1ca4, ca8b8, 2
+//                                                                     +CGREG: 1,"1ca4","000ca8b8",4,6
+//                                                                     +CEREG: 0
+//                                                                     +CGREG: 1,"1ca4","000ca8b8",6,6
+//                                                                     +CREG: 1, 1ca4, ca8b8, 6
+//                                                                     +CUSD: 0,"596f752068617665203339382e303820
+
+#[test]
+fn test_utf8_decoder() {
+    let input =
+        "596f752068617665203339382e303820736f6d2e20546f7020757020796f75722062616c616e63652077697468204f21426f6e75736573";
+    let output = decode_utf8_in_hex(input).unwrap();
+    println!("{}", output);
+    assert_eq!(
+        output,
+        "You have 398.08 som. Top up your balance with O!Bonuses"
     );
 }
 
@@ -243,14 +309,14 @@ fn test_ucs2_decoder_truncated_string() {
     let expected = "Баланс 548.08 с. 1000 психологических тестов *341# 5 сом в ден";
 
     let input = "04110430043b0430043d04410020003500340038002e0030003800200441002e002000310030003000300020043f044104380445043e043b043e04330438044704350441043a0438044500200442043504410442043e04320020002a00330034003100230020003500200441043e043c00200432002004340435043d044";
-    let output = decode_hex_to_ucs2(input).unwrap();
+    let output = decode_ucs2_in_hex(input).unwrap();
     assert_eq!(output, expected,);
 
     let input = "04110430043b0430043d04410020003500340038002e0030003800200441002e002000310030003000300020043f044104380445043e043b043e04330438044704350441043a0438044500200442043504410442043e04320020002a00330034003100230020003500200441043e043c00200432002004340435043d04";
-    let output = decode_hex_to_ucs2(input).unwrap();
+    let output = decode_ucs2_in_hex(input).unwrap();
     assert_eq!(output, expected,);
 
     let input = "04110430043b0430043d04410020003500340038002e0030003800200441002e002000310030003000300020043f044104380445043e043b043e04330438044704350441043a0438044500200442043504410442043e04320020002a00330034003100230020003500200441043e043c00200432002004340435043d0";
-    let output = decode_hex_to_ucs2(input).unwrap();
+    let output = decode_ucs2_in_hex(input).unwrap();
     assert_eq!(output, expected,);
 }
