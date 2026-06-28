@@ -8,7 +8,7 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use slog_scope::{error, info};
 use tokio::io::AsyncWriteExt;
 
@@ -82,6 +82,10 @@ async fn run_omshell(cfg: &Omapi, script: String) -> Result<String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // CRITICAL: omshell can block on the OMAPI server response. Without
+        // kill_on_drop the timeout below just drops the future, leaving the
+        // process spinning (orphaned, eating CPU). With it, a timeout kills omshell.
+        .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("Failed to spawn {}", cfg.omshell_path))?;
 
@@ -91,9 +95,14 @@ async fn run_omshell(cfg: &Omapi, script: String) -> Result<String> {
         stdin.shutdown().await?;
     }
 
-    let output = tokio::time::timeout(OMSHELL_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| anyhow!("omshell timed out after {:?}", OMSHELL_TIMEOUT))??;
+    let output = match tokio::time::timeout(OMSHELL_TIMEOUT, child.wait_with_output()).await {
+        Ok(res) => res?,
+        Err(_) => {
+            // `child` was moved into wait_with_output(); dropping that future on
+            // timeout drops the Child, and kill_on_drop(true) sends SIGKILL.
+            bail!("omshell timed out after {:?} (process killed)", OMSHELL_TIMEOUT);
+        }
+    };
 
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&output.stderr));

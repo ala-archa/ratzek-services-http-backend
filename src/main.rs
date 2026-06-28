@@ -104,7 +104,9 @@ impl Application {
                 // Heal unlimited-clients drift on boot. Non-fatal and bounded so a
                 // half-available OMAPI can't block startup.
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
+                    // Generous: reconcile may create many OMAPI hosts via omshell
+                    // (each up to OMSHELL_TIMEOUT). Non-fatal — heals on next start.
+                    std::time::Duration::from_secs(90),
                     async { state.lock().await.reconcile_unlimited().await },
                 )
                 .await

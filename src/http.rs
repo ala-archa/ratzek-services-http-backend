@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::{future::Future, sync::Arc};
 
 use actix_web::{
@@ -270,42 +272,92 @@ struct DhcpRecord {
 }
 
 #[get("/api/v1/dhcp")]
-async fn dhcp_leases(state: Data<Arc<Mutex<State>>>) -> Result<String, APIError> {
+async fn dhcp_leases(
+    state: Data<Arc<Mutex<State>>>,
+    query: web::Query<HashMap<String, String>>,
+) -> Result<HttpResponse, APIError> {
     info!("Client requested DHCP leases");
+
+    let params = parse_list_params(&query, &["ip", "mac", "hostname", "ends"], "ip")?;
+    let ip_prefix = query.get("ip_prefix").cloned();
+    let has_mac = match query.get("has_mac").map(String::as_str) {
+        None => None,
+        Some("true") | Some("1") => Some(true),
+        Some("false") | Some("0") => Some(false),
+        Some(_) => return Err(APIError::BadRequest),
+    };
+
     let state = state.lock().await;
 
-    let ipset_acl = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
-    let ipset_shaper = crate::ipset::IPSet::new(&state.config().ipset_shaper_name);
+    // Fetch each ipset once (was an N+1: re-read per lease).
+    let acl_entries = crate::ipset::IPSet::new(&state.config().ipset_acl_name)
+        .entries()
+        .map_err(|err| {
+            error!("failed to get ACL entries: {err}");
+            APIError::InternalError
+        })?;
+    let shaper_entries = crate::ipset::IPSet::new(&state.config().ipset_shaper_name)
+        .entries()
+        .map_err(|err| {
+            error!("failed to get shaper entries: {err}");
+            APIError::InternalError
+        })?;
 
-    let mut leases = Vec::new();
-    for lease in crate::dhcp::Dhcp::read(&state.config().dhcpd_leases)
-        .map_err(|_| APIError::InternalError)?
+    let mut items: Vec<DhcpRecord> = crate::dhcp::Dhcp::read(&state.config().dhcpd_leases)
+        .map_err(|err| {
+            error!("failed to read DHCP leases: {err}");
+            APIError::InternalError
+        })?
         .all()
-    {
-        let record = DhcpRecord {
+        .into_iter()
+        .map(|lease| DhcpRecord {
             mac: lease.hardware.map(|v| v.mac),
             hostname: lease.hostname,
             client_hostname: lease.client_hostname,
             vendor_class_identifier: lease.vendor_class_identifier,
             starts: lease.dates.starts.map(|v| v.to_string()),
             ends: lease.dates.ends.map(|v| v.to_string()),
-            acl: ipset_acl
-                .entries()
-                .map_err(|_| APIError::InternalError)?
-                .into_iter()
-                .find(|acl| acl.ip == lease.ip),
-            shaper: ipset_shaper
-                .entries()
-                .map_err(|_| APIError::InternalError)?
-                .into_iter()
-                .find(|acl| acl.ip == lease.ip),
+            acl: acl_entries.iter().find(|e| e.ip == lease.ip).cloned(),
+            shaper: shaper_entries.iter().find(|e| e.ip == lease.ip).cloned(),
             ip: lease.ip,
-        };
+        })
+        .collect();
 
-        leases.push(record)
+    // Domain filters (for the admin "pick an IP" form).
+    if let Some(prefix) = &ip_prefix {
+        items.retain(|r| r.ip.starts_with(prefix));
+    }
+    if let Some(want) = has_mac {
+        items.retain(|r| r.mac.as_deref().is_some_and(|m| !m.is_empty()) == want);
+    }
+    // Free-text filter.
+    if let Some(q) = &params.q {
+        items.retain(|r| {
+            r.ip.to_lowercase().contains(q)
+                || r.mac.as_deref().is_some_and(|s| s.to_lowercase().contains(q))
+                || r.hostname
+                    .as_deref()
+                    .is_some_and(|s| s.to_lowercase().contains(q))
+                || r.client_hostname
+                    .as_deref()
+                    .is_some_and(|s| s.to_lowercase().contains(q))
+        });
     }
 
-    Ok(serde_json::ser::to_string(&leases).unwrap())
+    items.sort_by(|a, b| {
+        let primary = match params.sort.as_str() {
+            "mac" => opt_str_cmp(&a.mac, &b.mac),
+            "hostname" => opt_str_cmp(&a.hostname, &b.hostname),
+            "ends" => opt_str_cmp(&a.ends, &b.ends),
+            _ => cmp_ip(&a.ip, &b.ip),
+        };
+        // Stable: secondary by ip regardless of order.
+        ordered(primary, params.order).then_with(|| cmp_ip(&a.ip, &b.ip))
+    });
+
+    let total = items.len();
+    let page = paginate(items, &params);
+    Ok(json_with_total(&page, total))
 }
 
 #[derive(Serialize)]
@@ -570,13 +622,153 @@ struct CreateUnlimitedClient {
     comment: Option<String>,
 }
 
+// --- Server-side list pagination/sort/filter (see doc/backend-pagination-spec.md) ---
+
+#[derive(Clone, Copy, PartialEq)]
+enum SortOrder {
+    Asc,
+    Desc,
+}
+
+/// Parsed shared list query params. `page`/`per_page` are `None` when omitted,
+/// which selects "return everything" mode.
+struct ListParams {
+    page: Option<usize>,
+    per_page: Option<usize>,
+    sort: String,
+    order: SortOrder,
+    /// Lowercased free-text filter, if any.
+    q: Option<String>,
+}
+
+/// Parse/validate `page`/`per_page`/`sort`/`order`/`q`. `sort` must be in
+/// `whitelist`; any invalid value yields `400` (not silently ignored).
+fn parse_list_params(
+    query: &HashMap<String, String>,
+    whitelist: &[&str],
+    default_sort: &str,
+) -> Result<ListParams, APIError> {
+    let page = match query.get("page") {
+        None => None,
+        Some(s) => Some(
+            s.parse::<usize>()
+                .ok()
+                .filter(|&p| p >= 1)
+                .ok_or(APIError::BadRequest)?,
+        ),
+    };
+    let per_page = match query.get("per_page") {
+        None => None,
+        Some(s) => Some(
+            s.parse::<usize>()
+                .ok()
+                .filter(|&p| (1..=200).contains(&p))
+                .ok_or(APIError::BadRequest)?,
+        ),
+    };
+    let sort = match query.get("sort") {
+        None => default_sort.to_string(),
+        Some(s) if whitelist.contains(&s.as_str()) => s.clone(),
+        Some(_) => return Err(APIError::BadRequest),
+    };
+    let order = match query.get("order").map(String::as_str) {
+        None | Some("asc") => SortOrder::Asc,
+        Some("desc") => SortOrder::Desc,
+        Some(_) => return Err(APIError::BadRequest),
+    };
+    let q = query
+        .get("q")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase);
+    Ok(ListParams {
+        page,
+        per_page,
+        sort,
+        order,
+        q,
+    })
+}
+
+/// Apply the page window. Returns everything when both `page` and `per_page`
+/// are absent; otherwise defaults to page=1, per_page=25.
+fn paginate<T>(items: Vec<T>, p: &ListParams) -> Vec<T> {
+    if p.page.is_none() && p.per_page.is_none() {
+        return items;
+    }
+    let page = p.page.unwrap_or(1);
+    let per_page = p.per_page.unwrap_or(25);
+    items
+        .into_iter()
+        .skip((page - 1) * per_page)
+        .take(per_page)
+        .collect()
+}
+
+/// JSON array body + `X-Total-Count` (count after filtering, before pagination).
+fn json_with_total<T: Serialize>(items: &[T], total: usize) -> HttpResponse {
+    HttpResponse::Ok()
+        .insert_header(("X-Total-Count", total.to_string()))
+        .json(items)
+}
+
+/// Compare IP strings numerically when both parse (so `10.11.5.9` < `10.11.5.30`),
+/// else lexicographically.
+fn cmp_ip(a: &str, b: &str) -> Ordering {
+    match (a.parse::<std::net::IpAddr>(), b.parse::<std::net::IpAddr>()) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        _ => a.cmp(b),
+    }
+}
+
+fn opt_str_cmp(a: &Option<String>, b: &Option<String>) -> Ordering {
+    a.as_deref().unwrap_or("").cmp(b.as_deref().unwrap_or(""))
+}
+
+fn ordered(primary: Ordering, order: SortOrder) -> Ordering {
+    if order == SortOrder::Desc {
+        primary.reverse()
+    } else {
+        primary
+    }
+}
+
 #[get("/api/v1/admin/unlimited-clients")]
 async fn unlimited_list(
     _auth: AuthSession,
     state: Data<Arc<Mutex<State>>>,
+    query: web::Query<HashMap<String, String>>,
 ) -> Result<HttpResponse, APIError> {
+    let params = parse_list_params(&query, &["name", "ip", "mac", "comment"], "name")?;
+
     let store = { state.lock().await.unlimited_clients().clone() };
-    Ok(HttpResponse::Ok().json(store.list().await))
+    let mut items = store.list().await;
+
+    if let Some(q) = &params.q {
+        items.retain(|c| {
+            c.name.to_lowercase().contains(q)
+                || c.ip.to_lowercase().contains(q)
+                || c.mac.to_lowercase().contains(q)
+                || c.comment
+                    .as_deref()
+                    .is_some_and(|s| s.to_lowercase().contains(q))
+        });
+    }
+
+    items.sort_by(|a, b| {
+        let primary = match params.sort.as_str() {
+            "ip" => cmp_ip(&a.ip, &b.ip),
+            "mac" => a.mac.cmp(&b.mac),
+            "comment" => opt_str_cmp(&a.comment, &b.comment),
+            _ => a.name.cmp(&b.name),
+        };
+        // Stable: secondary by name (ascending) regardless of order.
+        ordered(primary, params.order).then_with(|| a.name.cmp(&b.name))
+    });
+
+    let total = items.len();
+    let page = paginate(items, &params);
+    Ok(json_with_total(&page, total))
 }
 
 #[get("/api/v1/admin/unlimited-clients/{name}")]
@@ -820,5 +1012,78 @@ mod tests {
         let v = serde_json::to_value(&empty).unwrap();
         assert!(v["speedtest"].is_null());
         assert!(v["isp_balance"].is_null());
+    }
+
+    fn qmap(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn parse_list_params_defaults_validation_and_lowercasing() {
+        let wl = &["name", "ip"];
+
+        // No params -> "return everything" mode + defaults.
+        let p = parse_list_params(&HashMap::new(), wl, "name").unwrap();
+        assert!(p.page.is_none() && p.per_page.is_none());
+        assert_eq!(p.sort, "name");
+        assert!(matches!(p.order, SortOrder::Asc));
+        assert!(p.q.is_none());
+
+        let p = parse_list_params(
+            &qmap(&[
+                ("page", "2"),
+                ("per_page", "10"),
+                ("sort", "ip"),
+                ("order", "desc"),
+                ("q", "Foo"),
+            ]),
+            wl,
+            "name",
+        )
+        .unwrap();
+        assert_eq!(p.page, Some(2));
+        assert_eq!(p.per_page, Some(10));
+        assert_eq!(p.sort, "ip");
+        assert!(matches!(p.order, SortOrder::Desc));
+        assert_eq!(p.q.as_deref(), Some("foo")); // lowercased
+
+        let bad = |k: &str, v: &str| parse_list_params(&qmap(&[(k, v)]), wl, "name").is_err();
+        assert!(bad("page", "0"));
+        assert!(bad("page", "x"));
+        assert!(bad("per_page", "0"));
+        assert!(bad("per_page", "201"));
+        assert!(bad("sort", "secret_field"));
+        assert!(bad("order", "up"));
+    }
+
+    #[test]
+    fn paginate_window_and_return_all() {
+        let all: Vec<usize> = (1..=10).collect();
+        let mk = |page, per_page| ListParams {
+            page,
+            per_page,
+            sort: "x".into(),
+            order: SortOrder::Asc,
+            q: None,
+        };
+        // Both absent -> everything.
+        assert_eq!(paginate(all.clone(), &mk(None, None)).len(), 10);
+        // page 2 of size 3.
+        assert_eq!(paginate(all.clone(), &mk(Some(2), Some(3))), vec![4, 5, 6]);
+        // Beyond data -> empty (not an error).
+        assert!(paginate(all.clone(), &mk(Some(99), Some(3))).is_empty());
+        // Only per_page -> page defaults to 1.
+        assert_eq!(paginate(all, &mk(None, Some(4))), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn cmp_ip_is_numeric_not_lexical() {
+        assert_eq!(cmp_ip("10.11.5.9", "10.11.5.30"), Ordering::Less);
+        assert_eq!(cmp_ip("10.11.5.221", "10.11.5.30"), Ordering::Greater);
+        // non-IP falls back to string compare
+        assert_eq!(cmp_ip("abc", "abd"), Ordering::Less);
     }
 }

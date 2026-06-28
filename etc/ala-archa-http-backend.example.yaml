@@ -42,7 +42,8 @@ unlimited_subnet: "10.11.5.0/24"
 #   server: "127.0.0.1"
 #   port: 7911
 #   key_name: omapi_key
-#   key_secret: "base64-hmac-md5-secret"   # generate with: openssl rand -base64 32
+#   # MUST be alphanumeric (no '/','+','=') — omshell truncates base64 specials.
+#   key_secret: "alnumSecret"   # generate: openssl rand -base64 64 | tr -d '/+=' | head -c 40
 #   omshell_path: /usr/bin/omshell          # must be an absolute path
 
 telegram:

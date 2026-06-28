@@ -128,6 +128,12 @@ pub struct Config {
     pub omapi: Option<Omapi>,
 }
 
+/// An OMAPI key secret is safe only if non-empty and purely alphanumeric — see
+/// the note in [`Config::validate`] about omshell truncating base64 specials.
+fn is_valid_omapi_secret(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 impl Config {
     fn validate(&self) -> Result<()> {
         // Fail fast on a malformed admin password hash so the process refuses to
@@ -142,12 +148,22 @@ impl Config {
             .parse::<ipnet::IpNet>()
             .map_err(|err| anyhow::anyhow!("Invalid unlimited_subnet {:?}: {err}", self.unlimited_subnet))?;
 
-        // omshell must be an absolute path (avoid PATH hijacking).
         if let Some(omapi) = &self.omapi {
+            // omshell must be an absolute path (avoid PATH hijacking).
             if !std::path::Path::new(&omapi.omshell_path).is_absolute() {
                 anyhow::bail!(
                     "omapi.omshell_path must be absolute, got {:?}",
                     omapi.omshell_path
+                );
+            }
+            // The secret is passed unquoted to `omshell key <name> <secret>`, whose
+            // tokenizer truncates at base64 specials ('/', '+', '='), so the key it
+            // uses silently differs from dhcpd's -> auth fails with "dhcpctl_connect:
+            // no more". Require a purely alphanumeric secret.
+            if !is_valid_omapi_secret(&omapi.key_secret) {
+                anyhow::bail!(
+                    "omapi.key_secret must be non-empty and alphanumeric (no '/','+','='); \
+                     generate e.g. `openssl rand -base64 64 | tr -d '/+=' | head -c 40`"
                 );
             }
         }
@@ -170,5 +186,19 @@ impl Config {
 
         config.validate()?;
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_omapi_secret;
+
+    #[test]
+    fn omapi_secret_validation() {
+        assert!(is_valid_omapi_secret("abcDEF123"));
+        assert!(!is_valid_omapi_secret("")); // empty
+        assert!(!is_valid_omapi_secret("ab/cd")); // base64 '/'
+        assert!(!is_valid_omapi_secret("ab+cd")); // base64 '+'
+        assert!(!is_valid_omapi_secret("abcd==")); // base64 padding
     }
 }
