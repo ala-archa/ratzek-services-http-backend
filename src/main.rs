@@ -125,10 +125,12 @@ impl Application {
                         .service(http::admin_login)
                         .service(http::admin_logout)
                         .service(http::admin_me)
+                        .service(http::admin_status)
                         .service(http::unlimited_list)
                         .service(http::unlimited_get)
                         .service(http::unlimited_create)
                         .service(http::unlimited_delete)
+                        .service(http::unlimited_patch)
                 })
                 .bind(&http_listen)?
                 .run()

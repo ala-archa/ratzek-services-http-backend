@@ -55,7 +55,22 @@ fn check_output(op: &str, out: &str, idempotent_markers: &[&str]) -> Result<()> 
             return Ok(());
         }
     }
-    const ERROR_MARKERS: &[&str] = &["can't", "not found", "no such", "invalid", "failed", "error"];
+    // More specific phrases than a bare "error"/"failed" substring, which would
+    // false-positive on benign output like "no errors" or "Reference".
+    const ERROR_MARKERS: &[&str] = &[
+        "can't",
+        "cannot",
+        "not found",
+        "no such",
+        "is invalid",
+        "invalid ",
+        "unable to",
+        "failed to",
+        ": error",
+        "error:",
+        "connection refused",
+        "timed out",
+    ];
     if let Some(marker) = ERROR_MARKERS.iter().find(|m| lower.contains(**m)) {
         bail!("omshell {op} reported error (marker {marker:?}): {}", out.trim());
     }

@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "ala-archa-http-backend"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "actix-web",
  "anyhow",

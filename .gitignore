@@ -29,3 +29,6 @@ Session.vim
 .favorites.json
 .settings/
 
+
+# Local debug logs
+mcp_debug.log

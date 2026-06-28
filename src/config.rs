@@ -103,6 +103,8 @@ pub struct Config {
     pub dhcpd_leases: std::path::PathBuf,
     #[serde(default)]
     pub blacklisted_macs: Vec<String>,
+    /// Deprecated: superseded by the unlimited-clients store. Kept only so the
+    /// `migrate-unlimited` command can still read it; not used for classification.
     #[serde(default)]
     pub no_shaping_ips: HashSet<String>,
     pub no_shaping_timeout: u64,

@@ -2,7 +2,7 @@ use std::{future::Future, sync::Arc};
 
 use actix_web::{
     cookie::{Cookie, SameSite},
-    delete, get, post,
+    delete, get, patch, post,
     web::{self, Data},
     HttpRequest, HttpResponse,
 };
@@ -48,7 +48,12 @@ struct ServiceInfo {
 fn client_ip(req: &HttpRequest) -> Option<String> {
     req.headers()
         .get("x-real-ip")
-        .and_then(|v| v.to_str().ok().map(|v| v.to_string()))
+        .and_then(|v| v.to_str().ok())
+        // Trust X-Real-IP only if it parses as an IP. Rejects a forged header
+        // (e.g. with embedded newlines) so it can't be used for log injection
+        // when the backend is reached without the trusted reverse proxy.
+        .filter(|s| s.parse::<std::net::IpAddr>().is_ok())
+        .map(|s| s.to_string())
         .or_else(|| req.peer_addr().map(|v| v.ip().to_string()))
 }
 
@@ -73,14 +78,12 @@ where
 
     let is_no_shape = {
         let state = state.lock().await;
-        // The runtime store is the source of truth; `no_shaping_ips` from the
-        // static config is kept as a transitional fallback until migration.
-        state.config().no_shaping_ips.contains(&client_ip)
-            || state.unlimited_clients().contains_ip(&client_ip).await
+        // The unlimited-clients store is the single source of truth (legacy
+        // config.no_shaping_ips is no longer consulted; migrated into the store).
+        state.unlimited_clients().contains_ip(&client_ip).await
     };
     if is_no_shape {
         info!("Client is in no_shape list");
-        slog_scope::logger().new(slog::slog_o!("client_ip" => client_ip.clone()));
         return cb(client_ip, Client::Whitelist).await;
     }
 
@@ -272,7 +275,7 @@ async fn dhcp_leases(state: Data<Arc<Mutex<State>>>) -> Result<String, APIError>
     let state = state.lock().await;
 
     let ipset_acl = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
-    let ipset_shaper = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
+    let ipset_shaper = crate::ipset::IPSet::new(&state.config().ipset_shaper_name);
 
     let mut leases = Vec::new();
     for lease in crate::dhcp::Dhcp::read(&state.config().dhcpd_leases)
@@ -305,159 +308,130 @@ async fn dhcp_leases(state: Data<Arc<Mutex<State>>>) -> Result<String, APIError>
     Ok(serde_json::ser::to_string(&leases).unwrap())
 }
 
+#[derive(Serialize)]
+struct LeaseCounts {
+    free: usize,
+    active: usize,
+    abandoned: usize,
+}
+
+/// System status snapshot. Shared by `/metrics` (rendered to Prometheus text)
+/// and `GET /api/v1/admin/status` (returned as JSON).
+#[derive(Serialize)]
+struct AdminStatus {
+    internet_available: bool,
+    speedtest: Option<crate::speedtest::SpeedTest>,
+    isp_balance: Option<f64>,
+    last_tariff_update_secs: Option<i64>,
+    clients_in_acl: usize,
+    clients_in_shaper: usize,
+    dhcp_leases: LeaseCounts,
+}
+
+/// Collect the system status once, from persistent state + ipsets + DHCP leases.
+async fn collect_status(state: &State) -> Result<AdminStatus, APIError> {
+    let cfg = state.config();
+
+    let count_set = |name: &str| -> Result<usize, APIError> {
+        crate::ipset::IPSet::new(name)
+            .entries()
+            .map(|e| e.len())
+            .map_err(|err| {
+                error!("failed to get {name} entries: {err}");
+                APIError::InternalError
+            })
+    };
+    let clients_in_acl = count_set(&cfg.ipset_acl_name)?;
+    let clients_in_shaper = count_set(&cfg.ipset_shaper_name)?;
+
+    let leases = crate::dhcp::Dhcp::read(&cfg.dhcpd_leases)
+        .map_err(|err| {
+            error!("failed to read DHCP leases: {err}");
+            APIError::InternalError
+        })?
+        .all();
+    let count = |s: dhcpd_parser::leases::BindingState| {
+        leases.iter().filter(|v| v.binding_state == s).count()
+    };
+    let lease_counts = LeaseCounts {
+        free: count(dhcpd_parser::leases::BindingState::Free),
+        active: count(dhcpd_parser::leases::BindingState::Active),
+        abandoned: count(dhcpd_parser::leases::BindingState::Abandoned),
+    };
+
+    let ps = state.persistent_state().await;
+    Ok(AdminStatus {
+        internet_available: ps.is_wide_network_available.unwrap_or(false),
+        speedtest: ps.speedtest,
+        isp_balance: ps.balance,
+        last_tariff_update_secs: ps
+            .last_tariff_update
+            .map(|t| (t - chrono::Utc::now()).num_seconds()),
+        clients_in_acl,
+        clients_in_shaper,
+        dhcp_leases: lease_counts,
+    })
+}
+
+fn gauge(name: &str, help: &str, value: f64) -> String {
+    use prometheus_exporter_base::prelude::*;
+    PrometheusMetric::build()
+        .with_name(name)
+        .with_metric_type(MetricType::Gauge)
+        .with_help(help)
+        .build()
+        .render_and_append_instance(&PrometheusInstance::new().with_value(value))
+        .render()
+}
+
 #[get("/metrics")]
 async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, APIError> {
-    use prometheus_exporter_base::prelude::*;
-
     info!("Client requested prometheus exporter data");
+    let status = collect_status(&*state.lock().await).await?;
 
-    let state = state.lock().await;
-
-    let ipset_acl = crate::ipset::IPSet::new(&state.config().ipset_acl_name);
-    let ipset_shaper = crate::ipset::IPSet::new(&state.config().ipset_shaper_name);
-
-    let persistent_state = state.persistent_state().await;
-
-    let mut metrics = Vec::new();
-    metrics.push(
-        PrometheusMetric::build()
-            .with_name("ratzek_internet_available")
-            .with_metric_type(MetricType::Gauge)
-            .with_help("Flag of wide internet availability")
-            .build()
-            .render_and_append_instance(
-                &PrometheusInstance::new()
-                    .with_value(persistent_state.is_wide_network_available.unwrap_or(false) as i8),
-            )
-            .render(),
+    let mut out = String::new();
+    out += &gauge(
+        "ratzek_internet_available",
+        "Flag of wide internet availability",
+        status.internet_available as i64 as f64,
     );
-
-    if let Some(speedtest_result) = persistent_state.speedtest {
-        metrics.push(
-            PrometheusMetric::build()
-                .with_name("ratzek_speedtest_download")
-                .with_metric_type(MetricType::Gauge)
-                .with_help("Speedtest download speed")
-                .build()
-                .render_and_append_instance(
-                    &PrometheusInstance::new().with_value(speedtest_result.download),
-                )
-                .render(),
-        );
-        metrics.push(
-            PrometheusMetric::build()
-                .with_name("ratzek_speedtest_upload")
-                .with_metric_type(MetricType::Gauge)
-                .with_help("Speedtest upload speed")
-                .build()
-                .render_and_append_instance(
-                    &PrometheusInstance::new().with_value(speedtest_result.upload),
-                )
-                .render(),
-        );
-        metrics.push(
-            PrometheusMetric::build()
-                .with_name("ratzek_speedtest_ping")
-                .with_metric_type(MetricType::Gauge)
-                .with_help("Speedtest ping speed")
-                .build()
-                .render_and_append_instance(
-                    &PrometheusInstance::new().with_value(speedtest_result.ping),
-                )
-                .render(),
-        );
+    if let Some(st) = &status.speedtest {
+        out += &gauge("ratzek_speedtest_download", "Speedtest download speed", st.download);
+        out += &gauge("ratzek_speedtest_upload", "Speedtest upload speed", st.upload);
+        out += &gauge("ratzek_speedtest_ping", "Speedtest ping speed", st.ping);
     }
-
-    if let Some(balance) = persistent_state.balance {
-        metrics.push(
-            PrometheusMetric::build()
-                .with_name("ratzek_isp_balance")
-                .with_metric_type(MetricType::Gauge)
-                .with_help("ISP balance")
-                .build()
-                .render_and_append_instance(&PrometheusInstance::new().with_value(balance))
-                .render(),
-        );
+    if let Some(balance) = status.isp_balance {
+        out += &gauge("ratzek_isp_balance", "ISP balance", balance);
     }
-
-    if let Some(last_tariff_update) = persistent_state.last_tariff_update {
-        metrics.push(
-            PrometheusMetric::build()
-                .with_name("ratzek_last_tariff_update")
-                .with_metric_type(MetricType::Gauge)
-                .with_help("Last tariff update")
-                .build()
-                .render_and_append_instance(
-                    &PrometheusInstance::new()
-                        .with_value((last_tariff_update - chrono::Utc::now()).num_seconds()),
-                )
-                .render(),
-        );
+    if let Some(secs) = status.last_tariff_update_secs {
+        out += &gauge("ratzek_last_tariff_update", "Last tariff update", secs as f64);
     }
-
-    metrics.push(
-        PrometheusMetric::build()
-            .with_name("ratzek_clients_in_acl")
-            .with_metric_type(MetricType::Gauge)
-            .with_help("Number of clients in ACL")
-            .build()
-            .render_and_append_instance(
-                &PrometheusInstance::new().with_value(
-                    ipset_acl
-                        .entries()
-                        .map_err(|err| {
-                            error!("failed to get ACL entries: {}", err);
-                            APIError::InternalError
-                        })?
-                        .len(),
-                ),
-            )
-            .render(),
+    out += &gauge(
+        "ratzek_clients_in_acl",
+        "Number of clients in ACL",
+        status.clients_in_acl as f64,
     );
-    metrics.push(
-        PrometheusMetric::build()
-            .with_name("ratzek_clients_in_shaper")
-            .with_metric_type(MetricType::Gauge)
-            .with_help("Number of clients in shaper")
-            .build()
-            .render_and_append_instance(
-                &PrometheusInstance::new().with_value(
-                    ipset_shaper
-                        .entries()
-                        .map_err(|err| {
-                            error!("failed to get shaper entries: {}", err);
-                            APIError::InternalError
-                        })?
-                        .len(),
-                ),
-            )
-            .render(),
+    out += &gauge(
+        "ratzek_clients_in_shaper",
+        "Number of clients in shaper",
+        status.clients_in_shaper as f64,
     );
-
-    let leases = crate::dhcp::Dhcp::read(&state.config().dhcpd_leases)
-        .map_err(|_| APIError::InternalError)?
-        .all();
-
-    for (name, state) in [
-        ("free", dhcpd_parser::leases::BindingState::Free),
-        ("active", dhcpd_parser::leases::BindingState::Active),
-        ("abandoned", dhcpd_parser::leases::BindingState::Abandoned),
-    ] {
-        metrics.push(
-            PrometheusMetric::build()
-                .with_name(&format!("ratzek_dhcp_leases_{}", name))
-                .with_metric_type(MetricType::Gauge)
-                .with_help(&format!("Number of {} DHCP leases", name))
-                .build()
-                .render_and_append_instance(
-                    &PrometheusInstance::new()
-                        .with_value(leases.iter().filter(|v| v.binding_state == state).count()),
-                )
-                .render(),
-        )
-    }
-
-    Ok(metrics.join(""))
+    out += &gauge(
+        "ratzek_dhcp_leases_free",
+        "Number of free DHCP leases",
+        status.dhcp_leases.free as f64,
+    );
+    out += &gauge(
+        "ratzek_dhcp_leases_active",
+        "Number of active DHCP leases",
+        status.dhcp_leases.active as f64,
+    );
+    out += &gauge(
+        "ratzek_dhcp_leases_abandoned",
+        "Number of abandoned DHCP leases",
+        status.dhcp_leases.abandoned as f64,
+    );
+    Ok(out)
 }
 
 #[derive(Deserialize)]
@@ -538,6 +512,15 @@ async fn admin_logout(store: Data<SessionStore>, req: HttpRequest) -> HttpRespon
 #[get("/api/v1/admin/me")]
 async fn admin_me(auth: AuthSession) -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({ "login": auth.login }))
+}
+
+#[get("/api/v1/admin/status")]
+async fn admin_status(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+) -> Result<HttpResponse, APIError> {
+    let status = collect_status(&*state.lock().await).await?;
+    Ok(HttpResponse::Ok().json(status))
 }
 
 // --- Unlimited clients CRUD (admin-only via AuthSession) ---
@@ -752,4 +735,90 @@ async fn unlimited_delete(
         client.name, client.ip
     );
     Ok(HttpResponse::NoContent().finish())
+}
+
+#[derive(Deserialize)]
+struct PatchUnlimitedClient {
+    /// New comment (or `null` to clear). Only the comment can be edited; to
+    /// change ip/name, delete and recreate.
+    #[serde(default)]
+    comment: Option<String>,
+}
+
+#[patch("/api/v1/admin/unlimited-clients/{name}")]
+async fn unlimited_patch(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    req: HttpRequest,
+    path: web::Path<String>,
+    body: web::Json<PatchUnlimitedClient>,
+) -> Result<HttpResponse, APIError> {
+    let admin_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
+    let name = path.into_inner();
+    let store = { state.lock().await.unlimited_clients().clone() };
+
+    let _guard = store.lock_for_mutation().await;
+    match store.set_comment(&name, body.comment.clone()).await {
+        Ok(true) => {
+            info!("Admin updated comment of unlimited client {name} from {admin_ip}");
+            match store.get(&name).await {
+                Some(client) => Ok(HttpResponse::Ok().json(client)),
+                None => Err(APIError::NotFound),
+            }
+        }
+        Ok(false) => Err(APIError::NotFound),
+        Err(err) => {
+            warn!("Rejected comment update for {name} (from {admin_ip}): {err}");
+            Err(APIError::BadRequest)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_status_serializes_to_documented_shape() {
+        let full = AdminStatus {
+            internet_available: true,
+            speedtest: Some(crate::speedtest::SpeedTest {
+                download: 1.0,
+                upload: 2.0,
+                ping: 3.0,
+            }),
+            isp_balance: Some(42.0),
+            last_tariff_update_secs: Some(-10),
+            clients_in_acl: 5,
+            clients_in_shaper: 3,
+            dhcp_leases: LeaseCounts {
+                free: 1,
+                active: 2,
+                abandoned: 0,
+            },
+        };
+        let v = serde_json::to_value(&full).unwrap();
+        assert_eq!(v["internet_available"], true);
+        assert_eq!(v["speedtest"]["download"], 1.0);
+        assert_eq!(v["clients_in_acl"], 5);
+        assert_eq!(v["dhcp_leases"]["active"], 2);
+
+        // Optional fields serialize as null when absent.
+        let empty = AdminStatus {
+            internet_available: false,
+            speedtest: None,
+            isp_balance: None,
+            last_tariff_update_secs: None,
+            clients_in_acl: 0,
+            clients_in_shaper: 0,
+            dhcp_leases: LeaseCounts {
+                free: 0,
+                active: 0,
+                abandoned: 0,
+            },
+        };
+        let v = serde_json::to_value(&empty).unwrap();
+        assert!(v["speedtest"].is_null());
+        assert!(v["isp_balance"].is_null());
+    }
 }

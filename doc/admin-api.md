@@ -136,6 +136,18 @@
 | `404` | имя не найдено |
 | `500` | ошибка снятия побочных эффектов — можно повторить |
 
+### PATCH `/api/v1/admin/unlimited-clients/{name}`
+Изменить **только `comment`** (смена `ip`/`name` — через delete+create). Без OMAPI/ipset
+side-effects. Тело:
+```json
+{ "comment": "новый комментарий" }   // или { "comment": null } чтобы очистить
+```
+| Статус | Когда |
+|---|---|
+| `200` | обновлено; тело — `UnlimitedClient` |
+| `404` | имя не найдено |
+| `400` | `comment` > 256 символов / тело не распарсилось |
+
 ---
 
 ## 3. DHCP-аренды (`GET /api/v1/dhcp`)
@@ -162,11 +174,7 @@
 ```
 Поля `acl`/`shaper` — запись соответствующего ipset (объект `{ip, timeout?, bytes?}`,
 `timeout` сериализуется как `{secs, nanos}` или `null`) либо `null`, если IP в наборе нет.
-Наличие `acl` = устройство имеет доступ в интернет.
-
-> ⚠️ **Известный баг бэкенда:** поле `shaper` сейчас читается из **того же ACL-набора**,
-> что и `acl` (а не из shaper-ipset), поэтому фактически **дублирует `acl`**. Не
-> полагайся на `shaper` как на признак шейпинга, пока баг не починят.
+Наличие `acl` = устройство имеет доступ в интернет; наличие `shaper` = устройство шейпится.
 
 **UX-подсказка для формы создания безлимита:** фильтруй аренды по `10.11.5.*`, показывай
 `ip` + `hostname`/`mac`, дай ввести `name` и `comment`, отправь `POST` (MAC сервер
@@ -174,13 +182,28 @@
 
 ---
 
-## 4. Состояние системы / метрики (`GET /metrics`)
+## 4. Состояние системы (`GET /api/v1/admin/status` — JSON, и `/metrics` — Prometheus)
 
-Единственный источник системного статуса — **Prometheus-эндпоинт** (публичный,
-**текстовый формат `text/plain`, не JSON**). Для дашборда админки его придётся
-распарсить (или попросить бэкенд добавить JSON-эндпоинт — сейчас его нет, см. §9).
+### GET `/api/v1/admin/status` (для дашборда)
+Под `AuthSession`. JSON-снимок состояния системы. → `200`:
+```jsonc
+{
+  "internet_available": true,
+  "speedtest": { "download": 0.0, "upload": 0.0, "ping": 0.0 } | null, // null если не измерялось
+  "isp_balance": 0.0 | null,
+  "last_tariff_update_secs": -123 | null,   // секунд с обновления тарифа (отрицательное)
+  "clients_in_acl": 48,                     // клиентов с доступом
+  "clients_in_shaper": 24,                  // клиентов под шейпингом
+  "dhcp_leases": { "free": 0, "active": 0, "abandoned": 0 }
+}
+```
+Опциональные поля сериализуются как `null`. Строй дашборд на этом эндпоинте.
 
-Метрики (все — gauge):
+> **Производительность:** каждый вызов читает `dhcpd.leases` (~4k строк) + 2 ipset.
+> Поллить не чаще ~30–60 сек.
+
+### GET `/metrics` (Prometheus, для мониторинга)
+Публичный, **текстовый `text/plain`**. Те же данные в Prometheus exposition. Метрики (gauge):
 | Метрика | Смысл |
 |---|---|
 | `ratzek_internet_available` | есть ли интернет наружу: `1`/`0` |
@@ -275,8 +298,15 @@ curl -i -b jar -X POST $BASE/api/v1/admin/unlimited-clients \
   -H 'content-type: application/json' \
   -d '{"name":"evgenii-phone","ip":"10.11.5.50","comment":"личный"}'
 
+# Изменить комментарий
+curl -i -b jar -X PATCH $BASE/api/v1/admin/unlimited-clients/evgenii-phone \
+  -H 'content-type: application/json' -d '{"comment":"обновлённый"}'
+
 # Удалить
 curl -i -b jar -X DELETE $BASE/api/v1/admin/unlimited-clients/evgenii-phone
+
+# Статус системы (дашборд)
+curl -b jar $BASE/api/v1/admin/status
 
 # Логаут
 curl -b jar -X POST $BASE/api/v1/admin/logout
@@ -309,25 +339,21 @@ curl -b jar -X POST $BASE/api/v1/admin/logout
 | `GET /api/v1/admin/unlimited-clients` | список безлимитов | да | да |
 | `GET /api/v1/admin/unlimited-clients/{name}` | один безлимит | да | да |
 | `POST /api/v1/admin/unlimited-clients` | создать безлимит | да | да |
+| `PATCH /api/v1/admin/unlimited-clients/{name}` | изменить `comment` | да | да |
 | `DELETE /api/v1/admin/unlimited-clients/{name}` | удалить безлимит | да | да |
+| `GET /api/v1/admin/status` | JSON-статус системы (дашборд) | да | да |
 | `GET /api/v1/dhcp` | список DHCP-аренд | нет* | да (устройства / выбор IP) |
-| `GET /metrics` | метрики Prometheus (статус системы) | нет | да (дашборд) |
+| `GET /metrics` | метрики Prometheus | нет | мониторинг |
 | `GET /api/v1/client` | статус доступа вызывающего | нет | нет (клиентский) |
 | `POST /api/v1/client` | саморегистрация вызывающего | нет | нет (клиентский) |
 
 \* публичный, но прячь за общим guard'ом админки.
 
-**Пробелы (если понадобится полный функционал — запросить у бэкенд-команды):**
-- **Нет JSON-эндпоинта статуса системы** — для дашборда придётся парсить текстовый
-  `/metrics`. Можно попросить добавить `GET /api/v1/admin/status` с JSON.
-- **`GET /api/v1/dhcp` без авторизации** — пока полагаемся на guard на фронте; при
-  необходимости попросить закрыть его `AuthSession`.
-- **`blacklisted_macs` и legacy `no_shaping_ips` правятся только в конфиге** —
-  API для управления чёрным списком/легаси-списком нет.
-- **Изменение безлимит-клиента (`PUT`/`PATCH`) не поддерживается** — только
-  create/delete; чтобы поменять `comment`/`name`, удали и создай заново.
-- **Баг бэкенда:** в `GET /api/v1/dhcp` поле `shaper` дублирует `acl` (см. §3) —
-  стоит починить отдельной задачей.
-- **OMAPI-cutover не завершён** → `POST` безлимитов временно `500`; `DELETE`
-  возвращает `204`, но эффект неполный до cutover (см. §6). После завершения —
-  без изменений на фронте.
+**Безопасность:** хост `www.ratzek` — **только HTTP (нет TLS)** и `GET /api/v1/dhcp`
+публичный, поэтому админку держать в **trusted LAN** (staff-сеть, не guest).
+
+**Известные пробелы (вне текущего scope):**
+- **`blacklisted_macs` правится только в конфиге** — API управления чёрным списком нет.
+- **Смена `ip`/`name` безлимит-клиента** — только delete+create (PATCH меняет лишь `comment`).
+- **OMAPI-cutover:** до его завершения `POST` безлимитов возвращает `500`, а `DELETE`
+  даёт `204`, но с неполным эффектом (см. §6). После cutover — полноценно, без правок фронта.

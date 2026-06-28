@@ -155,6 +155,29 @@ impl UnlimitedClientsStore {
         Ok(())
     }
 
+    /// Update only the `comment` of an existing client. Returns `false` if the
+    /// name is unknown. Validates comment length. Atomic write (see [`Self::add`]).
+    pub async fn set_comment(&self, name: &str, comment: Option<String>) -> Result<bool> {
+        if let Some(c) = &comment {
+            if c.len() > MAX_COMMENT_LEN {
+                bail!("comment too long ({} > {MAX_COMMENT_LEN})", c.len());
+            }
+        }
+        let mut next = self.cache.read().await.clone();
+        let found = match next.get_mut(name) {
+            Some(client) => {
+                client.comment = comment;
+                true
+            }
+            None => false,
+        };
+        if found {
+            self.persist(&next)?;
+            *self.cache.write().await = next;
+        }
+        Ok(found)
+    }
+
     fn persist(&self, map: &HashMap<String, UnlimitedClient>) -> Result<()> {
         let mut list: Vec<&UnlimitedClient> = map.values().collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
@@ -252,6 +275,43 @@ mod tests {
 
         store.remove("phone").await.unwrap();
         assert!(!store.contains_ip("10.11.5.50").await);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn set_comment_updates_persists_and_validates() {
+        let dir = std::env::temp_dir().join(format!("uc-cmt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clients.yaml");
+
+        let store = UnlimitedClientsStore::load(&path).unwrap();
+        store
+            .add(UnlimitedClient {
+                name: "phone".into(),
+                mac: "aa:bb:cc:dd:ee:ff".into(),
+                ip: "10.11.5.50".into(),
+                comment: None,
+            })
+            .await
+            .unwrap();
+
+        // updates and persists
+        assert!(store.set_comment("phone", Some("hi".into())).await.unwrap());
+        let reloaded = UnlimitedClientsStore::load(&path).unwrap();
+        assert_eq!(
+            reloaded.get("phone").await.unwrap().comment.as_deref(),
+            Some("hi")
+        );
+
+        // unknown name -> false, no error
+        assert!(!store.set_comment("nope", None).await.unwrap());
+
+        // too long -> error
+        assert!(store
+            .set_comment("phone", Some("x".repeat(257)))
+            .await
+            .is_err());
 
         std::fs::remove_dir_all(&dir).ok();
     }
