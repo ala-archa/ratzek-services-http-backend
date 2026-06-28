@@ -1,24 +1,28 @@
 use std::{future::Future, sync::Arc};
 
 use actix_web::{
+    cookie::{Cookie, SameSite},
     get,
     http::{header::ContentType, StatusCode},
     post,
-    web::Data,
+    web::{self, Data},
     HttpRequest, HttpResponse,
 };
 use derive_more::{Display, Error};
 use dhcpd_parser::parser::LeasesMethods;
-use serde::Serialize;
-use slog_scope::{error, info};
+use serde::{Deserialize, Serialize};
+use slog_scope::{error, info, warn};
 use tokio::sync::Mutex;
 
+use crate::session::{AuthSession, SessionStore, SESSION_COOKIE};
 use crate::state::State;
 
 #[derive(Debug, Display, Error)]
-enum APIError {
+pub enum APIError {
     #[display(fmt = "internal error")]
     InternalError,
+    #[display(fmt = "unauthorized")]
+    Unauthorized,
 }
 
 impl actix_web::error::ResponseError for APIError {
@@ -31,6 +35,7 @@ impl actix_web::error::ResponseError for APIError {
     fn status_code(&self) -> StatusCode {
         match *self {
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
         }
     }
 }
@@ -473,4 +478,84 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
     }
 
     Ok(metrics.join(""))
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    login: String,
+    password: String,
+}
+
+#[post("/api/v1/admin/login")]
+async fn admin_login(
+    state: Data<Arc<Mutex<State>>>,
+    store: Data<SessionStore>,
+    req: HttpRequest,
+    body: web::Json<LoginRequest>,
+) -> Result<HttpResponse, APIError> {
+    let client_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
+
+    let admin = { state.lock().await.config().admin.clone() };
+    let admin = match admin {
+        Some(admin) => admin,
+        None => {
+            warn!("Admin login attempt but no admin configured (from {client_ip})");
+            return Err(APIError::Unauthorized);
+        }
+    };
+
+    // argon2 verification is CPU-bound; keep it off the async worker thread.
+    let password_hash = admin.password_hash.clone();
+    let password = body.password.clone();
+    let verified = tokio::task::spawn_blocking(move || {
+        crate::session::verify_password(&password_hash, &password)
+    })
+    .await
+    .map_err(|err| {
+        error!("Password verification task failed: {err}");
+        APIError::InternalError
+    })?
+    .map_err(|err| {
+        error!("Password verification error: {err}");
+        APIError::InternalError
+    })?;
+
+    if body.login != admin.login || !verified {
+        warn!("Failed admin login for {:?} from {client_ip}", body.login);
+        return Err(APIError::Unauthorized);
+    }
+
+    let token = store.create(admin.login.clone());
+    info!("Admin {:?} logged in from {client_ip}", admin.login);
+
+    let cookie = Cookie::build(SESSION_COOKIE, token)
+        .http_only(true)
+        .same_site(SameSite::Strict)
+        .secure(admin.cookie_secure)
+        .path("/")
+        .finish();
+
+    Ok(HttpResponse::Ok()
+        .cookie(cookie)
+        .json(serde_json::json!({ "login": admin.login })))
+}
+
+#[post("/api/v1/admin/logout")]
+async fn admin_logout(store: Data<SessionStore>, req: HttpRequest) -> HttpResponse {
+    let client_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
+
+    if let Some(token) = req.cookie(SESSION_COOKIE) {
+        store.remove(token.value());
+    }
+    info!("Admin logout from {client_ip}");
+
+    let mut cookie = Cookie::build(SESSION_COOKIE, "").path("/").finish();
+    cookie.make_removal();
+
+    HttpResponse::Ok().cookie(cookie).finish()
+}
+
+#[get("/api/v1/admin/me")]
+async fn admin_me(auth: AuthSession) -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({ "login": auth.login }))
 }

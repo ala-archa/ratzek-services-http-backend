@@ -10,6 +10,7 @@ mod http;
 mod ipset;
 mod mobile_provider;
 mod persistent_state;
+mod session;
 mod speedtest;
 mod state;
 mod telegram;
@@ -34,6 +35,11 @@ enum CommandLine {
     /// Update state
     #[command(subcommand)]
     Get(GetCommand),
+    /// Generate an argon2 hash for an admin password (for the `admin` config section)
+    HashPassword {
+        /// Plaintext password to hash
+        password: String,
+    },
 }
 
 /// Ala-Archa HTTP backend
@@ -84,17 +90,26 @@ impl Application {
                 let http_listen = config.http_listen.clone();
                 let state = crate::state::State::new(&config).await?;
                 crate::state::State::init_cronjobs(state.clone()).await?;
+                let session_store = web::Data::new(crate::session::SessionStore::new());
                 actix_web::HttpServer::new(move || {
                     actix_web::App::new()
                         .app_data(web::Data::new(state.clone()))
+                        .app_data(session_store.clone())
                         .service(http::client_get)
                         .service(http::client_register)
                         .service(http::dhcp_leases)
                         .service(http::prometheus_exporter)
+                        .service(http::admin_login)
+                        .service(http::admin_logout)
+                        .service(http::admin_me)
                 })
                 .bind(&http_listen)?
                 .run()
                 .await?;
+                Ok(())
+            }
+            CommandLine::HashPassword { .. } => {
+                // Handled early in `run()` before the config/logger are loaded.
                 Ok(())
             }
             CommandLine::Get(GetCommand::Balance) => {
@@ -129,6 +144,16 @@ impl Application {
     }
 
     pub async fn run(&self) {
+        // Hashing a password needs neither a config file nor a logger, and a
+        // valid config already requires a hash — so handle it before reading one.
+        if let CommandLine::HashPassword { password } = &self.command {
+            match crate::session::hash_password(password) {
+                Ok(hash) => println!("{}", hash),
+                Err(err) => eprintln!("Failed to hash password: {:#}", err),
+            }
+            return;
+        }
+
         let config = config::Config::read(&self.config_path).expect("Config");
         let _logger_guard = self.init_logger(&config).expect("Logger");
 

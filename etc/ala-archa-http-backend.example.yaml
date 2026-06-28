@@ -18,6 +18,16 @@ dhcpd_leases: /var/lib/dhcp/dhcpd.leases
 
 persistent_state_path: /var/tmp/ala-archa-http-backend.state
 
+# Admin panel credentials (optional). Generate password_hash with:
+#   ala-archa-http-backend hash-password 'your-password'
+# Keep this config readable only by its owner (mode 0600).
+# admin:
+#   login: admin
+#   password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$..."
+#   # Set Secure flag on the session cookie. Keep true in production (TLS).
+#   # Set false only for local http testing.
+#   cookie_secure: true
+
 telegram:
   bot_token: "123456:ABC-asdasdasdasd"
   retry_crontab: "30 */5 * * * *"
