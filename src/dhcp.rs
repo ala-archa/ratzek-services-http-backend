@@ -19,4 +19,14 @@ impl Dhcp {
             .find(|lease| lease.ip == ip)
             .ok_or_else(|| anyhow!("DHCP lease not found"))
     }
+
+    /// `host` reservations present in the leases file. OMAPI-created hosts are
+    /// persisted here, so this is how we enumerate them (OMAPI itself can't list).
+    pub fn hosts(leases: &std::path::Path) -> Result<Vec<dhcpd_parser::parser::Host>> {
+        let s = std::fs::read_to_string(leases)
+            .map_err(|err| anyhow!("Failed to read {:?}: {}", leases, err))?;
+        let parsed = dhcpd_parser::parser::parse(s)
+            .map_err(|err| anyhow!("Failed to parse {:?}: {}", leases, err))?;
+        Ok(parsed.hosts)
+    }
 }

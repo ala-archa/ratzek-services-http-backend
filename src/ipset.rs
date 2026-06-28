@@ -66,7 +66,14 @@ impl IPSet {
     }
 
     pub fn add(&self, entry: &str, timeout: Option<u64>) -> Result<()> {
-        let mut args = vec!["add".to_owned(), self.name.clone(), entry.to_owned()];
+        // `-exist` makes re-adding an existing entry a no-op (idempotent) and
+        // updates its timeout instead of failing.
+        let mut args = vec![
+            "add".to_owned(),
+            "-exist".to_owned(),
+            self.name.clone(),
+            entry.to_owned(),
+        ];
         if let Some(timeout) = timeout {
             args.push("timeout".to_owned());
             args.push(format!("{}", timeout))
@@ -74,7 +81,28 @@ impl IPSet {
         let r = std::process::Command::new("ipset").args(args).output()?;
 
         if !r.status.success() {
-            bail!("Got non-zero exit code")
+            bail!(
+                "ipset add failed: {}",
+                String::from_utf8_lossy(&r.stderr).trim()
+            )
+        }
+
+        Ok(())
+    }
+
+    /// Remove an entry. Removing an absent entry is treated as success so the
+    /// operation is idempotent (safe to retry / use during reconcile).
+    pub fn del(&self, entry: &str) -> Result<()> {
+        let r = std::process::Command::new("ipset")
+            .args(["del", &self.name, entry])
+            .output()?;
+
+        if !r.status.success() {
+            let stderr = String::from_utf8_lossy(&r.stderr);
+            if stderr.contains("not in set") || stderr.contains("element is missing") {
+                return Ok(());
+            }
+            bail!("ipset del failed: {}", stderr.trim())
         }
 
         Ok(())

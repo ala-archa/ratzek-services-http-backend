@@ -2,43 +2,20 @@ use std::{future::Future, sync::Arc};
 
 use actix_web::{
     cookie::{Cookie, SameSite},
-    get,
-    http::{header::ContentType, StatusCode},
-    post,
+    delete, get, post,
     web::{self, Data},
     HttpRequest, HttpResponse,
 };
-use derive_more::{Display, Error};
+use dhcpd_parser::leases::BindingState;
 use dhcpd_parser::parser::LeasesMethods;
 use serde::{Deserialize, Serialize};
 use slog_scope::{error, info, warn};
 use tokio::sync::Mutex;
 
+use crate::error::APIError;
 use crate::session::{AuthSession, SessionStore, SESSION_COOKIE};
 use crate::state::State;
-
-#[derive(Debug, Display, Error)]
-pub enum APIError {
-    #[display(fmt = "internal error")]
-    InternalError,
-    #[display(fmt = "unauthorized")]
-    Unauthorized,
-}
-
-impl actix_web::error::ResponseError for APIError {
-    fn error_response(&self) -> HttpResponse {
-        HttpResponse::build(self.status_code())
-            .insert_header(ContentType::html())
-            .body(self.to_string())
-    }
-
-    fn status_code(&self) -> StatusCode {
-        match *self {
-            Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Unauthorized => StatusCode::UNAUTHORIZED,
-        }
-    }
-}
+use crate::unlimited_clients::{is_valid_name, normalize_mac, UnlimitedClient};
 
 #[derive(Serialize)]
 struct ClientConnectionInfo {
@@ -96,7 +73,10 @@ where
 
     let is_no_shape = {
         let state = state.lock().await;
+        // The runtime store is the source of truth; `no_shaping_ips` from the
+        // static config is kept as a transitional fallback until migration.
         state.config().no_shaping_ips.contains(&client_ip)
+            || state.unlimited_clients().contains_ip(&client_ip).await
     };
     if is_no_shape {
         info!("Client is in no_shape list");
@@ -558,4 +538,218 @@ async fn admin_logout(store: Data<SessionStore>, req: HttpRequest) -> HttpRespon
 #[get("/api/v1/admin/me")]
 async fn admin_me(auth: AuthSession) -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({ "login": auth.login }))
+}
+
+// --- Unlimited clients CRUD (admin-only via AuthSession) ---
+
+/// Config + store snapshot taken under the State lock so handlers can operate
+/// without holding it across OMAPI/ipset calls.
+struct UnlimitedCtx {
+    store: crate::unlimited_clients::UnlimitedClientsStore,
+    subnet: ipnet::IpNet,
+    omapi: Option<crate::config::Omapi>,
+    leases: std::path::PathBuf,
+    no_shape_name: String,
+    acl_name: String,
+}
+
+fn unlimited_ctx(state: &State) -> UnlimitedCtx {
+    let c = state.config();
+    UnlimitedCtx {
+        store: state.unlimited_clients().clone(),
+        subnet: c.parsed_unlimited_subnet(),
+        omapi: c.omapi.clone(),
+        leases: c.dhcpd_leases.clone(),
+        no_shape_name: c.ipset_no_shape_name.clone(),
+        acl_name: c.ipset_acl_name.clone(),
+    }
+}
+
+/// Best-effort compensation for a failed create transaction. A failure here
+/// leaves drift that startup reconcile will heal, but it must be visible.
+async fn rollback_omapi(omapi: &crate::config::Omapi, name: &str) {
+    if let Err(err) = crate::omapi::remove_host(omapi, name).await {
+        error!("rollback: OMAPI remove_host {name} failed: {err} (manual cleanup may be needed)");
+    }
+}
+
+fn rollback_ipset(set: &crate::ipset::IPSet, ip: &str) {
+    if let Err(err) = set.del(ip) {
+        error!("rollback: ipset del {ip} failed: {err} (manual cleanup may be needed)");
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateUnlimitedClient {
+    name: String,
+    ip: String,
+    #[serde(default)]
+    comment: Option<String>,
+}
+
+#[get("/api/v1/admin/unlimited-clients")]
+async fn unlimited_list(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+) -> Result<HttpResponse, APIError> {
+    let store = { state.lock().await.unlimited_clients().clone() };
+    Ok(HttpResponse::Ok().json(store.list().await))
+}
+
+#[get("/api/v1/admin/unlimited-clients/{name}")]
+async fn unlimited_get(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, APIError> {
+    let store = { state.lock().await.unlimited_clients().clone() };
+    match store.get(&path.into_inner()).await {
+        Some(client) => Ok(HttpResponse::Ok().json(client)),
+        None => Err(APIError::NotFound),
+    }
+}
+
+#[post("/api/v1/admin/unlimited-clients")]
+async fn unlimited_create(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    req: HttpRequest,
+    body: web::Json<CreateUnlimitedClient>,
+) -> Result<HttpResponse, APIError> {
+    let admin_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
+    let ctx = { unlimited_ctx(&*state.lock().await) };
+
+    let omapi = match &ctx.omapi {
+        Some(o) => o.clone(),
+        None => {
+            error!("unlimited-clients CRUD requires the `omapi` config section");
+            return Err(APIError::InternalError);
+        }
+    };
+
+    // Serialize the whole transaction against concurrent CRUD requests.
+    let _guard = ctx.store.lock_for_mutation().await;
+
+    if !is_valid_name(&body.name) {
+        warn!("Rejected unlimited client: invalid name {:?}", body.name);
+        return Err(APIError::BadRequest);
+    }
+
+    // Derive the MAC from a current, active lease for the requested IP.
+    let lease = match crate::dhcp::Dhcp::of_ip(&ctx.leases, &body.ip) {
+        Ok(l) => l,
+        Err(err) => {
+            warn!("DHCP lease lookup for {} failed (from {admin_ip}): {err}", body.ip);
+            return Err(APIError::BadRequest);
+        }
+    };
+    if lease.binding_state != BindingState::Active {
+        warn!("Lease for {} is not active", body.ip);
+        return Err(APIError::BadRequest);
+    }
+    let mac = match lease.hardware.and_then(|h| normalize_mac(&h.mac)) {
+        Some(m) => m,
+        None => {
+            warn!("Lease for {} has no usable MAC", body.ip);
+            return Err(APIError::BadRequest);
+        }
+    };
+
+    let client = UnlimitedClient {
+        name: body.name.clone(),
+        mac,
+        ip: body.ip.clone(),
+        comment: body.comment.clone(),
+    };
+    if let Err(err) = client.validate(ctx.subnet) {
+        warn!("Rejected unlimited client: {err}");
+        return Err(APIError::BadRequest);
+    }
+
+    if ctx.store.contains_name(&client.name).await || ctx.store.contains_ip(&client.ip).await {
+        return Err(APIError::Conflict);
+    }
+
+    let no_shape = crate::ipset::IPSet::new(&ctx.no_shape_name);
+    let acl = crate::ipset::IPSet::new(&ctx.acl_name);
+
+    // Transaction: OMAPI -> ipset -> store. Compensate in reverse on failure;
+    // store is written last so it never records a client without side effects.
+    if let Err(err) = crate::omapi::add_host(&omapi, &client.name, &client.mac, &client.ip).await {
+        error!("OMAPI add_host failed: {err}");
+        return Err(APIError::InternalError);
+    }
+    if let Err(err) = no_shape.add(&client.ip, Some(0)) {
+        error!("ipset add no_shape failed: {err}");
+        rollback_omapi(&omapi, &client.name).await;
+        return Err(APIError::InternalError);
+    }
+    if let Err(err) = acl.add(&client.ip, Some(0)) {
+        error!("ipset add acl failed: {err}");
+        rollback_ipset(&no_shape, &client.ip);
+        rollback_omapi(&omapi, &client.name).await;
+        return Err(APIError::InternalError);
+    }
+    if let Err(err) = ctx.store.add(client.clone()).await {
+        error!("unlimited store add failed: {err}");
+        rollback_ipset(&acl, &client.ip);
+        rollback_ipset(&no_shape, &client.ip);
+        rollback_omapi(&omapi, &client.name).await;
+        return Err(APIError::InternalError);
+    }
+
+    info!(
+        "Admin created unlimited client {} ip={} mac={} from {admin_ip}",
+        client.name, client.ip, client.mac
+    );
+    Ok(HttpResponse::Created().json(client))
+}
+
+#[delete("/api/v1/admin/unlimited-clients/{name}")]
+async fn unlimited_delete(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, APIError> {
+    let admin_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
+    let name = path.into_inner();
+    let ctx = { unlimited_ctx(&*state.lock().await) };
+
+    let _guard = ctx.store.lock_for_mutation().await;
+
+    let client = match ctx.store.get(&name).await {
+        Some(c) => c,
+        None => return Err(APIError::NotFound),
+    };
+
+    // Side effects first (idempotent). If any fails, keep the store entry so the
+    // client stays consistently unlimited; admin retries.
+    if let Some(omapi) = &ctx.omapi {
+        if let Err(err) = crate::omapi::remove_host(omapi, &client.name).await {
+            error!("OMAPI remove_host failed: {err}");
+            return Err(APIError::InternalError);
+        }
+    }
+    let no_shape = crate::ipset::IPSet::new(&ctx.no_shape_name);
+    let acl = crate::ipset::IPSet::new(&ctx.acl_name);
+    if let Err(err) = no_shape.del(&client.ip) {
+        error!("ipset del no_shape failed: {err}");
+        return Err(APIError::InternalError);
+    }
+    if let Err(err) = acl.del(&client.ip) {
+        error!("ipset del acl failed: {err}");
+        return Err(APIError::InternalError);
+    }
+
+    if let Err(err) = ctx.store.remove(&name).await {
+        error!("unlimited store remove failed: {err}");
+        return Err(APIError::InternalError);
+    }
+
+    info!(
+        "Admin deleted unlimited client {} ip={} from {admin_ip}",
+        client.name, client.ip
+    );
+    Ok(HttpResponse::NoContent().finish())
 }

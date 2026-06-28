@@ -40,6 +40,7 @@ pub struct State {
     config: crate::config::Config,
     scheduler: tokio_cron_scheduler::JobScheduler,
     persistent_state: crate::persistent_state::PersistentStateGuard,
+    unlimited_clients: crate::unlimited_clients::UnlimitedClientsStore,
 }
 
 impl State {
@@ -219,12 +220,16 @@ impl State {
     pub async fn new(config: &crate::config::Config) -> anyhow::Result<Arc<Mutex<Self>>> {
         use tokio_cron_scheduler::JobScheduler;
 
+        let unlimited_clients =
+            crate::unlimited_clients::UnlimitedClientsStore::load(&config.unlimited_clients_path)?;
+
         let state = Arc::new(Mutex::new(Self {
             config: config.clone(),
             persistent_state: crate::persistent_state::PersistentStateGuard::load_from_yaml(
                 &config.persistent_state_path,
             ),
             scheduler: JobScheduler::new().await?,
+            unlimited_clients,
         }));
 
         Ok(state)
@@ -236,5 +241,91 @@ impl State {
 
     pub fn config(&self) -> &crate::config::Config {
         &self.config
+    }
+
+    pub fn unlimited_clients(&self) -> &crate::unlimited_clients::UnlimitedClientsStore {
+        &self.unlimited_clients
+    }
+
+    /// Apply the unlimited-clients store to the live system, healing drift in
+    /// both directions. Best-effort and non-fatal: logs and continues so a
+    /// half-available OMAPI never blocks startup. Run under a timeout by the caller.
+    pub async fn reconcile_unlimited(&self) -> anyhow::Result<()> {
+        let clients = self.unlimited_clients.list().await;
+        info!("Reconciling {} unlimited client(s)", clients.len());
+
+        let no_shape = crate::ipset::IPSet::new(&self.config.ipset_no_shape_name);
+        let acl = crate::ipset::IPSet::new(&self.config.ipset_acl_name);
+
+        // 1) Ensure every stored client is applied (store ⊆ system).
+        let mut applied = 0usize;
+        let mut failed = 0usize;
+        for client in &clients {
+            let mut ok = true;
+            if let Some(omapi) = &self.config.omapi {
+                if let Err(err) =
+                    crate::omapi::add_host(omapi, &client.name, &client.mac, &client.ip).await
+                {
+                    error!("reconcile: OMAPI add_host {} failed: {err}", client.name);
+                    ok = false;
+                }
+            }
+            // timeout 0 = permanent; these entries are owned by CRUD/reconcile.
+            if let Err(err) = no_shape.add(&client.ip, Some(0)) {
+                error!("reconcile: ipset add no_shape {} failed: {err}", client.ip);
+                ok = false;
+            }
+            if let Err(err) = acl.add(&client.ip, Some(0)) {
+                error!("reconcile: ipset add acl {} failed: {err}", client.ip);
+                ok = false;
+            }
+            if ok {
+                applied += 1;
+            } else {
+                failed += 1;
+            }
+        }
+        info!("Reconcile applied {applied} client(s), {failed} failed");
+
+        let managed_ips: std::collections::HashSet<&str> =
+            clients.iter().map(|c| c.ip.as_str()).collect();
+        let managed_names: std::collections::HashSet<&str> =
+            clients.iter().map(|c| c.name.as_str()).collect();
+
+        // 2) Prune orphans (system ⊄ store). NB: never prune `acl` — it holds
+        //    all clients, not only the unlimited ones.
+        if let Some(omapi) = &self.config.omapi {
+            match crate::dhcp::Dhcp::hosts(&self.config.dhcpd_leases) {
+                Ok(hosts) => {
+                    for host in hosts {
+                        // Only touch hosts that follow our naming and aren't in the store.
+                        if crate::unlimited_clients::is_valid_name(&host.name)
+                            && !managed_names.contains(host.name.as_str())
+                        {
+                            info!("reconcile: removing orphan OMAPI host {}", host.name);
+                            if let Err(err) = crate::omapi::remove_host(omapi, &host.name).await {
+                                error!("reconcile: OMAPI remove_host {} failed: {err}", host.name);
+                            }
+                        }
+                    }
+                }
+                Err(err) => error!("reconcile: unable to list OMAPI hosts: {err}"),
+            }
+        }
+        match no_shape.entries() {
+            Ok(entries) => {
+                for entry in entries {
+                    if !managed_ips.contains(entry.ip.as_str()) {
+                        info!("reconcile: removing orphan no_shape entry {}", entry.ip);
+                        if let Err(err) = no_shape.del(&entry.ip) {
+                            error!("reconcile: ipset del no_shape {} failed: {err}", entry.ip);
+                        }
+                    }
+                }
+            }
+            Err(err) => error!("reconcile: unable to list no_shape entries: {err}"),
+        }
+
+        Ok(())
     }
 }

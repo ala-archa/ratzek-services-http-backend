@@ -6,14 +6,17 @@ use slog_scope::error;
 
 mod config;
 mod dhcp;
+mod error;
 mod http;
 mod ipset;
 mod mobile_provider;
+mod omapi;
 mod persistent_state;
 mod session;
 mod speedtest;
 mod state;
 mod telegram;
+mod unlimited_clients;
 
 const CONFIG_DEFAULT_PATH: &str = "/etc/ala-archa-http-backend.yaml";
 
@@ -39,6 +42,12 @@ enum CommandLine {
     HashPassword {
         /// Plaintext password to hash
         password: String,
+    },
+    /// Build the unlimited-clients store file from no_shaping_ips + dhcpd.conf
+    /// hosts (one-time migration; writes the file, applies nothing).
+    MigrateUnlimited {
+        /// Path to the existing dhcpd.conf to read host reservations from
+        dhcpd_conf: String,
     },
 }
 
@@ -91,6 +100,20 @@ impl Application {
                 let state = crate::state::State::new(&config).await?;
                 crate::state::State::init_cronjobs(state.clone()).await?;
                 let session_store = web::Data::new(crate::session::SessionStore::new());
+
+                // Heal unlimited-clients drift on boot. Non-fatal and bounded so a
+                // half-available OMAPI can't block startup.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    async { state.lock().await.reconcile_unlimited().await },
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => error!("Unlimited reconcile failed: {:#}", err),
+                    Err(_) => error!("Unlimited reconcile timed out; will heal on next start"),
+                }
+
                 actix_web::HttpServer::new(move || {
                     actix_web::App::new()
                         .app_data(web::Data::new(state.clone()))
@@ -102,6 +125,10 @@ impl Application {
                         .service(http::admin_login)
                         .service(http::admin_logout)
                         .service(http::admin_me)
+                        .service(http::unlimited_list)
+                        .service(http::unlimited_get)
+                        .service(http::unlimited_create)
+                        .service(http::unlimited_delete)
                 })
                 .bind(&http_listen)?
                 .run()
@@ -111,6 +138,9 @@ impl Application {
             CommandLine::HashPassword { .. } => {
                 // Handled early in `run()` before the config/logger are loaded.
                 Ok(())
+            }
+            CommandLine::MigrateUnlimited { dhcpd_conf } => {
+                migrate_unlimited(&config, dhcpd_conf)
             }
             CommandLine::Get(GetCommand::Balance) => {
                 let state = crate::state::State::new(&config).await?;
@@ -161,6 +191,76 @@ impl Application {
             error!("Failed with error: {:#}", err);
         }
     }
+}
+
+/// One-time migration: cross-reference `no_shaping_ips` with the `host`
+/// reservations in `dhcpd.conf` and print the resulting unlimited-clients YAML
+/// to stdout (review, then redirect into `unlimited_clients_path`). Applies
+/// nothing to the live system.
+fn migrate_unlimited(config: &config::Config, dhcpd_conf: &str) -> Result<()> {
+    use std::collections::{HashMap, HashSet};
+
+    let content = std::fs::read_to_string(dhcpd_conf)
+        .with_context(|| format!("Failed to read {:?}", dhcpd_conf))?;
+    let parsed = dhcpd_parser::parser::parse(content)
+        .map_err(|err| anyhow::anyhow!("Failed to parse {:?}: {}", dhcpd_conf, err))?;
+
+    let mut host_by_ip: HashMap<&str, &dhcpd_parser::parser::Host> = HashMap::new();
+    for host in &parsed.hosts {
+        for ip in &host.fixed_addresses {
+            host_by_ip.insert(ip.as_str(), host);
+        }
+    }
+
+    let mut clients: Vec<unlimited_clients::UnlimitedClient> = Vec::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut skipped = 0usize;
+
+    let mut ips: Vec<&String> = config.no_shaping_ips.iter().collect();
+    ips.sort();
+    for ip in ips {
+        let host = match host_by_ip.get(ip.as_str()) {
+            Some(h) => h,
+            None => {
+                eprintln!("WARNING: no host block for {ip} in {dhcpd_conf}; skipped");
+                skipped += 1;
+                continue;
+            }
+        };
+        let mac = host
+            .mac
+            .as_deref()
+            .and_then(unlimited_clients::normalize_mac);
+        let mac = match mac {
+            Some(m) => m,
+            None => {
+                eprintln!("WARNING: host {} ({ip}) has no usable MAC; skipped", host.name);
+                skipped += 1;
+                continue;
+            }
+        };
+        if !seen_names.insert(host.name.clone()) {
+            eprintln!("WARNING: duplicate host name {} ({ip}); skipped", host.name);
+            skipped += 1;
+            continue;
+        }
+        clients.push(unlimited_clients::UnlimitedClient {
+            name: host.name.clone(),
+            mac,
+            ip: ip.clone(),
+            comment: None,
+        });
+    }
+
+    clients.sort_by(|a, b| a.name.cmp(&b.name));
+    print!("{}", serde_yaml::to_string(&clients)?);
+    eprintln!(
+        "Migrated {} client(s), {} skipped. Review, then write to {:?}.",
+        clients.len(),
+        skipped,
+        config.unlimited_clients_path
+    );
+    Ok(())
 }
 
 #[actix_web::main]

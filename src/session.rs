@@ -15,7 +15,7 @@ use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use rand::rngs::OsRng;
 use rand::RngCore;
 
-use crate::http::APIError;
+use crate::error::APIError;
 
 /// Name of the cookie carrying the session token.
 pub const SESSION_COOKIE: &str = "admin_session";

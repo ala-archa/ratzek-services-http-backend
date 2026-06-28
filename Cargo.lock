@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "ala-archa-http-backend"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "actix-web",
  "anyhow",
@@ -235,6 +235,7 @@ dependencies = [
  "dhcpd_parser",
  "hex",
  "humantime-serde",
+ "ipnet",
  "prometheus_exporter_base",
  "rand",
  "reqwest",
@@ -663,7 +664,7 @@ dependencies = [
 [[package]]
 name = "dhcpd_parser"
 version = "0.4.3"
-source = "git+https://github.com/ala-archa/dhcpd-parser#cf3804606d009b118350c0b8f4b3b29088f745b1"
+source = "git+https://github.com/ala-archa/dhcpd-parser?rev=13c6fac0e69ce080e009396bfb7fa70882601d8e#13c6fac0e69ce080e009396bfb7fa70882601d8e"
 
 [[package]]
 name = "digest"
@@ -2456,6 +2457,7 @@ dependencies = [
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.5.8",
+ "tokio-macros",
  "windows-sys 0.52.0",
 ]
 
@@ -2472,6 +2474,17 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "693d596312e88961bc67d7f1f97af8a70227d9f90c31bba5806eec004978d752"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.90",
 ]
 
 [[package]]

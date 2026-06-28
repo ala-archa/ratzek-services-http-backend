@@ -41,6 +41,44 @@ fn default_cookie_secure() -> bool {
     true
 }
 
+fn default_unlimited_clients_path() -> std::path::PathBuf {
+    "/var/lib/ala-archa-http-backend/unlimited-clients.yaml".into()
+}
+
+fn default_unlimited_subnet() -> String {
+    "10.11.5.0/24".to_string()
+}
+
+fn default_omapi_server() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_omapi_port() -> u16 {
+    7911
+}
+
+fn default_omshell_path() -> String {
+    "/usr/bin/omshell".to_string()
+}
+
+/// OMAPI connection settings used to create/delete dhcpd `host` reservations on
+/// the live server (no dhcpd restart). Requires `omapi-port` + a matching `key`
+/// in `dhcpd.conf`.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Omapi {
+    #[serde(default = "default_omapi_server")]
+    pub server: String,
+    #[serde(default = "default_omapi_port")]
+    pub port: u16,
+    /// Name of the `key` directive in dhcpd.conf.
+    pub key_name: String,
+    /// Base64 HMAC-MD5 secret matching that key. Secret — never log it.
+    pub key_secret: String,
+    /// Absolute path to the `omshell` binary.
+    #[serde(default = "default_omshell_path")]
+    pub omshell_path: String,
+}
+
 /// Admin panel credentials. A single administrator authenticates with a login
 /// and an argon2 password hash (generate it via the `hash-password` subcommand).
 #[derive(Serialize, Deserialize, Clone)]
@@ -78,6 +116,14 @@ pub struct Config {
     pub persistent_state_path: std::path::PathBuf,
     #[serde(default)]
     pub admin: Option<Admin>,
+    /// File backing the runtime-managed unlimited-clients store.
+    #[serde(default = "default_unlimited_clients_path")]
+    pub unlimited_clients_path: std::path::PathBuf,
+    /// CIDR an admin may pick unlimited-client IPs from.
+    #[serde(default = "default_unlimited_subnet")]
+    pub unlimited_subnet: String,
+    #[serde(default)]
+    pub omapi: Option<Omapi>,
 }
 
 impl Config {
@@ -88,7 +134,30 @@ impl Config {
             argon2::PasswordHash::new(&admin.password_hash)
                 .map_err(|err| anyhow::anyhow!("Invalid admin.password_hash: {err}"))?;
         }
+
+        // Fail fast on an unparseable unlimited_subnet CIDR.
+        self.unlimited_subnet
+            .parse::<ipnet::IpNet>()
+            .map_err(|err| anyhow::anyhow!("Invalid unlimited_subnet {:?}: {err}", self.unlimited_subnet))?;
+
+        // omshell must be an absolute path (avoid PATH hijacking).
+        if let Some(omapi) = &self.omapi {
+            if !std::path::Path::new(&omapi.omshell_path).is_absolute() {
+                anyhow::bail!(
+                    "omapi.omshell_path must be absolute, got {:?}",
+                    omapi.omshell_path
+                );
+            }
+        }
+
         Ok(())
+    }
+
+    /// Parsed `unlimited_subnet` (already validated in [`Config::validate`]).
+    pub fn parsed_unlimited_subnet(&self) -> ipnet::IpNet {
+        self.unlimited_subnet
+            .parse()
+            .expect("unlimited_subnet validated at startup")
     }
 
     pub fn read(file: &str) -> Result<Self> {

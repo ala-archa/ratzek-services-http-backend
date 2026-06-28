@@ -28,6 +28,23 @@ persistent_state_path: /var/tmp/ala-archa-http-backend.state
 #   # Set false only for local http testing.
 #   cookie_secure: true
 
+# Unlimited-clients management (admin CRUD). Optional; required only for the
+# /api/v1/admin/unlimited-clients endpoints and startup reconcile.
+#
+# File the backend owns and rewrites; it replaces hand-edited no_shaping_ips.
+unlimited_clients_path: /var/lib/ala-archa-http-backend/unlimited-clients.yaml
+# CIDR an admin may pick unlimited-client IPs from (must have an active lease).
+unlimited_subnet: "10.11.5.0/24"
+# OMAPI lets the backend create/remove dhcpd host reservations without a restart.
+# Requires `omapi-port 7911;` + a matching `key` in dhcpd.conf. Firewall 7911 to
+# localhost. WARNING: key_secret is a secret — keep this config mode 0600.
+# omapi:
+#   server: "127.0.0.1"
+#   port: 7911
+#   key_name: omapi_key
+#   key_secret: "base64-hmac-md5-secret"   # generate with: openssl rand -base64 32
+#   omshell_path: /usr/bin/omshell          # must be an absolute path
+
 telegram:
   bot_token: "123456:ABC-asdasdasdasd"
   retry_crontab: "30 */5 * * * *"
