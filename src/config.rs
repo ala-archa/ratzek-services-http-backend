@@ -75,6 +75,30 @@ pub struct DhcpReservations {
     pub reload_command: String,
 }
 
+fn default_device_metrics_crontab() -> String {
+    // Every 5 minutes (6-field cron). Kept modest to spare SD-card writes.
+    "0 */5 * * * *".to_string()
+}
+
+fn default_device_metrics_retention_days() -> i64 {
+    730
+}
+
+/// Optional per-device metrics: a periodic sampler records first/last seen and
+/// accumulated traffic (from dhcpd leases + ipset counters) into a SQLite DB,
+/// surfaced in the admin API. Omit to disable. See `src/device_metrics.rs`.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct DeviceMetricsConfig {
+    /// Absolute path to the SQLite DB the backend owns.
+    pub db_path: std::path::PathBuf,
+    /// 6-field cron for the sampler (default every 5 min).
+    #[serde(default = "default_device_metrics_crontab")]
+    pub crontab: String,
+    /// Drop daily traffic buckets / IP history older than this many days.
+    #[serde(default = "default_device_metrics_retention_days")]
+    pub retention_days: i64,
+}
+
 /// Admin panel credentials. A single administrator authenticates with a login
 /// and an argon2 password hash (generate it via the `hash-password` subcommand).
 #[derive(Serialize, Deserialize, Clone)]
@@ -122,6 +146,8 @@ pub struct Config {
     pub unlimited_subnet: String,
     #[serde(default)]
     pub dhcp_reservations: Option<DhcpReservations>,
+    #[serde(default)]
+    pub device_metrics: Option<DeviceMetricsConfig>,
 }
 
 impl Config {
@@ -156,6 +182,21 @@ impl Config {
                 anyhow::bail!(
                     "dhcp_reservations.validate_command and reload_command must be non-empty"
                 );
+            }
+        }
+
+        if let Some(dm) = &self.device_metrics {
+            if !std::path::Path::new(&dm.db_path).is_absolute() {
+                anyhow::bail!(
+                    "device_metrics.db_path must be absolute, got {:?}",
+                    dm.db_path
+                );
+            }
+            if dm.crontab.trim().is_empty() {
+                anyhow::bail!("device_metrics.crontab must be non-empty");
+            }
+            if dm.retention_days < 0 {
+                anyhow::bail!("device_metrics.retention_days must be >= 0");
             }
         }
 

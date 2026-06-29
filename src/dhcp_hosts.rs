@@ -216,6 +216,7 @@ mod tests {
             mac: mac.into(),
             ip: ip.into(),
             comment: None,
+            ..Default::default()
         }
     }
 

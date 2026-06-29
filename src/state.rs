@@ -1,8 +1,23 @@
 use crate::speedtest::SpeedTest;
 use anyhow::bail;
-use slog_scope::{error, info};
+use slog_scope::{error, info, warn};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+/// Default retention for device metrics when not set in config.
+/// Mirrors `config::default_device_metrics_retention_days`.
+const SAMPLER_DEFAULT_RETENTION_DAYS: i64 = 730;
+
+/// RAII guard that resets a "running" flag on drop, so the flag is cleared even
+/// if the sampling task panics (preventing the sampler from getting stuck).
+struct RunningGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 async fn check_is_wide_internet_available(config: &crate::config::Ping) -> bool {
     info!("Checking if wide network is available");
@@ -36,11 +51,94 @@ async fn check_is_wide_internet_available(config: &crate::config::Ping) -> bool 
     success
 }
 
+/// One device-metrics sampling pass: read active leases + ACL ipset counters and
+/// feed them to the store. The heavy (blocking) work runs in `spawn_blocking`.
+/// Best-effort: any failure is logged and the next tick retries.
+async fn sample_device_metrics(state: Arc<Mutex<State>>) {
+    let (store, leases_path, acl_name, retention_days, last_sample) = {
+        let s = state.lock().await;
+        let store = match s.device_metrics.clone() {
+            Some(st) => st,
+            None => return,
+        };
+        let retention = s
+            .config
+            .device_metrics
+            .as_ref()
+            .map(|d| d.retention_days)
+            .unwrap_or(SAMPLER_DEFAULT_RETENTION_DAYS);
+        (
+            store,
+            s.config.dhcpd_leases.clone(),
+            s.config.ipset_acl_name.clone(),
+            retention,
+            s.metrics_last_sample.clone(),
+        )
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<crate::device_metrics::SampleStats> {
+            use dhcpd_parser::leases::BindingState;
+            use dhcpd_parser::parser::LeasesMethods;
+
+            let observations: Vec<crate::device_metrics::LeaseObservation> =
+                crate::dhcp::Dhcp::read(&leases_path)?
+                    .all()
+                    .into_iter()
+                    .filter(|l| l.binding_state == BindingState::Active)
+                    .filter_map(|l| {
+                        let mac = l
+                            .hardware
+                            .as_ref()
+                            .and_then(|h| crate::unlimited_clients::normalize_mac(&h.mac))?;
+                        Some(crate::device_metrics::LeaseObservation {
+                            mac,
+                            ip: l.ip.clone(),
+                            hostname: l.hostname.clone(),
+                            vendor: l.vendor_class_identifier.clone(),
+                        })
+                    })
+                    .collect();
+
+            let counters: Vec<crate::device_metrics::IpsetCounter> =
+                crate::ipset::IPSet::new(&acl_name)
+                    .entries()?
+                    .into_iter()
+                    .map(|e| crate::device_metrics::IpsetCounter {
+                        ip: e.ip,
+                        bytes: e.bytes.unwrap_or(0) as i64,
+                        packets: e.packets.unwrap_or(0) as i64,
+                    })
+                    .collect();
+
+            store.sample(&observations, &counters, now, retention_days)
+        },
+    )
+    .await;
+
+    match result {
+        Ok(Ok(stats)) => {
+            last_sample.store(now, Ordering::SeqCst);
+            info!(
+                "device-metrics sample: {} devices, {} ips, +{} bytes, {} counter resets",
+                stats.devices, stats.ips, stats.bytes_added, stats.resets
+            );
+        }
+        Ok(Err(err)) => error!("device-metrics sample failed: {err:#}"),
+        Err(err) => error!("device-metrics sample task panicked: {err}"),
+    }
+}
+
 pub struct State {
     config: crate::config::Config,
     scheduler: tokio_cron_scheduler::JobScheduler,
     persistent_state: crate::persistent_state::PersistentStateGuard,
     unlimited_clients: crate::unlimited_clients::UnlimitedClientsStore,
+    /// Optional device-metrics store (None if disabled or the DB couldn't open).
+    device_metrics: Option<Arc<crate::device_metrics::DeviceMetricsStore>>,
+    /// Unix epoch of the last successful metrics sample (0 = never), for monitoring.
+    metrics_last_sample: Arc<AtomicI64>,
 }
 
 impl State {
@@ -176,6 +274,29 @@ impl State {
                 .await?;
         }
 
+        if let Some(dm_cfg) = &state_guard.config.device_metrics {
+            let state1 = state.clone();
+            // Guards against overlapping ticks if a sample runs longer than the interval.
+            let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            info!("Starting device-metrics sampler");
+            state_guard
+                .scheduler
+                .add(Job::new_async(&dm_cfg.crontab, move |_uuid, _l| {
+                    let state1 = state1.clone();
+                    let running = running.clone();
+                    Box::pin(async move {
+                        if running.swap(true, Ordering::SeqCst) {
+                            warn!("device-metrics: previous sample still running, skipping tick");
+                            return;
+                        }
+                        // Resets the flag on drop, even if the sample panics.
+                        let _guard = RunningGuard(running.clone());
+                        sample_device_metrics(state1).await;
+                    })
+                })?)
+                .await?;
+        }
+
         state_guard.scheduler.start().await?;
 
         Ok(())
@@ -223,6 +344,17 @@ impl State {
         let unlimited_clients =
             crate::unlimited_clients::UnlimitedClientsStore::load(&config.unlimited_clients_path)?;
 
+        // Best-effort: a metrics-DB failure disables metrics but never blocks startup.
+        let device_metrics = config.device_metrics.as_ref().and_then(|dm| {
+            match crate::device_metrics::DeviceMetricsStore::open(&dm.db_path) {
+                Ok(store) => Some(Arc::new(store)),
+                Err(err) => {
+                    error!("device-metrics DB unavailable, metrics disabled: {err:#}");
+                    None
+                }
+            }
+        });
+
         let state = Arc::new(Mutex::new(Self {
             config: config.clone(),
             persistent_state: crate::persistent_state::PersistentStateGuard::load_from_yaml(
@@ -230,6 +362,8 @@ impl State {
             ),
             scheduler: JobScheduler::new().await?,
             unlimited_clients,
+            device_metrics,
+            metrics_last_sample: Arc::new(AtomicI64::new(0)),
         }));
 
         Ok(state)
@@ -245,6 +379,15 @@ impl State {
 
     pub fn unlimited_clients(&self) -> &crate::unlimited_clients::UnlimitedClientsStore {
         &self.unlimited_clients
+    }
+
+    pub fn device_metrics(&self) -> Option<&Arc<crate::device_metrics::DeviceMetricsStore>> {
+        self.device_metrics.as_ref()
+    }
+
+    /// Unix epoch of the last successful metrics sample (0 = never).
+    pub fn metrics_last_sample(&self) -> i64 {
+        self.metrics_last_sample.load(Ordering::SeqCst)
     }
 
     /// Apply the unlimited-clients store to the live system, healing drift in

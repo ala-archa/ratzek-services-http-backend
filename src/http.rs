@@ -267,6 +267,12 @@ struct DhcpRecord {
     pub vendor_class_identifier: Option<String>,
     pub starts: Option<String>,
     pub ends: Option<String>,
+    /// Client-last-transaction time — when the device last talked to dhcpd
+    /// ("last seen on the network"). The ipset `acl`/`shaper` entries also carry
+    /// `bytes`/`packets` counters.
+    pub last_seen: Option<String>,
+    /// Last time dhcpd recorded a transaction for this lease.
+    pub tstp: Option<String>,
     pub acl: Option<crate::ipset::Entry>,
     pub shaper: Option<crate::ipset::Entry>,
 }
@@ -317,6 +323,8 @@ async fn dhcp_leases(
             vendor_class_identifier: lease.vendor_class_identifier,
             starts: lease.dates.starts.map(|v| v.to_string()),
             ends: lease.dates.ends.map(|v| v.to_string()),
+            last_seen: lease.dates.cltt.map(|v| v.to_string()),
+            tstp: lease.dates.tstp.map(|v| v.to_string()),
             acl: acl_entries.iter().find(|e| e.ip == lease.ip).cloned(),
             shaper: shaper_entries.iter().find(|e| e.ip == lease.ip).cloned(),
             ip: lease.ip,
@@ -497,6 +505,27 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
         "Number of abandoned DHCP leases",
         status.dhcp_leases.abandoned as f64,
     );
+    // Seconds since the device-metrics sampler last succeeded (0 = never sampled
+    // yet / metrics disabled). Lets monitoring alert on a stalled sampler.
+    let (metrics_last_sample, metrics_enabled) = {
+        let s = state.lock().await;
+        (s.metrics_last_sample(), s.device_metrics().is_some())
+    };
+    // Whether device-metrics collection is enabled at all. Together with the
+    // age-gauge this distinguishes "metrics off" from "sampler never ran yet".
+    out += &gauge(
+        "ratzek_device_metrics_enabled",
+        "Whether device-metrics collection is enabled (1) or off (0)",
+        metrics_enabled as i64 as f64,
+    );
+    if metrics_last_sample > 0 {
+        let age = (chrono::Utc::now().timestamp() - metrics_last_sample).max(0);
+        out += &gauge(
+            "ratzek_device_metrics_age_seconds",
+            "Seconds since the last successful device-metrics sample",
+            age as f64,
+        );
+    }
     Ok(out)
 }
 
@@ -752,6 +781,225 @@ fn ordered(primary: Ordering, order: SortOrder) -> Ordering {
     }
 }
 
+// --- Device metadata enrichment for admin listings (see doc/admin-api.md §10/§11) ---
+
+struct LeaseInfo {
+    mac: Option<String>,
+    active: bool,
+    hostname: Option<String>,
+    vendor: Option<String>,
+}
+
+/// Build an `ip -> latest lease` map from the leases file (empty on error). The
+/// last lease block for an IP wins (most recent).
+fn read_leases_map(path: &std::path::Path) -> HashMap<String, LeaseInfo> {
+    let dhcp = match crate::dhcp::Dhcp::read(path) {
+        Ok(d) => d,
+        Err(err) => {
+            error!("device enrichment: failed to read leases: {err}");
+            return HashMap::new();
+        }
+    };
+    dhcp.all()
+        .into_iter()
+        .map(|l| {
+            (
+                l.ip.clone(),
+                LeaseInfo {
+                    mac: l.hardware.as_ref().and_then(|h| normalize_mac(&h.mac)),
+                    active: l.binding_state == BindingState::Active,
+                    hostname: l.hostname.clone(),
+                    vendor: l.vendor_class_identifier.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// An unlimited client plus live/derived metadata. All extra fields are additive
+/// (tolerant clients ignore unknown fields).
+#[derive(Serialize)]
+struct UnlimitedClientView {
+    name: String,
+    mac: String,
+    ip: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comment: Option<String>,
+    created_at: Option<i64>,
+    updated_at: Option<i64>,
+    online: bool,
+    /// True when the reserved IP currently has an active lease held by a different
+    /// MAC than the reservation (a stale/conflicting reservation).
+    stale_reservation: bool,
+    hostname: Option<String>,
+    vendor: Option<String>,
+    first_seen: Option<i64>,
+    last_seen: Option<i64>,
+    bytes_total: Option<i64>,
+    bytes_today: Option<i64>,
+    bytes_7d: Option<i64>,
+}
+
+fn build_unlimited_view(
+    c: UnlimitedClient,
+    leases: &HashMap<String, LeaseInfo>,
+    metrics: &HashMap<String, crate::device_metrics::DeviceMetrics>,
+) -> UnlimitedClientView {
+    let lease = leases.get(&c.ip);
+    let online = lease.map(|l| l.active).unwrap_or(false);
+    let stale_reservation = lease
+        .map(|l| l.active && l.mac.as_deref() != Some(c.mac.as_str()))
+        .unwrap_or(false);
+    let m = metrics.get(&c.mac).cloned().unwrap_or_default();
+    let hostname = lease.and_then(|l| l.hostname.clone()).or(m.hostname);
+    let vendor = lease.and_then(|l| l.vendor.clone()).or(m.vendor);
+    UnlimitedClientView {
+        name: c.name,
+        mac: c.mac,
+        ip: c.ip,
+        comment: c.comment,
+        created_at: c.created_at,
+        updated_at: c.updated_at,
+        online,
+        stale_reservation,
+        hostname,
+        vendor,
+        first_seen: m.first_seen,
+        last_seen: m.last_seen,
+        bytes_total: m.bytes_total,
+        bytes_today: m.bytes_today,
+        bytes_7d: m.bytes_7d,
+    }
+}
+
+/// Enrich clients with lease + metrics data. Heavy reads run in `spawn_blocking`;
+/// failures degrade to empty maps (null metrics, offline).
+async fn enrich_unlimited(
+    clients: Vec<UnlimitedClient>,
+    leases_path: std::path::PathBuf,
+    metrics: Option<Arc<crate::device_metrics::DeviceMetricsStore>>,
+    now: i64,
+) -> Vec<UnlimitedClientView> {
+    let macs: Vec<String> = clients.iter().map(|c| c.mac.clone()).collect();
+    let (leases_map, metrics_map) = tokio::task::spawn_blocking(move || {
+        let leases_map = read_leases_map(&leases_path);
+        let metrics_map = metrics
+            .and_then(|m| {
+                m.get_many(&macs, now)
+                    .map_err(|e| error!("device-metrics get_many failed: {e:#}"))
+                    .ok()
+            })
+            .unwrap_or_default();
+        (leases_map, metrics_map)
+    })
+    .await
+    .unwrap_or_default();
+    clients
+        .into_iter()
+        .map(|c| build_unlimited_view(c, &leases_map, &metrics_map))
+        .collect()
+}
+
+/// A device-inventory row plus live flags.
+#[derive(Serialize)]
+struct DeviceView {
+    #[serde(flatten)]
+    device: crate::device_metrics::DeviceRow,
+    online: bool,
+    is_unlimited: bool,
+}
+
+#[get("/api/v1/admin/devices")]
+async fn admin_devices(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    query: web::Query<HashMap<String, String>>,
+) -> Result<HttpResponse, APIError> {
+    let params = parse_list_params(
+        &query,
+        &["last_seen", "first_seen", "bytes_total", "mac", "last_ip"],
+        "last_seen",
+    )?;
+
+    let (metrics, leases_path, store) = {
+        let s = state.lock().await;
+        (
+            s.device_metrics().cloned(),
+            s.config().dhcpd_leases.clone(),
+            s.unlimited_clients().clone(),
+        )
+    };
+    // Metrics disabled -> empty inventory (not an error).
+    let metrics = match metrics {
+        Some(m) => m,
+        None => return Ok(json_with_total(&Vec::<DeviceView>::new(), 0)),
+    };
+    let unlimited_macs: std::collections::HashSet<String> =
+        store.list().await.into_iter().map(|c| c.mac).collect();
+
+    let now = chrono::Utc::now().timestamp();
+    let (rows, leases_map) = tokio::task::spawn_blocking(move || {
+        let rows = metrics.all_devices(now).unwrap_or_else(|e| {
+            error!("device-metrics all_devices failed: {e:#}");
+            Vec::new()
+        });
+        let leases = read_leases_map(&leases_path);
+        (rows, leases)
+    })
+    .await
+    .unwrap_or_default();
+
+    let mut views: Vec<DeviceView> = rows
+        .into_iter()
+        .map(|d| {
+            let online = d
+                .last_ip
+                .as_ref()
+                .and_then(|ip| leases_map.get(ip))
+                .map(|l| l.active)
+                .unwrap_or(false);
+            let is_unlimited = unlimited_macs.contains(&d.mac);
+            DeviceView {
+                device: d,
+                online,
+                is_unlimited,
+            }
+        })
+        .collect();
+
+    if let Some(q) = &params.q {
+        views.retain(|v| {
+            v.device.mac.to_lowercase().contains(q)
+                || v.device
+                    .last_ip
+                    .as_deref()
+                    .is_some_and(|s| s.to_lowercase().contains(q))
+                || v.device
+                    .hostname
+                    .as_deref()
+                    .is_some_and(|s| s.to_lowercase().contains(q))
+                || v.device.ips.iter().any(|ip| ip.to_lowercase().contains(q))
+        });
+    }
+    views.sort_by(|a, b| {
+        let primary = match params.sort.as_str() {
+            "first_seen" => a.device.first_seen.cmp(&b.device.first_seen),
+            "bytes_total" => a.device.bytes_total.cmp(&b.device.bytes_total),
+            "mac" => a.device.mac.cmp(&b.device.mac),
+            "last_ip" => cmp_ip(
+                a.device.last_ip.as_deref().unwrap_or(""),
+                b.device.last_ip.as_deref().unwrap_or(""),
+            ),
+            _ => a.device.last_seen.cmp(&b.device.last_seen),
+        };
+        ordered(primary, params.order).then_with(|| a.device.mac.cmp(&b.device.mac))
+    });
+
+    let total = views.len();
+    let page = paginate(views, &params);
+    Ok(json_with_total(&page, total))
+}
+
 #[get("/api/v1/admin/unlimited-clients")]
 async fn unlimited_list(
     _auth: AuthSession,
@@ -760,7 +1008,14 @@ async fn unlimited_list(
 ) -> Result<HttpResponse, APIError> {
     let params = parse_list_params(&query, &["name", "ip", "mac", "comment"], "name")?;
 
-    let store = { state.lock().await.unlimited_clients().clone() };
+    let (store, leases_path, metrics) = {
+        let s = state.lock().await;
+        (
+            s.unlimited_clients().clone(),
+            s.config().dhcpd_leases.clone(),
+            s.device_metrics().cloned(),
+        )
+    };
     let mut items = store.list().await;
 
     if let Some(q) = &params.q {
@@ -787,7 +1042,10 @@ async fn unlimited_list(
 
     let total = items.len();
     let page = paginate(items, &params);
-    Ok(json_with_total(&page, total))
+    // Enrich only the page (metrics + lease join) to keep lookups bounded.
+    let now = chrono::Utc::now().timestamp();
+    let views = enrich_unlimited(page, leases_path, metrics, now).await;
+    Ok(json_with_total(&views, total))
 }
 
 #[get("/api/v1/admin/unlimited-clients/{name}")]
@@ -796,9 +1054,20 @@ async fn unlimited_get(
     state: Data<Arc<Mutex<State>>>,
     path: web::Path<String>,
 ) -> Result<HttpResponse, APIError> {
-    let store = { state.lock().await.unlimited_clients().clone() };
+    let (store, leases_path, metrics) = {
+        let s = state.lock().await;
+        (
+            s.unlimited_clients().clone(),
+            s.config().dhcpd_leases.clone(),
+            s.device_metrics().cloned(),
+        )
+    };
     match store.get(&path.into_inner()).await {
-        Some(client) => Ok(HttpResponse::Ok().json(client)),
+        Some(client) => {
+            let now = chrono::Utc::now().timestamp();
+            let mut views = enrich_unlimited(vec![client], leases_path, metrics, now).await;
+            Ok(HttpResponse::Ok().json(views.remove(0)))
+        }
         None => Err(APIError::NotFound),
     }
 }
@@ -857,6 +1126,7 @@ async fn unlimited_create(
         mac,
         ip: body.ip.clone(),
         comment: body.comment.clone(),
+        ..Default::default()
     };
     if let Err(err) = client.validate(ctx.subnet) {
         warn!("Rejected unlimited client: {err}");
@@ -902,7 +1172,18 @@ async fn unlimited_create(
         "Admin created unlimited client {} ip={} mac={} from {admin_ip}",
         client.name, client.ip, client.mac
     );
-    Ok(HttpResponse::Created().json(client))
+    // Return the enriched, timestamp-stamped record (same shape as the listing).
+    let now = chrono::Utc::now().timestamp();
+    let stored = ctx
+        .store
+        .get(&client.name)
+        .await
+        .unwrap_or_else(|| client.clone());
+    let metrics = { state.lock().await.device_metrics().cloned() };
+    let view = enrich_unlimited(vec![stored], ctx.leases.clone(), metrics, now)
+        .await
+        .remove(0);
+    Ok(HttpResponse::Created().json(view))
 }
 
 #[delete("/api/v1/admin/unlimited-clients/{name}")]
@@ -1119,5 +1400,143 @@ mod tests {
         assert_eq!(cmp_ip("10.11.5.221", "10.11.5.30"), Ordering::Greater);
         // non-IP falls back to string compare
         assert_eq!(cmp_ip("abc", "abd"), Ordering::Less);
+    }
+
+    // --- Device enrichment ---
+
+    fn client(mac: &str, ip: &str) -> UnlimitedClient {
+        UnlimitedClient {
+            name: "alice".into(),
+            mac: mac.into(),
+            ip: ip.into(),
+            ..Default::default()
+        }
+    }
+
+    fn lease(mac: Option<&str>, active: bool, hostname: Option<&str>) -> LeaseInfo {
+        LeaseInfo {
+            mac: mac.map(|s| s.to_string()),
+            active,
+            hostname: hostname.map(|s| s.to_string()),
+            vendor: None,
+        }
+    }
+
+    #[test]
+    fn build_unlimited_view_no_lease_is_offline() {
+        let leases = HashMap::new();
+        let metrics = HashMap::new();
+        let view = build_unlimited_view(client("aa:bb:cc:dd:ee:ff", "10.0.0.1"), &leases, &metrics);
+        assert!(!view.online);
+        assert!(!view.stale_reservation);
+    }
+
+    #[test]
+    fn build_unlimited_view_active_lease_same_mac_is_online_not_stale() {
+        let mac = "aa:bb:cc:dd:ee:ff";
+        let mut leases = HashMap::new();
+        leases.insert("10.0.0.1".to_string(), lease(Some(mac), true, None));
+        let metrics = HashMap::new();
+        let view = build_unlimited_view(client(mac, "10.0.0.1"), &leases, &metrics);
+        assert!(view.online);
+        assert!(!view.stale_reservation);
+    }
+
+    #[test]
+    fn build_unlimited_view_active_lease_other_mac_is_stale() {
+        let mut leases = HashMap::new();
+        leases.insert(
+            "10.0.0.1".to_string(),
+            lease(Some("11:11:11:11:11:11"), true, None),
+        );
+        let metrics = HashMap::new();
+        let view = build_unlimited_view(client("aa:bb:cc:dd:ee:ff", "10.0.0.1"), &leases, &metrics);
+        assert!(view.online);
+        assert!(view.stale_reservation);
+    }
+
+    #[test]
+    fn build_unlimited_view_lease_hostname_wins_over_metrics() {
+        let mac = "aa:bb:cc:dd:ee:ff";
+        let mut leases = HashMap::new();
+        leases.insert(
+            "10.0.0.1".to_string(),
+            lease(Some(mac), true, Some("from-lease")),
+        );
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            mac.to_string(),
+            crate::device_metrics::DeviceMetrics {
+                hostname: Some("from-metrics".into()),
+                first_seen: Some(123),
+                ..Default::default()
+            },
+        );
+        let view = build_unlimited_view(client(mac, "10.0.0.1"), &leases, &metrics);
+        assert_eq!(view.hostname.as_deref(), Some("from-lease"));
+        // Metrics still flow through for fields the lease doesn't carry.
+        assert_eq!(view.first_seen, Some(123));
+    }
+
+    #[test]
+    fn device_view_flatten_keeps_fields_at_top_level() {
+        let view = DeviceView {
+            device: crate::device_metrics::DeviceRow {
+                mac: "aa:bb:cc:dd:ee:ff".into(),
+                last_ip: Some("10.0.0.1".into()),
+                ips: vec!["10.0.0.1".into()],
+                hostname: Some("host".into()),
+                vendor: None,
+                first_seen: Some(100),
+                last_seen: Some(200),
+                bytes_total: 10,
+                bytes_today: 5,
+                bytes_7d: 7,
+            },
+            online: true,
+            is_unlimited: false,
+        };
+        let v = serde_json::to_value(&view).unwrap();
+        // Flatten must not nest the row under a "device" key.
+        assert!(v.get("device").is_none());
+        assert_eq!(v["mac"], "aa:bb:cc:dd:ee:ff");
+        assert_eq!(v["online"], true);
+        assert_eq!(v["is_unlimited"], false);
+        assert_eq!(v["first_seen"], 100);
+    }
+
+    #[test]
+    fn unlimited_client_view_serializes_new_fields() {
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "aa:bb:cc:dd:ee:ff".to_string(),
+            crate::device_metrics::DeviceMetrics {
+                first_seen: Some(1),
+                last_seen: Some(2),
+                bytes_total: Some(3),
+                bytes_today: Some(4),
+                bytes_7d: Some(5),
+                hostname: Some("h".into()),
+                vendor: Some("v".into()),
+            },
+        );
+        let leases = HashMap::new();
+        let view = build_unlimited_view(client("aa:bb:cc:dd:ee:ff", "10.0.0.1"), &leases, &metrics);
+        let v = serde_json::to_value(&view).unwrap();
+        for key in [
+            "online",
+            "stale_reservation",
+            "hostname",
+            "vendor",
+            "first_seen",
+            "last_seen",
+            "bytes_total",
+            "bytes_today",
+            "bytes_7d",
+        ] {
+            assert!(v.get(key).is_some(), "missing field {key}");
+        }
+        assert_eq!(v["bytes_7d"], 5);
+        assert_eq!(v["vendor"], "v");
     }
 }

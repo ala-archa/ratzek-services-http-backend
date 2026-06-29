@@ -7,6 +7,7 @@ pub struct Entry {
     pub ip: String,
     pub timeout: Option<std::time::Duration>,
     pub bytes: Option<usize>,
+    pub packets: Option<usize>,
 }
 
 pub struct IPSet {
@@ -44,6 +45,7 @@ impl IPSet {
 
             let mut timeout = None;
             let mut bytes = None;
+            let mut packets = None;
 
             while tail.len() > 1 {
                 if let Some(name) = tail.pop_front() {
@@ -54,12 +56,20 @@ impl IPSet {
                             })
                         }
                         "bytes" => bytes = tail.pop_front().and_then(|v| v.parse::<usize>().ok()),
+                        "packets" => {
+                            packets = tail.pop_front().and_then(|v| v.parse::<usize>().ok())
+                        }
                         _ => continue,
                     }
                 }
             }
 
-            result.push(Entry { ip, timeout, bytes })
+            result.push(Entry {
+                ip,
+                timeout,
+                bytes,
+                packets,
+            })
         }
 
         Ok(result)

@@ -16,13 +16,19 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 /// One unlimited client. Equals a dhcpd `host` reservation 1:1.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnlimitedClient {
     pub name: String,
     pub mac: String,
     pub ip: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// Unix epoch seconds when the client was first added (set by the store).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
+    /// Unix epoch seconds of the last store change (add / comment edit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
 }
 
 const MAX_COMMENT_LEN: usize = 256;
@@ -141,7 +147,18 @@ impl UnlimitedClientsStore {
     /// cache, so memory never gets ahead of disk. The (synchronous) disk write
     /// runs without holding the cache lock, so readers aren't blocked on I/O.
     /// Concurrent writers are serialized by the caller via [`Self::lock_for_mutation`].
-    pub async fn add(&self, client: UnlimitedClient) -> Result<()> {
+    pub async fn add(&self, mut client: UnlimitedClient) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        // Preserve an existing created_at across a re-add; otherwise stamp now.
+        let prior_created = self
+            .cache
+            .read()
+            .await
+            .get(&client.name)
+            .and_then(|c| c.created_at);
+        client.created_at = client.created_at.or(prior_created).or(Some(now));
+        client.updated_at = Some(now);
+
         let mut next = self.cache.read().await.clone();
         next.insert(client.name.clone(), client);
         self.persist(&next)?;
@@ -170,6 +187,7 @@ impl UnlimitedClientsStore {
         let found = match next.get_mut(name) {
             Some(client) => {
                 client.comment = comment;
+                client.updated_at = Some(chrono::Utc::now().timestamp());
                 true
             }
             None => false,
@@ -235,6 +253,7 @@ mod tests {
             mac: "aa:bb:cc:dd:ee:ff".into(),
             ip: "10.11.5.50".into(),
             comment: None,
+            ..Default::default()
         };
         assert!(ok.validate(subnet()).is_ok());
 
@@ -264,6 +283,7 @@ mod tests {
                 mac: "aa:bb:cc:dd:ee:ff".into(),
                 ip: "10.11.5.50".into(),
                 comment: Some("test".into()),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -295,6 +315,7 @@ mod tests {
                 mac: "aa:bb:cc:dd:ee:ff".into(),
                 ip: "10.11.5.50".into(),
                 comment: None,
+                ..Default::default()
             })
             .await
             .unwrap();

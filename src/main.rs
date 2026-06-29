@@ -5,6 +5,7 @@ use slog::{o, Drain};
 use slog_scope::error;
 
 mod config;
+mod device_metrics;
 mod dhcp;
 mod dhcp_hosts;
 mod error;
@@ -133,6 +134,7 @@ impl Application {
                         .service(http::unlimited_create)
                         .service(http::unlimited_delete)
                         .service(http::unlimited_patch)
+                        .service(http::admin_devices)
                 })
                 .bind(&http_listen)?
                 .run()
@@ -254,6 +256,7 @@ fn migrate_unlimited(config: &config::Config, dhcpd_conf: &str) -> Result<()> {
             mac,
             ip: ip.clone(),
             comment: None,
+            ..Default::default()
         });
     }
 

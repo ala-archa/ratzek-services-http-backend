@@ -46,6 +46,16 @@ unlimited_subnet: "10.11.5.0/24"
 #   validate_command: "dhcpd -t"                       # must fail on an invalid config
 #   reload_command: "systemctl restart isc-dhcp-server"
 
+# device_metrics: optional per-device metrics (first/last seen, accumulated traffic,
+# IP history) sampled periodically from dhcpd leases + ipset counters into SQLite and
+# surfaced in the admin API (GET /api/v1/admin/devices, and extra fields on
+# unlimited-clients). Best-effort: a DB error disables metrics but never blocks the
+# backend. Omit to disable. Back up the .sqlite file before upgrades.
+# device_metrics:
+#   db_path: /var/lib/ala-archa-http-backend/device-metrics.sqlite   # absolute
+#   crontab: "0 */5 * * * *"     # 6-field cron; every 5 min (spare SD-card writes)
+#   retention_days: 730          # drop daily traffic buckets / IP history older than this
+
 telegram:
   bot_token: "123456:ABC-asdasdasdasd"
   retry_crontab: "30 */5 * * * *"
