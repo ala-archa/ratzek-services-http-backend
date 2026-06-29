@@ -55,7 +55,7 @@ async fn check_is_wide_internet_available(config: &crate::config::Ping) -> bool 
 /// feed them to the store. The heavy (blocking) work runs in `spawn_blocking`.
 /// Best-effort: any failure is logged and the next tick retries.
 async fn sample_device_metrics(state: Arc<Mutex<State>>) {
-    let (store, leases_path, acl_name, retention_days, last_sample) = {
+    let (store, leases_path, traffic_sets, retention_days, last_sample) = {
         let s = state.lock().await;
         let store = match s.device_metrics.clone() {
             Some(st) => st,
@@ -70,7 +70,13 @@ async fn sample_device_metrics(state: Arc<Mutex<State>>) {
         (
             store,
             s.config.dhcpd_leases.clone(),
-            s.config.ipset_acl_name.clone(),
+            // Per-client byte/packet counters live on the shaper (rate-limited) and
+            // no_shape (unlimited) sets — a client is in exactly one of them. The
+            // acl set has no counters.
+            vec![
+                s.config.ipset_shaper_name.clone(),
+                s.config.ipset_no_shape_name.clone(),
+            ],
             retention,
             s.metrics_last_sample.clone(),
         )
@@ -101,16 +107,23 @@ async fn sample_device_metrics(state: Arc<Mutex<State>>) {
                     })
                     .collect();
 
-            let counters: Vec<crate::device_metrics::IpsetCounter> =
-                crate::ipset::IPSet::new(&acl_name)
-                    .entries()?
-                    .into_iter()
-                    .map(|e| crate::device_metrics::IpsetCounter {
-                        ip: e.ip,
-                        bytes: e.bytes.unwrap_or(0) as i64,
-                        packets: e.packets.unwrap_or(0) as i64,
-                    })
-                    .collect();
+            // Union counters from all traffic sets, deduped by IP (an IP should be
+            // in only one set, but dedup defensively so it's never double-counted).
+            let mut by_ip: std::collections::HashMap<String, crate::device_metrics::IpsetCounter> =
+                std::collections::HashMap::new();
+            for set in &traffic_sets {
+                for e in crate::ipset::IPSet::new(set).entries()? {
+                    by_ip.insert(
+                        e.ip.clone(),
+                        crate::device_metrics::IpsetCounter {
+                            ip: e.ip,
+                            bytes: e.bytes.unwrap_or(0) as i64,
+                            packets: e.packets.unwrap_or(0) as i64,
+                        },
+                    );
+                }
+            }
+            let counters: Vec<crate::device_metrics::IpsetCounter> = by_ip.into_values().collect();
 
             store.sample(&observations, &counters, now, retention_days)
         },
