@@ -33,3 +33,4 @@ Session.vim
 # Local debug logs
 mcp_debug.log
 /.cross-cargo
+/target-bench

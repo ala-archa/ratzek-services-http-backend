@@ -12,6 +12,15 @@ strip = true
 opt-level = "z"
 codegen-units = 1
 
+# Faster-building deploy profile used by scripts/deploy.sh: trades a little binary
+# size for much shorter build times (thin LTO + parallel codegen instead of fat
+# LTO + a single codegen unit). Runtime behavior is unchanged.
+[profile.deploy]
+inherits = "release"
+opt-level = 2
+lto = "thin"
+codegen-units = 16
+
 [profile.fastdev]
 
 inherits = "dev"

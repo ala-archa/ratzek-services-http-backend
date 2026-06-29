@@ -14,6 +14,7 @@ set -euo pipefail
 IMAGE=ratzek-cross-aarch64
 TARGET=aarch64-unknown-linux-gnu
 BIN=ala-archa-http-backend
+PROFILE=deploy                       # faster build than `release` (see Cargo.toml)
 MAX_GLIBC=2.31                       # production (Debian 11) glibc ceiling
 REMOTE="${1:-ratzek}"
 REMOTE_BIN=/usr/bin/ratzek-services-http-backend
@@ -32,15 +33,15 @@ fi
 # 2) Cross-compile. Run as the host user with a repo-local CARGO_HOME so the
 #    target/ and cache stay host-owned (no root-owned droppings). target/ and the
 #    cache persist on the host -> incremental rebuilds are fast.
-echo ">> cross-compiling $BIN for $TARGET…"
+echo ">> cross-compiling $BIN for $TARGET (profile: $PROFILE)…"
 docker run --rm \
   --user "$(id -u):$(id -g)" \
   -e CARGO_HOME=/src/.cross-cargo \
   -v "$REPO":/src -w /src \
   "$IMAGE" \
-  cargo build --release --target "$TARGET"
+  cargo build --profile "$PROFILE" --target "$TARGET"
 
-BINARY="target/$TARGET/release/$BIN"
+BINARY="target/$TARGET/$PROFILE/$BIN"
 [ -x "$BINARY" ] || { echo "!! binary not produced: $BINARY" >&2; exit 1; }
 
 # 3) Verify the binary won't out-require the Pi's glibc.
