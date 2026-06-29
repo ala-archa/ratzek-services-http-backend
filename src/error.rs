@@ -3,7 +3,7 @@ use actix_web::HttpResponse;
 use derive_more::{Display, Error};
 
 /// Error type shared by the HTTP handlers and request guards. Lives in its own
-/// module so `session`/`omapi`/`unlimited_clients` can depend on it without a
+/// module so `session`/`unlimited_clients` can depend on it without a
 /// back-edge into `http`.
 #[derive(Debug, Display, Error)]
 pub enum APIError {

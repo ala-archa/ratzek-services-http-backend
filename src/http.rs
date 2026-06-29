@@ -334,7 +334,9 @@ async fn dhcp_leases(
     if let Some(q) = &params.q {
         items.retain(|r| {
             r.ip.to_lowercase().contains(q)
-                || r.mac.as_deref().is_some_and(|s| s.to_lowercase().contains(q))
+                || r.mac
+                    .as_deref()
+                    .is_some_and(|s| s.to_lowercase().contains(q))
                 || r.hostname
                     .as_deref()
                     .is_some_and(|s| s.to_lowercase().contains(q))
@@ -448,15 +450,27 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
         status.internet_available as i64 as f64,
     );
     if let Some(st) = &status.speedtest {
-        out += &gauge("ratzek_speedtest_download", "Speedtest download speed", st.download);
-        out += &gauge("ratzek_speedtest_upload", "Speedtest upload speed", st.upload);
+        out += &gauge(
+            "ratzek_speedtest_download",
+            "Speedtest download speed",
+            st.download,
+        );
+        out += &gauge(
+            "ratzek_speedtest_upload",
+            "Speedtest upload speed",
+            st.upload,
+        );
         out += &gauge("ratzek_speedtest_ping", "Speedtest ping speed", st.ping);
     }
     if let Some(balance) = status.isp_balance {
         out += &gauge("ratzek_isp_balance", "ISP balance", balance);
     }
     if let Some(secs) = status.last_tariff_update_secs {
-        out += &gauge("ratzek_last_tariff_update", "Last tariff update", secs as f64);
+        out += &gauge(
+            "ratzek_last_tariff_update",
+            "Last tariff update",
+            secs as f64,
+        );
     }
     out += &gauge(
         "ratzek_clients_in_acl",
@@ -578,11 +592,11 @@ async fn admin_status(
 // --- Unlimited clients CRUD (admin-only via AuthSession) ---
 
 /// Config + store snapshot taken under the State lock so handlers can operate
-/// without holding it across OMAPI/ipset calls.
+/// without holding it across dhcp-reservation/ipset calls.
 struct UnlimitedCtx {
     store: crate::unlimited_clients::UnlimitedClientsStore,
     subnet: ipnet::IpNet,
-    omapi: Option<crate::config::Omapi>,
+    dhcp_reservations: Option<crate::config::DhcpReservations>,
     leases: std::path::PathBuf,
     no_shape_name: String,
     acl_name: String,
@@ -593,18 +607,23 @@ fn unlimited_ctx(state: &State) -> UnlimitedCtx {
     UnlimitedCtx {
         store: state.unlimited_clients().clone(),
         subnet: c.parsed_unlimited_subnet(),
-        omapi: c.omapi.clone(),
+        dhcp_reservations: c.dhcp_reservations.clone(),
         leases: c.dhcpd_leases.clone(),
         no_shape_name: c.ipset_no_shape_name.clone(),
         acl_name: c.ipset_acl_name.clone(),
     }
 }
 
-/// Best-effort compensation for a failed create transaction. A failure here
-/// leaves drift that startup reconcile will heal, but it must be visible.
-async fn rollback_omapi(omapi: &crate::config::Omapi, name: &str) {
-    if let Err(err) = crate::omapi::remove_host(omapi, name).await {
-        error!("rollback: OMAPI remove_host {name} failed: {err} (manual cleanup may be needed)");
+/// Re-render the dhcpd include from the current store and re-apply it, undoing a
+/// reservation written earlier in a transaction that then failed. Best-effort;
+/// startup reconcile heals any residue.
+async fn revert_reservations(
+    dr: &crate::config::DhcpReservations,
+    store: &crate::unlimited_clients::UnlimitedClientsStore,
+) {
+    let clients = store.list().await;
+    if let Err(err) = crate::dhcp_hosts::apply(dr, &crate::dhcp_hosts::render(&clients)).await {
+        error!("rollback: dhcp reservations revert failed: {err} (reconcile will heal)");
     }
 }
 
@@ -794,10 +813,10 @@ async fn unlimited_create(
     let admin_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
     let ctx = { unlimited_ctx(&*state.lock().await) };
 
-    let omapi = match &ctx.omapi {
-        Some(o) => o.clone(),
+    let dr = match &ctx.dhcp_reservations {
+        Some(d) => d.clone(),
         None => {
-            error!("unlimited-clients CRUD requires the `omapi` config section");
+            error!("unlimited-clients CRUD requires the `dhcp_reservations` config section");
             return Err(APIError::InternalError);
         }
     };
@@ -814,18 +833,21 @@ async fn unlimited_create(
     let lease = match crate::dhcp::Dhcp::of_ip(&ctx.leases, &body.ip) {
         Ok(l) => l,
         Err(err) => {
-            warn!("DHCP lease lookup for {} failed (from {admin_ip}): {err}", body.ip);
+            warn!(
+                "DHCP lease lookup for {:?} failed (from {admin_ip}): {err}",
+                body.ip
+            );
             return Err(APIError::BadRequest);
         }
     };
     if lease.binding_state != BindingState::Active {
-        warn!("Lease for {} is not active", body.ip);
+        warn!("Lease for {:?} is not active", body.ip);
         return Err(APIError::BadRequest);
     }
     let mac = match lease.hardware.and_then(|h| normalize_mac(&h.mac)) {
         Some(m) => m,
         None => {
-            warn!("Lease for {} has no usable MAC", body.ip);
+            warn!("Lease for {:?} has no usable MAC", body.ip);
             return Err(APIError::BadRequest);
         }
     };
@@ -848,28 +870,31 @@ async fn unlimited_create(
     let no_shape = crate::ipset::IPSet::new(&ctx.no_shape_name);
     let acl = crate::ipset::IPSet::new(&ctx.acl_name);
 
-    // Transaction: OMAPI -> ipset -> store. Compensate in reverse on failure;
-    // store is written last so it never records a client without side effects.
-    if let Err(err) = crate::omapi::add_host(&omapi, &client.name, &client.mac, &client.ip).await {
-        error!("OMAPI add_host failed: {err}");
+    // Transaction: dhcp reservation (gated by `dhcpd -t`) -> ipset -> store.
+    // Compensate in reverse on failure; store is written last so it never records
+    // a client whose side effects didn't land.
+    let mut desired = ctx.store.list().await;
+    desired.push(client.clone());
+    if let Err(err) = crate::dhcp_hosts::apply(&dr, &crate::dhcp_hosts::render(&desired)).await {
+        error!("dhcp reservation apply failed: {err}");
         return Err(APIError::InternalError);
     }
     if let Err(err) = no_shape.add(&client.ip, Some(0)) {
         error!("ipset add no_shape failed: {err}");
-        rollback_omapi(&omapi, &client.name).await;
+        revert_reservations(&dr, &ctx.store).await;
         return Err(APIError::InternalError);
     }
     if let Err(err) = acl.add(&client.ip, Some(0)) {
         error!("ipset add acl failed: {err}");
         rollback_ipset(&no_shape, &client.ip);
-        rollback_omapi(&omapi, &client.name).await;
+        revert_reservations(&dr, &ctx.store).await;
         return Err(APIError::InternalError);
     }
     if let Err(err) = ctx.store.add(client.clone()).await {
         error!("unlimited store add failed: {err}");
         rollback_ipset(&acl, &client.ip);
         rollback_ipset(&no_shape, &client.ip);
-        rollback_omapi(&omapi, &client.name).await;
+        revert_reservations(&dr, &ctx.store).await;
         return Err(APIError::InternalError);
     }
 
@@ -900,9 +925,18 @@ async fn unlimited_delete(
 
     // Side effects first (idempotent). If any fails, keep the store entry so the
     // client stays consistently unlimited; admin retries.
-    if let Some(omapi) = &ctx.omapi {
-        if let Err(err) = crate::omapi::remove_host(omapi, &client.name).await {
-            error!("OMAPI remove_host failed: {err}");
+    // Regenerate the dhcpd include without this client (gated by `dhcpd -t`).
+    if let Some(dr) = &ctx.dhcp_reservations {
+        let remaining: Vec<_> = ctx
+            .store
+            .list()
+            .await
+            .into_iter()
+            .filter(|c| c.name != client.name)
+            .collect();
+        if let Err(err) = crate::dhcp_hosts::apply(dr, &crate::dhcp_hosts::render(&remaining)).await
+        {
+            error!("dhcp reservation apply (delete) failed: {err}");
             return Err(APIError::InternalError);
         }
     }

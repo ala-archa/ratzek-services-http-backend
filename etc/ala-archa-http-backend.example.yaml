@@ -35,16 +35,16 @@ persistent_state_path: /var/tmp/ala-archa-http-backend.state
 unlimited_clients_path: /var/lib/ala-archa-http-backend/unlimited-clients.yaml
 # CIDR an admin may pick unlimited-client IPs from (must have an active lease).
 unlimited_subnet: "10.11.5.0/24"
-# OMAPI lets the backend create/remove dhcpd host reservations without a restart.
-# Requires `omapi-port 7911;` + a matching `key` in dhcpd.conf. Firewall 7911 to
-# localhost. WARNING: key_secret is a secret — keep this config mode 0600.
-# omapi:
-#   server: "127.0.0.1"
-#   port: 7911
-#   key_name: omapi_key
-#   # MUST be alphanumeric (no '/','+','=') — omshell truncates base64 specials.
-#   key_secret: "alnumSecret"   # generate: openssl rand -base64 64 | tr -d '/+=' | head -c 40
-#   omshell_path: /usr/bin/omshell          # must be an absolute path
+# dhcp_reservations: how the backend manages dhcpd `host` reservations for
+# unlimited clients. It owns the include file below (reference it from dhcpd.conf
+# with `include "/etc/dhcp/unlimited-hosts.conf";`), regenerates it from the store
+# on every CRUD change and on startup, validates with `dhcpd -t`, then restarts
+# dhcpd. The backend must run as root. Omit this section to disable reservation
+# management (then admin CRUD POST returns 500).
+# dhcp_reservations:
+#   include_path: /etc/dhcp/unlimited-hosts.conf      # absolute; backend owns/rewrites it
+#   validate_command: "dhcpd -t"                       # must fail on an invalid config
+#   reload_command: "systemctl restart isc-dhcp-server"
 
 telegram:
   bot_token: "123456:ABC-asdasdasdasd"

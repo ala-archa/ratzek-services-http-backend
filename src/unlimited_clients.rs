@@ -4,7 +4,7 @@
 //! client classification. Backed by a YAML file written atomically; the
 //! in-memory cache is updated only after a successful write so memory and disk
 //! never diverge. A dedicated mutation lock serializes whole CRUD transactions
-//! (store + OMAPI + ipset) so concurrent requests can't interleave.
+//! (store + dhcp reservations + ipset) so concurrent requests can't interleave.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -57,7 +57,10 @@ impl UnlimitedClient {
     /// Validate all fields. `mac` must already be normalized.
     pub fn validate(&self, subnet: IpNet) -> Result<()> {
         if !is_valid_name(&self.name) {
-            bail!("invalid name {:?}: expected slug [a-z0-9-]{{1,63}}", self.name);
+            bail!(
+                "invalid name {:?}: expected slug [a-z0-9-]{{1,63}}",
+                self.name
+            );
         }
         if normalize_mac(&self.mac).as_deref() != Some(self.mac.as_str()) {
             bail!("invalid/non-normalized MAC {:?}", self.mac);

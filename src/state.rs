@@ -249,7 +249,7 @@ impl State {
 
     /// Apply the unlimited-clients store to the live system, healing drift in
     /// both directions. Best-effort and non-fatal: logs and continues so a
-    /// half-available OMAPI never blocks startup. Run under a timeout by the caller.
+    /// failed dhcpd reload / ipset op can't block startup. Run under a timeout by the caller.
     pub async fn reconcile_unlimited(&self) -> anyhow::Result<()> {
         let clients = self.unlimited_clients.list().await;
         info!("Reconciling {} unlimited client(s)", clients.len());
@@ -262,14 +262,6 @@ impl State {
         let mut failed = 0usize;
         for client in &clients {
             let mut ok = true;
-            if let Some(omapi) = &self.config.omapi {
-                if let Err(err) =
-                    crate::omapi::add_host(omapi, &client.name, &client.mac, &client.ip).await
-                {
-                    error!("reconcile: OMAPI add_host {} failed: {err}", client.name);
-                    ok = false;
-                }
-            }
             // timeout 0 = permanent; these entries are owned by CRUD/reconcile.
             if let Err(err) = no_shape.add(&client.ip, Some(0)) {
                 error!("reconcile: ipset add no_shape {} failed: {err}", client.ip);
@@ -289,29 +281,19 @@ impl State {
 
         let managed_ips: std::collections::HashSet<&str> =
             clients.iter().map(|c| c.ip.as_str()).collect();
-        let managed_names: std::collections::HashSet<&str> =
-            clients.iter().map(|c| c.name.as_str()).collect();
 
-        // 2) Prune orphans (system ⊄ store). NB: never prune `acl` — it holds
-        //    all clients, not only the unlimited ones.
-        if let Some(omapi) = &self.config.omapi {
-            match crate::dhcp::Dhcp::hosts(&self.config.dhcpd_leases) {
-                Ok(hosts) => {
-                    for host in hosts {
-                        // Only touch hosts that follow our naming and aren't in the store.
-                        if crate::unlimited_clients::is_valid_name(&host.name)
-                            && !managed_names.contains(host.name.as_str())
-                        {
-                            info!("reconcile: removing orphan OMAPI host {}", host.name);
-                            if let Err(err) = crate::omapi::remove_host(omapi, &host.name).await {
-                                error!("reconcile: OMAPI remove_host {} failed: {err}", host.name);
-                            }
-                        }
-                    }
-                }
-                Err(err) => error!("reconcile: unable to list OMAPI hosts: {err}"),
+        // 2) Regenerate the dhcpd reservations include file from the store. The
+        //    file is fully derived from the store, so removed clients drop out
+        //    automatically — no separate orphan-reservation prune is needed.
+        if let Some(dr) = &self.config.dhcp_reservations {
+            match crate::dhcp_hosts::apply(dr, &crate::dhcp_hosts::render(&clients)).await {
+                Ok(applied) => info!("reconcile: dhcp reservations {applied:?}"),
+                Err(err) => error!("reconcile: dhcp reservations apply failed: {err}"),
             }
         }
+
+        // 3) Prune ipset orphans (system ⊄ store). NB: never prune `acl` — it
+        //    holds all clients, not only the unlimited ones.
         match no_shape.entries() {
             Ok(entries) => {
                 for entry in entries {

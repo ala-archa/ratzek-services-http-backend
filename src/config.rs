@@ -49,34 +49,30 @@ fn default_unlimited_subnet() -> String {
     "10.11.5.0/24".to_string()
 }
 
-fn default_omapi_server() -> String {
-    "127.0.0.1".to_string()
+fn default_dhcpd_validate_command() -> String {
+    "dhcpd -t".to_string()
 }
 
-fn default_omapi_port() -> u16 {
-    7911
+fn default_dhcpd_reload_command() -> String {
+    "systemctl restart isc-dhcp-server".to_string()
 }
 
-fn default_omshell_path() -> String {
-    "/usr/bin/omshell".to_string()
-}
-
-/// OMAPI connection settings used to create/delete dhcpd `host` reservations on
-/// the live server (no dhcpd restart). Requires `omapi-port` + a matching `key`
-/// in `dhcpd.conf`.
+/// How the backend manages dhcpd `host` reservations: it owns an include file
+/// (referenced from `dhcpd.conf` via `include "...";`), regenerates it from the
+/// unlimited-clients store, validates the config with `validate_command`, then
+/// applies it with `reload_command`. Replaces the OMAPI/omshell path, which is
+/// unreliable on this host. See `src/dhcp_hosts.rs`.
 #[derive(Serialize, Deserialize, Clone)]
-pub struct Omapi {
-    #[serde(default = "default_omapi_server")]
-    pub server: String,
-    #[serde(default = "default_omapi_port")]
-    pub port: u16,
-    /// Name of the `key` directive in dhcpd.conf.
-    pub key_name: String,
-    /// Base64 HMAC-MD5 secret matching that key. Secret — never log it.
-    pub key_secret: String,
-    /// Absolute path to the `omshell` binary.
-    #[serde(default = "default_omshell_path")]
-    pub omshell_path: String,
+pub struct DhcpReservations {
+    /// Absolute path to the include file the backend owns and rewrites.
+    pub include_path: std::path::PathBuf,
+    /// Command that exits non-zero if the dhcpd config (incl. the include) is
+    /// invalid. Gates every restart so a bad file can't take dhcpd down.
+    #[serde(default = "default_dhcpd_validate_command")]
+    pub validate_command: String,
+    /// Command that makes dhcpd load the regenerated include.
+    #[serde(default = "default_dhcpd_reload_command")]
+    pub reload_command: String,
 }
 
 /// Admin panel credentials. A single administrator authenticates with a login
@@ -125,13 +121,7 @@ pub struct Config {
     #[serde(default = "default_unlimited_subnet")]
     pub unlimited_subnet: String,
     #[serde(default)]
-    pub omapi: Option<Omapi>,
-}
-
-/// An OMAPI key secret is safe only if non-empty and purely alphanumeric — see
-/// the note in [`Config::validate`] about omshell truncating base64 specials.
-fn is_valid_omapi_secret(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric())
+    pub dhcp_reservations: Option<DhcpReservations>,
 }
 
 impl Config {
@@ -146,24 +136,25 @@ impl Config {
         // Fail fast on an unparseable unlimited_subnet CIDR.
         self.unlimited_subnet
             .parse::<ipnet::IpNet>()
-            .map_err(|err| anyhow::anyhow!("Invalid unlimited_subnet {:?}: {err}", self.unlimited_subnet))?;
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "Invalid unlimited_subnet {:?}: {err}",
+                    self.unlimited_subnet
+                )
+            })?;
 
-        if let Some(omapi) = &self.omapi {
-            // omshell must be an absolute path (avoid PATH hijacking).
-            if !std::path::Path::new(&omapi.omshell_path).is_absolute() {
+        if let Some(dr) = &self.dhcp_reservations {
+            // Absolute path: the file is written by a root daemon and referenced
+            // from dhcpd.conf; a relative path would be ambiguous.
+            if !std::path::Path::new(&dr.include_path).is_absolute() {
                 anyhow::bail!(
-                    "omapi.omshell_path must be absolute, got {:?}",
-                    omapi.omshell_path
+                    "dhcp_reservations.include_path must be absolute, got {:?}",
+                    dr.include_path
                 );
             }
-            // The secret is passed unquoted to `omshell key <name> <secret>`, whose
-            // tokenizer truncates at base64 specials ('/', '+', '='), so the key it
-            // uses silently differs from dhcpd's -> auth fails with "dhcpctl_connect:
-            // no more". Require a purely alphanumeric secret.
-            if !is_valid_omapi_secret(&omapi.key_secret) {
+            if dr.validate_command.trim().is_empty() || dr.reload_command.trim().is_empty() {
                 anyhow::bail!(
-                    "omapi.key_secret must be non-empty and alphanumeric (no '/','+','='); \
-                     generate e.g. `openssl rand -base64 64 | tr -d '/+=' | head -c 40`"
+                    "dhcp_reservations.validate_command and reload_command must be non-empty"
                 );
             }
         }
@@ -186,19 +177,5 @@ impl Config {
 
         config.validate()?;
         Ok(config)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_valid_omapi_secret;
-
-    #[test]
-    fn omapi_secret_validation() {
-        assert!(is_valid_omapi_secret("abcDEF123"));
-        assert!(!is_valid_omapi_secret("")); // empty
-        assert!(!is_valid_omapi_secret("ab/cd")); // base64 '/'
-        assert!(!is_valid_omapi_secret("ab+cd")); // base64 '+'
-        assert!(!is_valid_omapi_secret("abcd==")); // base64 padding
     }
 }

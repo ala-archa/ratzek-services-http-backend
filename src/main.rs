@@ -6,11 +6,11 @@ use slog_scope::error;
 
 mod config;
 mod dhcp;
+mod dhcp_hosts;
 mod error;
 mod http;
 mod ipset;
 mod mobile_provider;
-mod omapi;
 mod persistent_state;
 mod session;
 mod speedtest;
@@ -102,10 +102,10 @@ impl Application {
                 let session_store = web::Data::new(crate::session::SessionStore::new());
 
                 // Heal unlimited-clients drift on boot. Non-fatal and bounded so a
-                // half-available OMAPI can't block startup.
+                // failed dhcpd reload / ipset op can't block startup.
                 match tokio::time::timeout(
-                    // Generous: reconcile may create many OMAPI hosts via omshell
-                    // (each up to OMSHELL_TIMEOUT). Non-fatal — heals on next start.
+                    // Generous: reconcile may regenerate the dhcpd include and
+                    // restart dhcpd. Non-fatal — heals on next start.
                     std::time::Duration::from_secs(90),
                     async { state.lock().await.reconcile_unlimited().await },
                 )
@@ -143,9 +143,7 @@ impl Application {
                 // Handled early in `run()` before the config/logger are loaded.
                 Ok(())
             }
-            CommandLine::MigrateUnlimited { dhcpd_conf } => {
-                migrate_unlimited(&config, dhcpd_conf)
-            }
+            CommandLine::MigrateUnlimited { dhcpd_conf } => migrate_unlimited(&config, dhcpd_conf),
             CommandLine::Get(GetCommand::Balance) => {
                 let state = crate::state::State::new(&config).await?;
                 let state_guard = state.lock().await;
@@ -238,7 +236,10 @@ fn migrate_unlimited(config: &config::Config, dhcpd_conf: &str) -> Result<()> {
         let mac = match mac {
             Some(m) => m,
             None => {
-                eprintln!("WARNING: host {} ({ip}) has no usable MAC; skipped", host.name);
+                eprintln!(
+                    "WARNING: host {} ({ip}) has no usable MAC; skipped",
+                    host.name
+                );
                 skipped += 1;
                 continue;
             }
