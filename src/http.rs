@@ -273,14 +273,15 @@ async fn dhcp_leases(
 ) -> Result<HttpResponse, APIError> {
     info!("Client requested DHCP leases");
 
-    let params = parse_list_params(&query, &["ip", "mac", "hostname", "ends"], "ip")?;
+    let params = parse_list_params(
+        &query,
+        &["ip", "mac", "hostname", "ends", "last_seen"],
+        "ip",
+    )?;
     let ip_prefix = query.get("ip_prefix").cloned();
-    let has_mac = match query.get("has_mac").map(String::as_str) {
-        None => None,
-        Some("true") | Some("1") => Some(true),
-        Some("false") | Some("0") => Some(false),
-        Some(_) => return Err(APIError::BadRequest),
-    };
+    let has_mac = parse_bool_param(&query, "has_mac")?;
+    let has_acl = parse_bool_param(&query, "has_acl")?;
+    let has_shaper = parse_bool_param(&query, "has_shaper")?;
 
     let state = state.lock().await;
 
@@ -335,6 +336,12 @@ async fn dhcp_leases(
     if let Some(want) = has_mac {
         items.retain(|r| r.mac.as_deref().is_some_and(|m| !m.is_empty()) == want);
     }
+    if let Some(want) = has_acl {
+        items.retain(|r| r.acl.is_some() == want);
+    }
+    if let Some(want) = has_shaper {
+        items.retain(|r| r.shaper.is_some() == want);
+    }
     // Free-text filter.
     if let Some(q) = &params.q {
         items.retain(|r| {
@@ -356,6 +363,7 @@ async fn dhcp_leases(
             "mac" => opt_str_cmp(&a.mac, &b.mac),
             "hostname" => opt_str_cmp(&a.hostname, &b.hostname),
             "ends" => opt_str_cmp(&a.ends, &b.ends),
+            "last_seen" => a.last_seen.cmp(&b.last_seen),
             _ => cmp_ip(&a.ip, &b.ip),
         };
         // Stable: secondary by ip regardless of order.
@@ -813,6 +821,17 @@ fn json_with_total<T: Serialize>(items: &[T], total: usize) -> HttpResponse {
         .json(items)
 }
 
+/// Parse an optional boolean query filter: `true`/`1` -> `Some(true)`,
+/// `false`/`0` -> `Some(false)`, absent -> `None`, anything else -> `400`.
+fn parse_bool_param(query: &HashMap<String, String>, key: &str) -> Result<Option<bool>, APIError> {
+    match query.get(key).map(String::as_str) {
+        None => Ok(None),
+        Some("true") | Some("1") => Ok(Some(true)),
+        Some("false") | Some("0") => Ok(Some(false)),
+        Some(_) => Err(APIError::BadRequest),
+    }
+}
+
 /// Compare IP strings numerically when both parse (so `10.11.5.9` < `10.11.5.30`),
 /// else lexicographically.
 fn cmp_ip(a: &str, b: &str) -> Ordering {
@@ -979,9 +998,29 @@ async fn admin_devices(
 ) -> Result<HttpResponse, APIError> {
     let params = parse_list_params(
         &query,
-        &["last_seen", "first_seen", "bytes_total", "mac", "last_ip"],
+        &[
+            "last_seen",
+            "first_seen",
+            "bytes_total",
+            "bytes_today",
+            "bytes_7d",
+            "rate_bps",
+            "mac",
+            "last_ip",
+        ],
         "last_seen",
     )?;
+    let online_filter = parse_bool_param(&query, "online")?;
+    let unlimited_filter = parse_bool_param(&query, "is_unlimited")?;
+    let seen_within_days = match query.get("seen_within_days") {
+        None => None,
+        Some(s) => Some(
+            s.parse::<i64>()
+                .ok()
+                .filter(|&n| n >= 0)
+                .ok_or(APIError::BadRequest)?,
+        ),
+    };
 
     let (metrics, store) = {
         let s = state.lock().await;
@@ -1016,6 +1055,16 @@ async fn admin_devices(
         })
         .collect();
 
+    if let Some(want) = online_filter {
+        views.retain(|v| v.device.online == want);
+    }
+    if let Some(want) = unlimited_filter {
+        views.retain(|v| v.is_unlimited == want);
+    }
+    if let Some(days) = seen_within_days {
+        let cutoff = now.saturating_sub(days.saturating_mul(86_400));
+        views.retain(|v| v.device.last_seen.is_some_and(|ls| ls >= cutoff));
+    }
     if let Some(q) = &params.q {
         views.retain(|v| {
             v.device.mac.to_lowercase().contains(q)
@@ -1034,6 +1083,9 @@ async fn admin_devices(
         let primary = match params.sort.as_str() {
             "first_seen" => a.device.first_seen.cmp(&b.device.first_seen),
             "bytes_total" => a.device.bytes_total.cmp(&b.device.bytes_total),
+            "bytes_today" => a.device.bytes_today.cmp(&b.device.bytes_today),
+            "bytes_7d" => a.device.bytes_7d.cmp(&b.device.bytes_7d),
+            "rate_bps" => a.device.rate_bps.cmp(&b.device.rate_bps),
             "mac" => a.device.mac.cmp(&b.device.mac),
             "last_ip" => cmp_ip(
                 a.device.last_ip.as_deref().unwrap_or(""),
@@ -1263,7 +1315,16 @@ async fn blacklist_list(
     query: web::Query<HashMap<String, String>>,
 ) -> Result<HttpResponse, APIError> {
     let params = parse_list_params(&query, &["mac", "created_at"], "mac")?;
+    // `source` filter: runtime store vs static config entries.
+    let source_filter = match query.get("source").map(String::as_str) {
+        None => None,
+        Some(s @ ("store" | "config")) => Some(s.to_string()),
+        Some(_) => return Err(APIError::BadRequest),
+    };
     let mut items = blacklist_views(&state).await;
+    if let Some(src) = &source_filter {
+        items.retain(|v| v.source == src);
+    }
     if let Some(q) = &params.q {
         items.retain(|v| {
             v.mac.to_lowercase().contains(q)
@@ -1381,7 +1442,21 @@ async fn unlimited_list(
     state: Data<Arc<Mutex<State>>>,
     query: web::Query<HashMap<String, String>>,
 ) -> Result<HttpResponse, APIError> {
-    let params = parse_list_params(&query, &["name", "ip", "mac", "comment"], "name")?;
+    let params = parse_list_params(
+        &query,
+        &[
+            "name",
+            "ip",
+            "mac",
+            "comment",
+            "last_seen",
+            "bytes_total",
+            "created_at",
+        ],
+        "name",
+    )?;
+    let stale_filter = parse_bool_param(&query, "stale_reservation")?;
+    let online_filter = parse_bool_param(&query, "online")?;
 
     let (store, leases_path, metrics) = {
         let s = state.lock().await;
@@ -1393,6 +1468,7 @@ async fn unlimited_list(
     };
     let mut items = store.list().await;
 
+    // q-filter on the raw client (name/ip/mac/comment are available pre-enrichment).
     if let Some(q) = &params.q {
         items.retain(|c| {
             c.name.to_lowercase().contains(q)
@@ -1404,23 +1480,35 @@ async fn unlimited_list(
         });
     }
 
-    items.sort_by(|a, b| {
+    // Enrich the whole (q-filtered) list — the set is small (~tens) — so the
+    // metrics/lease-derived fields are available for filtering and sorting.
+    let now = chrono::Utc::now().timestamp();
+    let mut views = enrich_unlimited(items, leases_path, metrics, now).await;
+
+    if let Some(want) = stale_filter {
+        views.retain(|v| v.stale_reservation == want);
+    }
+    if let Some(want) = online_filter {
+        views.retain(|v| v.online == want);
+    }
+
+    views.sort_by(|a, b| {
         let primary = match params.sort.as_str() {
             "ip" => cmp_ip(&a.ip, &b.ip),
             "mac" => a.mac.cmp(&b.mac),
             "comment" => opt_str_cmp(&a.comment, &b.comment),
+            "last_seen" => a.last_seen.cmp(&b.last_seen),
+            "bytes_total" => a.bytes_total.cmp(&b.bytes_total),
+            "created_at" => a.created_at.cmp(&b.created_at),
             _ => a.name.cmp(&b.name),
         };
         // Stable: secondary by name (ascending) regardless of order.
         ordered(primary, params.order).then_with(|| a.name.cmp(&b.name))
     });
 
-    let total = items.len();
-    let page = paginate(items, &params);
-    // Enrich only the page (metrics + lease join) to keep lookups bounded.
-    let now = chrono::Utc::now().timestamp();
-    let views = enrich_unlimited(page, leases_path, metrics, now).await;
-    Ok(json_with_total(&views, total))
+    let total = views.len();
+    let page = paginate(views, &params);
+    Ok(json_with_total(&page, total))
 }
 
 #[get("/api/v1/admin/unlimited-clients/{name}")]
@@ -1715,6 +1803,28 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn parse_bool_param_accepts_bool_forms_and_rejects_junk() {
+        for v in ["true", "1"] {
+            assert_eq!(
+                parse_bool_param(&qmap(&[("f", v)]), "f").unwrap(),
+                Some(true)
+            );
+        }
+        for v in ["false", "0"] {
+            assert_eq!(
+                parse_bool_param(&qmap(&[("f", v)]), "f").unwrap(),
+                Some(false)
+            );
+        }
+        // Absent -> None (no filter).
+        assert_eq!(parse_bool_param(&HashMap::new(), "f").unwrap(), None);
+        // Anything else -> 400.
+        for v in ["yes", "TRUE", "2", ""] {
+            assert!(parse_bool_param(&qmap(&[("f", v)]), "f").is_err());
+        }
     }
 
     #[test]

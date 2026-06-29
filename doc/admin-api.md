@@ -388,7 +388,8 @@ curl -b jar -X POST $BASE/api/v1/admin/logout
 
 ## 10. Списки: пагинация, сортировка, фильтрация
 
-Применяется к `GET /api/v1/admin/unlimited-clients` и `GET /api/v1/dhcp`.
+Применяется к `GET /api/v1/admin/unlimited-clients`, `GET /api/v1/admin/devices`,
+`GET /api/v1/admin/blacklist` и `GET /api/v1/dhcp`.
 Реализует контракт `ratzek-services-frontend-admin/doc/backend-pagination-spec.md`.
 
 **Query-параметры** (все опциональны, snake_case):
@@ -411,7 +412,8 @@ curl -b jar -X POST $BASE/api/v1/admin/logout
 
 **Валидация → `400`** (тело — текст, ориентир HTTP-код): `page<1`/нечисло;
 `per_page<1`/`>200`/нечисло; `sort` вне белого списка; `order` ∉ {asc,desc};
-`has_mac` ∉ {true,false,1,0}. `page` за пределами данных → `200` + **пустой массив**
+любой булев фильтр ∉ {true,false,1,0}; `source` ∉ {store,config}; `seen_within_days` —
+нечисло/отрицательное. `page` за пределами данных → `200` + **пустой массив**
 + корректный `X-Total-Count` (не `404`).
 
 ```bash
@@ -419,6 +421,18 @@ curl -b jar -X POST $BASE/api/v1/admin/logout
 curl -i -b jar "$BASE/api/v1/admin/unlimited-clients?sort=ip&order=asc&page=1&per_page=25"
 # → 200, X-Total-Count: 137, массив из ≤25 UnlimitedClient
 ```
+
+### Доменные фильтры и `sort`-белые списки по эндпоинтам
+
+Булевы фильтры — формата `true|false|1|0` (иначе `400`), значение совпадает с одноимённым
+полем ответа.
+
+| Эндпоинт | `sort` ∈ | Доменные фильтры |
+|---|---|---|
+| `GET /admin/devices` | `last_seen`(деф.), `first_seen`, `bytes_total`, `bytes_today`, `bytes_7d`, `rate_bps`, `mac`, `last_ip` | `online`, `is_unlimited` (bool); `seen_within_days=N` (int ≥0 — активные за N дней) |
+| `GET /admin/unlimited-clients` | `name`(деф.), `ip`, `mac`, `comment`, `last_seen`, `bytes_total`, `created_at` | `stale_reservation`, `online` (bool) |
+| `GET /dhcp` | `ip`(деф.), `mac`, `hostname`, `ends`, `last_seen` | `has_mac`, `has_acl`, `has_shaper` (bool); `ip_prefix=<str>` |
+| `GET /admin/blacklist` | `mac`(деф.), `created_at` | `source` ∈ `{store, config}` (иначе `400`) |
 
 ---
 
