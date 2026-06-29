@@ -88,6 +88,14 @@ fn default_device_metrics_retention_days() -> i64 {
     730
 }
 
+fn default_device_metrics_retention_hourly_days() -> i64 {
+    90
+}
+
+fn default_device_metrics_retention_5min_hours() -> i64 {
+    48
+}
+
 /// Optional per-device metrics: a periodic sampler records first/last seen and
 /// accumulated traffic (from dhcpd leases + ipset counters) into a SQLite DB,
 /// surfaced in the admin API. Omit to disable. See `src/device_metrics.rs`.
@@ -101,6 +109,12 @@ pub struct DeviceMetricsConfig {
     /// Drop daily traffic buckets / IP history older than this many days.
     #[serde(default = "default_device_metrics_retention_days")]
     pub retention_days: i64,
+    /// Drop hourly traffic buckets older than this many days (default 90).
+    #[serde(default = "default_device_metrics_retention_hourly_days")]
+    pub retention_hourly_days: i64,
+    /// Drop 5-minute traffic buckets older than this many hours (default 48).
+    #[serde(default = "default_device_metrics_retention_5min_hours")]
+    pub retention_5min_hours: i64,
 }
 
 /// Admin panel credentials. A single administrator authenticates with a login
@@ -205,6 +219,12 @@ impl Config {
             }
             if dm.retention_days < 0 {
                 anyhow::bail!("device_metrics.retention_days must be >= 0");
+            }
+            if dm.retention_hourly_days < 0 {
+                anyhow::bail!("device_metrics.retention_hourly_days must be >= 0");
+            }
+            if dm.retention_5min_hours < 0 {
+                anyhow::bail!("device_metrics.retention_5min_hours must be >= 0");
             }
         }
 

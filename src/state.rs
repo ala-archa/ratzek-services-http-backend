@@ -6,8 +6,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Default retention for device metrics when not set in config.
-/// Mirrors `config::default_device_metrics_retention_days`.
+/// Mirror `config::default_device_metrics_retention_*`.
 const SAMPLER_DEFAULT_RETENTION_DAYS: i64 = 730;
+pub const SAMPLER_DEFAULT_RETENTION_HOURLY_DAYS: i64 = 90;
+pub const SAMPLER_DEFAULT_RETENTION_5MIN_HOURS: i64 = 48;
 
 /// RAII guard that resets a "running" flag on drop, so the flag is cleared even
 /// if the sampling task panics (preventing the sampler from getting stuck).
@@ -55,18 +57,24 @@ async fn check_is_wide_internet_available(config: &crate::config::Ping) -> bool 
 /// feed them to the store. The heavy (blocking) work runs in `spawn_blocking`.
 /// Best-effort: any failure is logged and the next tick retries.
 async fn sample_device_metrics(state: Arc<Mutex<State>>) {
-    let (store, leases_path, traffic_sets, retention_days, last_sample) = {
+    let (store, leases_path, traffic_sets, retention, last_sample) = {
         let s = state.lock().await;
         let store = match s.device_metrics.clone() {
             Some(st) => st,
             None => return,
         };
-        let retention = s
-            .config
-            .device_metrics
-            .as_ref()
-            .map(|d| d.retention_days)
-            .unwrap_or(SAMPLER_DEFAULT_RETENTION_DAYS);
+        let dm = s.config.device_metrics.as_ref();
+        let retention = crate::device_metrics::Retention {
+            daily_days: dm
+                .map(|d| d.retention_days)
+                .unwrap_or(SAMPLER_DEFAULT_RETENTION_DAYS),
+            hourly_days: dm
+                .map(|d| d.retention_hourly_days)
+                .unwrap_or(SAMPLER_DEFAULT_RETENTION_HOURLY_DAYS),
+            fivemin_hours: dm
+                .map(|d| d.retention_5min_hours)
+                .unwrap_or(SAMPLER_DEFAULT_RETENTION_5MIN_HOURS),
+        };
         (
             store,
             s.config.dhcpd_leases.clone(),
@@ -127,7 +135,7 @@ async fn sample_device_metrics(state: Arc<Mutex<State>>) {
             }
             let counters: Vec<crate::device_metrics::IpsetCounter> = by_ip.into_values().collect();
 
-            store.sample(&observations, &counters, now, retention_days)
+            store.sample(&observations, &counters, now, retention)
         },
     )
     .await;

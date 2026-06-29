@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SECONDS_PER_DAY: i64 = 86_400;
 /// SQLite `busy_timeout` for both the writer and short-lived readers.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -143,6 +143,62 @@ pub struct SampleStats {
     pub resets: usize,
 }
 
+/// Retention windows for the three traffic rollup levels, passed to
+/// [`DeviceMetricsStore::sample`]. A value `<= 0` disables pruning for that level.
+#[derive(Debug, Clone, Copy)]
+pub struct Retention {
+    pub daily_days: i64,
+    pub hourly_days: i64,
+    pub fivemin_hours: i64,
+}
+
+/// Traffic rollup granularity for the `/devices/{mac}/traffic` endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Granularity {
+    Day,
+    Hour,
+    FiveMin,
+}
+
+impl Granularity {
+    /// Parse the API `granularity` query value. `None` for anything else (-> 400).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "day" => Some(Self::Day),
+            "hour" => Some(Self::Hour),
+            "5m" => Some(Self::FiveMin),
+            _ => None,
+        }
+    }
+
+    /// The wire/serialized value (matches [`Granularity::parse`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Hour => "hour",
+            Self::FiveMin => "5m",
+        }
+    }
+
+    /// Backing `(table, bucket_column)` — both compile-time constants, never user
+    /// input, so they are safe to interpolate into SQL (mac/from/to stay bound).
+    fn table_col(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Day => ("traffic_daily", "day"),
+            Self::Hour => ("traffic_hourly", "hour"),
+            Self::FiveMin => ("traffic_5min", "ts"),
+        }
+    }
+}
+
+/// One bucket of a device's traffic series (`ts` = bucket start, unix sec UTC).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TrafficPoint {
+    pub ts: i64,
+    pub bytes: i64,
+    pub packets: i64,
+}
+
 pub struct DeviceMetricsStore {
     path: PathBuf,
     write: Mutex<Connection>,
@@ -157,7 +213,7 @@ fn configure(conn: &Connection) -> Result<()> {
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
-    // Fresh DBs get the full v2 schema here (incl. the rate columns + `meta`).
+    // Fresh DBs get the full v3 schema here (rate columns + `meta` + rollup tables).
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS devices (
             mac TEXT PRIMARY KEY,
@@ -191,17 +247,34 @@ fn init_schema(conn: &Connection) -> Result<()> {
             packets INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (mac, day)
          );
+         CREATE TABLE IF NOT EXISTS traffic_hourly (
+            mac TEXT NOT NULL,
+            hour INTEGER NOT NULL,
+            bytes INTEGER NOT NULL DEFAULT 0,
+            packets INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (mac, hour)
+         );
+         CREATE TABLE IF NOT EXISTS traffic_5min (
+            mac TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            bytes INTEGER NOT NULL DEFAULT 0,
+            packets INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (mac, ts)
+         );
          CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER);
-         CREATE INDEX IF NOT EXISTS idx_traffic_daily_day ON traffic_daily(day);",
+         CREATE INDEX IF NOT EXISTS idx_traffic_daily_day ON traffic_daily(day);
+         CREATE INDEX IF NOT EXISTS idx_traffic_hourly_hour ON traffic_hourly(hour);
+         CREATE INDEX IF NOT EXISTS idx_traffic_5min_ts ON traffic_5min(ts);",
     )?;
     migrate(conn)?;
     Ok(())
 }
 
-/// Idempotent schema migration. A fresh DB already has the v2 columns from the
-/// CREATE above (`user_version == 0`), so only the version bump runs. An existing
-/// v1 DB (`user_version == 1`) additionally gains the rate columns via ALTER.
-/// Gated strictly on `== 1` so it can never run twice.
+/// Idempotent schema migration. All tables/columns added in v3 (rollup tables) and
+/// for fresh DBs already exist from the `CREATE TABLE IF NOT EXISTS` batch above, so
+/// those upgrades need only the `user_version` bump. The one thing CREATE can't do
+/// retroactively is add columns to an existing table, so a v1 DB additionally gains
+/// the rate columns via ALTER — gated strictly on `== 1` so it can never run twice.
 fn migrate(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version == 1 {
@@ -218,6 +291,17 @@ fn migrate(conn: &Connection) -> Result<()> {
 
 fn day_start(now: i64) -> i64 {
     now / SECONDS_PER_DAY * SECONDS_PER_DAY
+}
+
+const SECONDS_PER_HOUR: i64 = 3600;
+const SECONDS_PER_5MIN: i64 = 300;
+
+fn hour_start(now: i64) -> i64 {
+    now / SECONDS_PER_HOUR * SECONDS_PER_HOUR
+}
+
+fn fivemin_start(now: i64) -> i64 {
+    now / SECONDS_PER_5MIN * SECONDS_PER_5MIN
 }
 
 /// Start of the rolling `bytes_7d` window (inclusive of `today`).
@@ -348,7 +432,9 @@ impl DeviceMetricsStore {
     }
 
     /// One transactional sampling pass. `now` is unix epoch seconds. Idempotent:
-    /// re-running with identical inputs adds no traffic (per-IP delta is 0).
+    /// re-running with identical inputs adds no traffic (per-IP delta is 0). Each
+    /// traffic delta is rolled into the daily / hourly / 5-minute buckets, then old
+    /// buckets are pruned per `retention` (one window per rollup level).
     ///
     /// # Errors
     ///
@@ -360,7 +446,7 @@ impl DeviceMetricsStore {
         leases: &[LeaseObservation],
         counters: &[IpsetCounter],
         now: i64,
-        retention_days: i64,
+        retention: Retention,
     ) -> Result<SampleStats> {
         // `std::Mutex` stays poisoned forever after a writer panic, which would
         // make every subsequent tick panic too. A panicking transaction is rolled
@@ -369,7 +455,10 @@ impl DeviceMetricsStore {
         let mut conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         let mut stats = SampleStats::default();
+        // Bucket starts for the three rollup levels (all floored, UTC).
         let day = day_start(now);
+        let hour = hour_start(now);
+        let five_min = fivemin_start(now);
 
         // Previous tick time, to compute the rate interval at the end.
         let prev_sample_at: i64 = tx
@@ -464,22 +553,41 @@ impl DeviceMetricsStore {
                        last_delta_bytes = last_delta_bytes + ?2 WHERE mac = ?1",
                     params![mac, dbytes, dpackets],
                 )?;
-                tx.execute(
-                    "INSERT INTO traffic_daily (mac, day, bytes, packets)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(mac, day) DO UPDATE SET
-                       bytes = bytes + excluded.bytes, packets = packets + excluded.packets",
-                    params![mac, day, dbytes, dpackets],
-                )?;
+                // Three rollup levels, all upsert (cron jitter can land two ticks
+                // in one bucket -> sum, never overwrite/conflict).
+                for (sql, bucket) in [
+                    (
+                        "INSERT INTO traffic_daily (mac, day, bytes, packets) VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(mac, day) DO UPDATE SET
+                           bytes = bytes + excluded.bytes, packets = packets + excluded.packets",
+                        day,
+                    ),
+                    (
+                        "INSERT INTO traffic_hourly (mac, hour, bytes, packets) VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(mac, hour) DO UPDATE SET
+                           bytes = bytes + excluded.bytes, packets = packets + excluded.packets",
+                        hour,
+                    ),
+                    (
+                        "INSERT INTO traffic_5min (mac, ts, bytes, packets) VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(mac, ts) DO UPDATE SET
+                           bytes = bytes + excluded.bytes, packets = packets + excluded.packets",
+                        five_min,
+                    ),
+                ] {
+                    tx.execute(sql, params![mac, bucket, dbytes, dpackets])?;
+                }
                 stats.bytes_added += dbytes;
             }
             stats.ips += 1;
         }
 
-        // 3) Retention: drop old daily buckets, stale IP history, aged-out
+        // 3) Retention: drop old rollup buckets, stale IP history, aged-out
         //    devices, and the IP baselines orphaned by the device_ips prune.
-        if retention_days > 0 {
-            let cutoff = day - retention_days * SECONDS_PER_DAY;
+        // `saturating_*` so an absurd retention config can't overflow the cutoff
+        // (a saturated cutoff prunes nothing, which is safe).
+        if retention.daily_days > 0 {
+            let cutoff = day.saturating_sub(retention.daily_days.saturating_mul(SECONDS_PER_DAY));
             tx.execute("DELETE FROM traffic_daily WHERE day < ?1", params![cutoff])?;
             tx.execute(
                 "DELETE FROM device_ips WHERE last_seen < ?1",
@@ -490,6 +598,18 @@ impl DeviceMetricsStore {
                 "DELETE FROM ip_samples WHERE ip NOT IN (SELECT ip FROM device_ips)",
                 [],
             )?;
+        }
+        if retention.hourly_days > 0 {
+            let cutoff = hour.saturating_sub(retention.hourly_days.saturating_mul(SECONDS_PER_DAY));
+            tx.execute(
+                "DELETE FROM traffic_hourly WHERE hour < ?1",
+                params![cutoff],
+            )?;
+        }
+        if retention.fivemin_hours > 0 {
+            let cutoff =
+                five_min.saturating_sub(retention.fivemin_hours.saturating_mul(SECONDS_PER_HOUR));
+            tx.execute("DELETE FROM traffic_5min WHERE ts < ?1", params![cutoff])?;
         }
 
         // Record this tick + the interval since the previous, for rate reads.
@@ -849,6 +969,50 @@ impl DeviceMetricsStore {
 
         Ok(Some(DeviceDetailData { device, daily }))
     }
+
+    /// Traffic series for one device at the given `granularity`, bucket starts in
+    /// `[from, to]` (inclusive), newest-first. `Ok(None)` if the MAC is unknown
+    /// (-> 404); `Ok(Some([]))` for a known device with no traffic in the window.
+    ///
+    /// # Errors
+    /// Returns an error if a read connection or any query fails (DB/SQL error).
+    pub fn traffic_series(
+        &self,
+        mac: &str,
+        granularity: Granularity,
+        from: i64,
+        to: i64,
+    ) -> Result<Option<Vec<TrafficPoint>>> {
+        let conn = self.read_conn()?;
+        // Unknown MAC -> None (404). A known device with no buckets -> Some([]).
+        let known: bool = conn
+            .query_row("SELECT 1 FROM devices WHERE mac = ?1", params![mac], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        if !known {
+            return Ok(None);
+        }
+        // `table`/`col` are compile-time constants from the Granularity enum (never
+        // user input); mac/from/to are bound. No user input is interpolated.
+        let (table, col) = granularity.table_col();
+        let sql = format!(
+            "SELECT {col}, bytes, packets FROM {table}
+             WHERE mac = ?1 AND {col} BETWEEN ?2 AND ?3 ORDER BY {col} DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let points = stmt
+            .query_map(params![mac, from, to], |r| {
+                Ok(TrafficPoint {
+                    ts: r.get(0)?,
+                    bytes: r.get(1)?,
+                    packets: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some(points))
+    }
 }
 
 #[cfg(test)]
@@ -882,6 +1046,14 @@ mod tests {
             packets: bytes / 100,
         }
     }
+    /// Test retention with the given daily window + production hourly/5min defaults.
+    fn retention(daily: i64) -> Retention {
+        Retention {
+            daily_days: daily,
+            hourly_days: 90,
+            fivemin_hours: 48,
+        }
+    }
 
     #[test]
     fn open_is_idempotent() {
@@ -901,7 +1073,7 @@ mod tests {
                 &[lease("aa:bb:cc:dd:ee:01", "10.0.0.2")],
                 &[ctr("10.0.0.2", 5000)],
                 now,
-                730,
+                retention(730),
             )
             .unwrap();
         assert_eq!(st.bytes_added, 0, "first observation only sets baseline");
@@ -919,7 +1091,7 @@ mod tests {
             &[lease(mac, "10.0.0.2")],
             &[ctr("10.0.0.2", 1000)],
             1000,
-            730,
+            retention(730),
         )
         .unwrap(); // baseline
         let st = s
@@ -927,7 +1099,7 @@ mod tests {
                 &[lease(mac, "10.0.0.2")],
                 &[ctr("10.0.0.2", 1500)],
                 2000,
-                730,
+                retention(730),
             )
             .unwrap();
         assert_eq!(st.bytes_added, 500); // 1500-1000
@@ -937,7 +1109,7 @@ mod tests {
                 &[lease(mac, "10.0.0.2")],
                 &[ctr("10.0.0.2", 300)],
                 3000,
-                730,
+                retention(730),
             )
             .unwrap();
         assert_eq!(st.resets, 1);
@@ -955,14 +1127,14 @@ mod tests {
             &[lease(mac, "10.0.0.2")],
             &[ctr("10.0.0.2", 1000)],
             1000,
-            730,
+            retention(730),
         )
         .unwrap();
         s.sample(
             &[lease(mac, "10.0.0.2")],
             &[ctr("10.0.0.2", 2000)],
             2000,
-            730,
+            retention(730),
         )
         .unwrap();
         // same inputs again -> no extra traffic
@@ -971,7 +1143,7 @@ mod tests {
                 &[lease(mac, "10.0.0.2")],
                 &[ctr("10.0.0.2", 2000)],
                 2000,
-                730,
+                retention(730),
             )
             .unwrap();
         assert_eq!(st.bytes_added, 0);
@@ -984,7 +1156,9 @@ mod tests {
     fn ip_without_lease_is_not_attributed() {
         let (s, dir) = store();
         // counter for an IP with no active lease this tick -> skipped
-        let st = s.sample(&[], &[ctr("10.0.0.9", 5000)], 1000, 730).unwrap();
+        let st = s
+            .sample(&[], &[ctr("10.0.0.9", 5000)], 1000, retention(730))
+            .unwrap();
         assert_eq!(st.ips, 0);
         assert_eq!(st.bytes_added, 0);
         std::fs::remove_dir_all(&dir).ok();
@@ -1000,14 +1174,14 @@ mod tests {
             &[lease(mac, "10.0.0.2")],
             &[ctr("10.0.0.2", 0)],
             10 * day,
-            730,
+            retention(730),
         )
         .unwrap();
         s.sample(
             &[lease(mac, "10.0.0.2")],
             &[ctr("10.0.0.2", 2000)],
             10 * day + 100,
-            730,
+            retention(730),
         )
         .unwrap();
         let m = s.get_many(&[mac.into()], 10 * day + 100).unwrap();
@@ -1024,8 +1198,10 @@ mod tests {
     fn ip_history_and_inventory() {
         let (s, dir) = store();
         let mac = "aa:bb:cc:dd:ee:01";
-        s.sample(&[lease(mac, "10.0.0.2")], &[], 1000, 730).unwrap();
-        s.sample(&[lease(mac, "10.0.0.5")], &[], 2000, 730).unwrap(); // roamed
+        s.sample(&[lease(mac, "10.0.0.2")], &[], 1000, retention(730))
+            .unwrap();
+        s.sample(&[lease(mac, "10.0.0.5")], &[], 2000, retention(730))
+            .unwrap(); // roamed
         let devs = s.all_devices(2000).unwrap();
         assert_eq!(devs.len(), 1);
         let d = &devs[0];
@@ -1040,13 +1216,18 @@ mod tests {
         let (s, dir) = store();
         let mac = "aa:bb:cc:dd:ee:01";
         let day = SECONDS_PER_DAY;
-        s.sample(&[lease(mac, "10.0.0.2")], &[ctr("10.0.0.2", 0)], 0, 730)
-            .unwrap();
+        s.sample(
+            &[lease(mac, "10.0.0.2")],
+            &[ctr("10.0.0.2", 0)],
+            0,
+            retention(730),
+        )
+        .unwrap();
         s.sample(
             &[lease(mac, "10.0.0.2")],
             &[ctr("10.0.0.2", 1000)],
             100,
-            730,
+            retention(730),
         )
         .unwrap(); // day 0
                    // 1000 days later with retention 30 -> day-0 bucket pruned, bytes_7d empty
@@ -1054,7 +1235,7 @@ mod tests {
             &[lease(mac, "10.0.0.2")],
             &[ctr("10.0.0.2", 1000)],
             1000 * day,
-            30,
+            retention(30),
         )
         .unwrap();
         let m = s.get_many(&[mac.into()], 1000 * day).unwrap();
@@ -1070,10 +1251,11 @@ mod tests {
         let stale = "aa:bb:cc:dd:ee:01";
         let fresh = "aa:bb:cc:dd:ee:02";
         // `stale` last seen at t=0, never observed again.
-        s.sample(&[lease(stale, "10.0.0.2")], &[], 0, 730).unwrap();
+        s.sample(&[lease(stale, "10.0.0.2")], &[], 0, retention(730))
+            .unwrap();
         // 1000 days later a different device ticks with retention 30 days; the
         // cutoff (970 days) is past `stale`'s last_seen, so it is pruned.
-        s.sample(&[lease(fresh, "10.0.0.3")], &[], 1000 * day, 30)
+        s.sample(&[lease(fresh, "10.0.0.3")], &[], 1000 * day, retention(30))
             .unwrap();
         let devs = s.all_devices(1000 * day).unwrap();
         let macs: Vec<&str> = devs.iter().map(|d| d.mac.as_str()).collect();
@@ -1094,7 +1276,7 @@ mod tests {
             &[lease(a, "10.0.0.2"), lease(b, "10.0.0.3")],
             &[ctr("10.0.0.2", 5000)],
             1000,
-            730,
+            retention(730),
         )
         .unwrap();
         // +3000 bytes on `a` over a 300s interval -> 10 bytes/sec.
@@ -1102,7 +1284,7 @@ mod tests {
             &[lease(a, "10.0.0.2"), lease(b, "10.0.0.3")],
             &[ctr("10.0.0.2", 8000)],
             1300,
-            730,
+            retention(730),
         )
         .unwrap();
         let m = s.get_many(&[a.into(), b.into()], 1300).unwrap();
@@ -1120,11 +1302,12 @@ mod tests {
             &[lease(a, "10.0.0.2"), lease(b, "10.0.0.3")],
             &[],
             1000,
-            730,
+            retention(730),
         )
         .unwrap();
         // Only `a` ticks now; `b` wasn't observed in the latest tick.
-        s.sample(&[lease(a, "10.0.0.2")], &[], 1300, 730).unwrap();
+        s.sample(&[lease(a, "10.0.0.2")], &[], 1300, retention(730))
+            .unwrap();
         let m = s.get_many(&[a.into(), b.into()], 1300).unwrap();
         assert_eq!(m[a].rate_bps, Some(0));
         assert_eq!(m[b].rate_bps, None);
@@ -1141,7 +1324,7 @@ mod tests {
             &[lease(a, "10.0.0.2"), lease(b, "10.0.0.3")],
             &[ctr("10.0.0.2", 1000), ctr("10.0.0.3", 2000)],
             now,
-            730,
+            retention(730),
         )
         .unwrap();
         // `a` gains +4000 over 300s; `b` is flat.
@@ -1149,7 +1332,7 @@ mod tests {
             &[lease(a, "10.0.0.2"), lease(b, "10.0.0.3")],
             &[ctr("10.0.0.2", 5000), ctr("10.0.0.3", 2000)],
             now + 300,
-            730,
+            retention(730),
         )
         .unwrap();
         let d = s.dashboard(now + 300, 5).unwrap();
@@ -1178,15 +1361,20 @@ mod tests {
         let now = 1_000_000;
         let a = "aa:bb:cc:dd:ee:01";
         let cltt = now - 3600; // device last talked to dhcpd an hour ago
-        s.sample(&[lease_cltt(a, "10.0.0.2", cltt)], &[], now, 730)
+        s.sample(&[lease_cltt(a, "10.0.0.2", cltt)], &[], now, retention(730))
             .unwrap();
         let m = s.get_many(&[a.into()], now).unwrap();
         assert_eq!(m[a].last_seen, Some(cltt), "last_seen = cltt, not now");
         assert_eq!(m[a].first_seen, Some(now), "first_seen = first observation");
 
         // Newer cltt advances last_seen; older cltt must NOT move it back (monotonic).
-        s.sample(&[lease_cltt(a, "10.0.0.2", now - 60)], &[], now + 300, 730)
-            .unwrap();
+        s.sample(
+            &[lease_cltt(a, "10.0.0.2", now - 60)],
+            &[],
+            now + 300,
+            retention(730),
+        )
+        .unwrap();
         assert_eq!(
             s.get_many(&[a.into()], now + 300).unwrap()[a].last_seen,
             Some(now - 60)
@@ -1195,7 +1383,7 @@ mod tests {
             &[lease_cltt(a, "10.0.0.2", now - 99_999)],
             &[],
             now + 600,
-            730,
+            retention(730),
         )
         .unwrap();
         assert_eq!(
@@ -1216,14 +1404,14 @@ mod tests {
             &[lease(a, "10.0.0.2"), lease(b, "10.0.0.3")],
             &[ctr("10.0.0.2", 1000)],
             now,
-            730,
+            retention(730),
         )
         .unwrap();
         s.sample(
             &[lease(a, "10.0.0.2"), lease(b, "10.0.0.3")],
             &[ctr("10.0.0.2", 5000)],
             now + 300,
-            730,
+            retention(730),
         )
         .unwrap();
         let m = s.get_many(&[a.into(), b.into()], now + 300).unwrap();
@@ -1241,13 +1429,18 @@ mod tests {
         let (s, dir) = store();
         let now = 1_000_000;
         let a = "aa:bb:cc:dd:ee:01";
-        s.sample(&[lease(a, "10.0.0.2")], &[ctr("10.0.0.2", 1000)], now, 730)
-            .unwrap();
+        s.sample(
+            &[lease(a, "10.0.0.2")],
+            &[ctr("10.0.0.2", 1000)],
+            now,
+            retention(730),
+        )
+        .unwrap();
         s.sample(
             &[lease(a, "10.0.0.2")],
             &[ctr("10.0.0.2", 4000)],
             now + 300,
-            730,
+            retention(730),
         )
         .unwrap();
         let detail = s.device_detail(a, now + 300, 30).unwrap().unwrap();
@@ -1295,13 +1488,14 @@ mod tests {
             conn.pragma_update(None, "user_version", 1i64).unwrap();
         }
 
-        // Opening migrates to v2 (adds rate columns + meta), preserving rows.
+        // Opening migrates v1 -> current (adds rate columns + meta + rollup tables),
+        // preserving rows.
         let s = DeviceMetricsStore::open(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, SCHEMA_VERSION);
 
         let m = s
             .get_many(&["aa:bb:cc:dd:ee:01".into()], 1_000_000)
@@ -1312,6 +1506,194 @@ mod tests {
 
         // Re-opening is a no-op (idempotent; ALTER must not run twice).
         assert!(DeviceMetricsStore::open(&path).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn granularity_parse_roundtrip() {
+        for (s, g) in [
+            ("day", Granularity::Day),
+            ("hour", Granularity::Hour),
+            ("5m", Granularity::FiveMin),
+        ] {
+            assert_eq!(Granularity::parse(s), Some(g));
+            assert_eq!(g.as_str(), s);
+        }
+        assert_eq!(Granularity::parse("minute"), None);
+        assert_eq!(Granularity::parse("5min"), None);
+        assert_eq!(Granularity::parse(""), None);
+    }
+
+    #[test]
+    fn sample_writes_rollups_and_jitter_sums() {
+        let (s, dir) = store();
+        let a = "aa:bb:cc:dd:ee:01";
+        let ip = "10.0.0.2";
+        // Baseline (first observation -> delta 0, no bucket row).
+        s.sample(&[lease(a, ip)], &[ctr(ip, 1000)], 999_900, retention(730))
+            .unwrap();
+        // +2000 then +2000 — both land in the SAME 5min (999_900) and hour bucket,
+        // so the upsert must SUM (jitter), not overwrite.
+        s.sample(&[lease(a, ip)], &[ctr(ip, 3000)], 999_960, retention(730))
+            .unwrap();
+        s.sample(&[lease(a, ip)], &[ctr(ip, 5000)], 1_000_050, retention(730))
+            .unwrap();
+
+        let five = s
+            .traffic_series(a, Granularity::FiveMin, 0, 2_000_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(five.len(), 1, "all three ticks share one 5min bucket");
+        assert_eq!(five[0].ts, fivemin_start(999_960));
+        assert_eq!(five[0].bytes, 4000, "jitter must sum, not overwrite");
+
+        let hourly = s
+            .traffic_series(a, Granularity::Hour, 0, 2_000_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hourly.len(), 1);
+        assert_eq!(hourly[0].ts, hour_start(999_960));
+        assert_eq!(hourly[0].bytes, 4000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn traffic_series_unknown_mac_and_empty_window() {
+        let (s, dir) = store();
+        let a = "aa:bb:cc:dd:ee:01";
+        s.sample(
+            &[lease(a, "10.0.0.2")],
+            &[ctr("10.0.0.2", 1000)],
+            1_000_000,
+            retention(730),
+        )
+        .unwrap();
+        s.sample(
+            &[lease(a, "10.0.0.2")],
+            &[ctr("10.0.0.2", 5000)],
+            1_000_300,
+            retention(730),
+        )
+        .unwrap();
+
+        // Unknown MAC -> None (404 at the HTTP layer).
+        assert!(s
+            .traffic_series("ff:ff:ff:ff:ff:ff", Granularity::Hour, 0, 2_000_000)
+            .unwrap()
+            .is_none());
+        // Known MAC, window with no buckets -> Some([]) (200, not an error).
+        assert!(s
+            .traffic_series(a, Granularity::FiveMin, 5_000_000, 6_000_000)
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        // Day granularity carries the +4000 delta.
+        let day = s
+            .traffic_series(a, Granularity::Day, 0, 2_000_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(day.iter().map(|p| p.bytes).sum::<i64>(), 4000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retention_prunes_rollups_keeps_daily() {
+        let (s, dir) = store();
+        let a = "aa:bb:cc:dd:ee:01";
+        let ip = "10.0.0.2";
+        s.sample(&[lease(a, ip)], &[ctr(ip, 1000)], 1_000_000, retention(730))
+            .unwrap();
+        s.sample(&[lease(a, ip)], &[ctr(ip, 5000)], 1_000_300, retention(730))
+            .unwrap();
+        // 100 days later, short rollup retention (hourly 7d, 5min 1h) prunes the
+        // old rollup buckets; daily (730d) keeps them.
+        let later = 1_000_000 + 100 * 24 * 3600;
+        let ret = Retention {
+            daily_days: 730,
+            hourly_days: 7,
+            fivemin_hours: 1,
+        };
+        s.sample(&[lease(a, ip)], &[], later, ret).unwrap();
+
+        assert!(s
+            .traffic_series(a, Granularity::FiveMin, 0, 9_000_000_000)
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .traffic_series(a, Granularity::Hour, 0, 9_000_000_000)
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        let day = s
+            .traffic_series(a, Granularity::Day, 0, 9_000_000_000)
+            .unwrap()
+            .unwrap();
+        assert!(day.iter().any(|p| p.bytes == 4000), "daily must survive");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_v2_to_v3_adds_rollup_tables() {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("dm-mig3-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v2.sqlite");
+        let _ = std::fs::remove_file(&path);
+
+        // Hand-build a v2 DB (rate columns + meta, no rollup tables, user_version=2).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE devices (mac TEXT PRIMARY KEY, first_seen INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL, last_ip TEXT, last_hostname TEXT, last_vendor TEXT,
+                    bytes_total INTEGER NOT NULL DEFAULT 0, packets_total INTEGER NOT NULL DEFAULT 0,
+                    last_delta_bytes INTEGER NOT NULL DEFAULT 0, last_delta_at INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE device_ips (mac TEXT NOT NULL, ip TEXT NOT NULL, first_seen INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL, PRIMARY KEY (mac, ip));
+                 CREATE TABLE ip_samples (ip TEXT PRIMARY KEY, mac TEXT, last_bytes INTEGER NOT NULL,
+                    last_packets INTEGER NOT NULL);
+                 CREATE TABLE traffic_daily (mac TEXT NOT NULL, day INTEGER NOT NULL,
+                    bytes INTEGER NOT NULL DEFAULT 0, packets INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (mac, day));
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value INTEGER);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO devices (mac, first_seen, last_seen, bytes_total) VALUES ('aa:bb:cc:dd:ee:01', 100, 200, 4242)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO traffic_daily (mac, day, bytes, packets) VALUES ('aa:bb:cc:dd:ee:01', 86400, 4242, 7)",
+                [],
+            ).unwrap();
+            conn.pragma_update(None, "user_version", 2i64).unwrap();
+        }
+
+        let s = DeviceMetricsStore::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 3);
+
+        // Existing daily data preserved.
+        let day = s
+            .traffic_series("aa:bb:cc:dd:ee:01", Granularity::Day, 0, 200_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(day.len(), 1);
+        assert_eq!(day[0].bytes, 4242);
+        // New rollup tables exist and are queryable (empty).
+        assert!(s
+            .traffic_series("aa:bb:cc:dd:ee:01", Granularity::FiveMin, 0, 200_000)
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .traffic_series("aa:bb:cc:dd:ee:01", Granularity::Hour, 0, 200_000)
+            .unwrap()
+            .unwrap()
+            .is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

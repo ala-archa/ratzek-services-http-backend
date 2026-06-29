@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use slog_scope::{error, info, warn};
 use tokio::sync::Mutex;
 
+use crate::device_metrics::Granularity;
 use crate::error::APIError;
 use crate::session::{AuthSession, SessionStore, SESSION_COOKIE};
 use crate::state::State;
@@ -1113,6 +1114,103 @@ async fn admin_device_detail(
     }))
 }
 
+/// Traffic series for the device-detail chart. `bytes` is the per-bucket sum (NOT
+/// a rate); the current (open) bucket is partial — that's expected.
+#[derive(Serialize)]
+struct TrafficSeriesResponse {
+    granularity: &'static str,
+    from: i64,
+    to: i64,
+    points: Vec<crate::device_metrics::TrafficPoint>,
+}
+
+/// Default series window (seconds) when `from` is omitted, per granularity.
+fn traffic_default_window(g: Granularity) -> i64 {
+    match g {
+        Granularity::Day => 30 * 86_400,
+        Granularity::Hour => 7 * 86_400,
+        Granularity::FiveMin => 24 * 3_600,
+    }
+}
+
+#[get("/api/v1/admin/devices/{mac}/traffic")]
+async fn admin_device_traffic(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    path: web::Path<String>,
+    query: web::Query<HashMap<String, String>>,
+) -> Result<HttpResponse, APIError> {
+    let mac = normalize_mac(&path.into_inner()).ok_or(APIError::BadRequest)?;
+    let granularity = query
+        .get("granularity")
+        .and_then(|s| Granularity::parse(s))
+        .ok_or(APIError::BadRequest)?;
+    let parse_opt = |k: &str| -> Result<Option<i64>, APIError> {
+        query
+            .get(k)
+            .map(|v| v.parse::<i64>().map_err(|_| APIError::BadRequest))
+            .transpose()
+    };
+    let from_q = parse_opt("from")?;
+    let to_q = parse_opt("to")?;
+
+    // Longest window the rollup's retention can actually back, in seconds — used to
+    // clamp `from` (avoids a misleading empty tail). Derived from config (defaults
+    // shared with the sampler), not hard-coded. `saturating_*` guards an absurd
+    // retention config from overflowing.
+    let (metrics, cap) = {
+        use crate::state::{
+            SAMPLER_DEFAULT_RETENTION_5MIN_HOURS, SAMPLER_DEFAULT_RETENTION_HOURLY_DAYS,
+        };
+        let s = state.lock().await;
+        let dm = s.config().device_metrics.as_ref();
+        let cap = match granularity {
+            Granularity::Day => 365_i64.saturating_mul(86_400),
+            Granularity::Hour => dm
+                .map(|d| d.retention_hourly_days)
+                .unwrap_or(SAMPLER_DEFAULT_RETENTION_HOURLY_DAYS)
+                .saturating_mul(86_400),
+            Granularity::FiveMin => dm
+                .map(|d| d.retention_5min_hours)
+                .unwrap_or(SAMPLER_DEFAULT_RETENTION_5MIN_HOURS)
+                .saturating_mul(3_600),
+        };
+        (s.device_metrics().cloned(), cap)
+    };
+    let metrics = match metrics {
+        Some(m) => m,
+        None => return Err(APIError::NotFound),
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let to = to_q.unwrap_or(now);
+    let from = from_q
+        .unwrap_or(to.saturating_sub(traffic_default_window(granularity)))
+        .max(to.saturating_sub(cap));
+
+    let series =
+        tokio::task::spawn_blocking(move || metrics.traffic_series(&mac, granularity, from, to))
+            .await
+            .map_err(|err| {
+                error!("traffic_series task panicked: {err}");
+                APIError::InternalError
+            })?;
+    let points = match series {
+        Ok(Some(p)) => p,
+        Ok(None) => return Err(APIError::NotFound),
+        Err(err) => {
+            error!("traffic_series failed: {err:#}");
+            return Err(APIError::InternalError);
+        }
+    };
+    Ok(HttpResponse::Ok().json(TrafficSeriesResponse {
+        granularity: granularity.as_str(),
+        from,
+        to,
+        points,
+    }))
+}
+
 // --- MAC blacklist CRUD (union with config.blacklisted_macs) ---
 
 #[derive(Serialize)]
@@ -1842,5 +1940,26 @@ mod tests {
         }
         assert_eq!(v["bytes_7d"], 5);
         assert_eq!(v["vendor"], "v");
+    }
+
+    #[test]
+    fn traffic_series_response_serializes_to_documented_shape() {
+        let resp = TrafficSeriesResponse {
+            granularity: Granularity::Hour.as_str(),
+            from: 1_751_000_000,
+            to: 1_751_600_000,
+            points: vec![crate::device_metrics::TrafficPoint {
+                ts: 1_751_596_800,
+                bytes: 104_857_600,
+                packets: 90_000,
+            }],
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["granularity"], "hour");
+        assert_eq!(v["from"], 1_751_000_000_i64);
+        assert_eq!(v["to"], 1_751_600_000_i64);
+        assert_eq!(v["points"][0]["ts"], 1_751_596_800_i64);
+        assert_eq!(v["points"][0]["bytes"], 104_857_600_i64);
+        assert_eq!(v["points"][0]["packets"], 90_000);
     }
 }

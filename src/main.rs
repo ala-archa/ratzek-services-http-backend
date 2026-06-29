@@ -137,6 +137,7 @@ impl Application {
                         .service(http::unlimited_patch)
                         .service(http::admin_devices)
                         .service(http::admin_device_detail)
+                        .service(http::admin_device_traffic)
                         .service(http::blacklist_list)
                         .service(http::blacklist_get)
                         .service(http::blacklist_create)

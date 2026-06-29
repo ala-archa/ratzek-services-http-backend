@@ -59,6 +59,8 @@ blacklist_path: /var/lib/ala-archa-http-backend/blacklist.yaml
 #   db_path: /var/lib/ala-archa-http-backend/device-metrics.sqlite   # absolute
 #   crontab: "0 */5 * * * *"     # 6-field cron; every 5 min (spare SD-card writes)
 #   retention_days: 730          # drop daily traffic buckets / IP history older than this
+#   retention_hourly_days: 90    # drop hourly traffic buckets older than this (optional)
+#   retention_5min_hours: 48     # drop 5-minute traffic buckets older than this (optional)
 
 telegram:
   bot_token: "123456:ABC-asdasdasdasd"
