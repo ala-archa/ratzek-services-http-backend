@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SECONDS_PER_DAY: i64 = 86_400;
 /// SQLite `busy_timeout` for both the writer and short-lived readers.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,6 +40,8 @@ const MONTH_WINDOW_DAYS: i64 = 30;
 /// row (or a transient DB error) serializes as `null`s without breaking the response.
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct DeviceMetrics {
+    /// First/last contact with dhcpd (lease `cltt`, unix sec UTC; `now` fallback for
+    /// a lease without cltt). Both use the same time source, so `first_seen <= last_seen`.
     pub first_seen: Option<i64>,
     pub last_seen: Option<i64>,
     pub bytes_total: Option<i64>,
@@ -283,6 +285,15 @@ fn migrate(conn: &Connection) -> Result<()> {
              ALTER TABLE devices ADD COLUMN last_delta_at INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    if version < 4 {
+        // v<4 -> 4: heal rows where the old `now`-based first_seen ended up AFTER the
+        // cltt-based last_seen. The INSERT now uses cltt for first_seen too, so this
+        // is a one-time fix; idempotent (a fresh/healed DB matches no rows).
+        conn.execute(
+            "UPDATE devices SET first_seen = last_seen WHERE first_seen > last_seen",
+            [],
+        )?;
+    }
     if version < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -476,18 +487,22 @@ impl DeviceMetricsStore {
             .collect();
 
         // 1) Upsert device + IP-history rows from active leases.
-        //    - `last_seen` tracks the lease `cltt` (real last-seen on the network),
-        //      NOT `now`: an unexpired-but-idle lease (cltt old) must not inflate it.
-        //      `MAX(last_seen, COALESCE(cltt, now))` keeps it monotonic; only a lease
-        //      with NO cltt at all falls back to `now` (we are observing it now).
-        //    - `first_seen` stays `now` (first time WE observed the MAC).
+        //    - `first_seen` and `last_seen` BOTH track the lease `cltt` (real
+        //      first/last contact with dhcpd), falling back to `now` only when the
+        //      lease has no cltt. Using one time source for the pair guarantees the
+        //      invariant `first_seen <= last_seen` (a `now`-based first_seen could be
+        //      AFTER a cltt-based last_seen on the first observation of a device that
+        //      had transacted before we sampled it).
+        //    - `first_seen` is frozen on first insert; `last_seen = MAX(.., cltt|now)`
+        //      stays monotonic. An unexpired-but-idle lease (cltt old) must not
+        //      inflate last_seen — hence cltt, not now.
         //    - Reset the per-tick rate accumulator (`last_delta_bytes=0`) and stamp
         //      `last_delta_at=now` for EVERY active device, so an active-but-idle
         //      device reads as "active in the latest tick" (rate 0).
         for l in leases {
             tx.execute(
                 "INSERT INTO devices (mac, first_seen, last_seen, last_ip, last_hostname, last_vendor, last_delta_at, last_delta_bytes)
-                 VALUES (?1, ?2, COALESCE(?6, ?2), ?3, ?4, ?5, ?2, 0)
+                 VALUES (?1, COALESCE(?6, ?2), COALESCE(?6, ?2), ?3, ?4, ?5, ?2, 0)
                  ON CONFLICT(mac) DO UPDATE SET
                    last_seen = MAX(last_seen, COALESCE(?6, ?2)),
                    last_ip = excluded.last_ip,
@@ -1365,7 +1380,13 @@ mod tests {
             .unwrap();
         let m = s.get_many(&[a.into()], now).unwrap();
         assert_eq!(m[a].last_seen, Some(cltt), "last_seen = cltt, not now");
-        assert_eq!(m[a].first_seen, Some(now), "first_seen = first observation");
+        // first_seen also uses cltt (same source), so it never exceeds last_seen.
+        assert_eq!(
+            m[a].first_seen,
+            Some(cltt),
+            "first_seen = cltt at first observation"
+        );
+        assert!(m[a].first_seen <= m[a].last_seen);
 
         // Newer cltt advances last_seen; older cltt must NOT move it back (monotonic).
         s.sample(
@@ -1674,7 +1695,7 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, SCHEMA_VERSION);
 
         // Existing daily data preserved.
         let day = s
@@ -1694,6 +1715,89 @@ mod tests {
             .unwrap()
             .unwrap()
             .is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn first_seen_never_exceeds_last_seen() {
+        let (s, dir) = store();
+        let now = 1_000_000;
+        let a = "aa:bb:cc:dd:ee:01";
+        // Device whose lease cltt predates our first sample (the bug scenario):
+        // first_seen must equal that cltt, not `now`, so it never exceeds last_seen.
+        let cltt = now - 250;
+        s.sample(&[lease_cltt(a, "10.0.0.2", cltt)], &[], now, retention(730))
+            .unwrap();
+        let m = s.get_many(&[a.into()], now).unwrap();
+        assert_eq!(m[a].first_seen, Some(cltt));
+        assert_eq!(m[a].last_seen, Some(cltt));
+        assert!(m[a].first_seen <= m[a].last_seen);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_v3_to_v4_heals_first_seen() {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("dm-mig4-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v3.sqlite");
+        let _ = std::fs::remove_file(&path);
+
+        // Minimal v3 DB with a row where first_seen > last_seen (the bug).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE devices (mac TEXT PRIMARY KEY, first_seen INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL, last_ip TEXT, last_hostname TEXT, last_vendor TEXT,
+                    bytes_total INTEGER NOT NULL DEFAULT 0, packets_total INTEGER NOT NULL DEFAULT 0,
+                    last_delta_bytes INTEGER NOT NULL DEFAULT 0, last_delta_at INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE device_ips (mac TEXT NOT NULL, ip TEXT NOT NULL, first_seen INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL, PRIMARY KEY (mac, ip));
+                 CREATE TABLE ip_samples (ip TEXT PRIMARY KEY, mac TEXT, last_bytes INTEGER NOT NULL,
+                    last_packets INTEGER NOT NULL);
+                 CREATE TABLE traffic_daily (mac TEXT NOT NULL, day INTEGER NOT NULL,
+                    bytes INTEGER NOT NULL DEFAULT 0, packets INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (mac, day));
+                 CREATE TABLE traffic_hourly (mac TEXT NOT NULL, hour INTEGER NOT NULL,
+                    bytes INTEGER NOT NULL DEFAULT 0, packets INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (mac, hour));
+                 CREATE TABLE traffic_5min (mac TEXT NOT NULL, ts INTEGER NOT NULL,
+                    bytes INTEGER NOT NULL DEFAULT 0, packets INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (mac, ts));
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value INTEGER);",
+            )
+            .unwrap();
+            // bad row (first > last) and a good row (first < last) — only the bad one heals.
+            conn.execute(
+                "INSERT INTO devices (mac, first_seen, last_seen) VALUES ('aa:bb:cc:dd:ee:01', 500, 247)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO devices (mac, first_seen, last_seen) VALUES ('aa:bb:cc:dd:ee:02', 100, 900)",
+                [],
+            ).unwrap();
+            conn.pragma_update(None, "user_version", 3i64).unwrap();
+        }
+
+        let _s = DeviceMetricsStore::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        let bad: (i64, i64) = conn
+            .query_row(
+                "SELECT first_seen, last_seen FROM devices WHERE mac='aa:bb:cc:dd:ee:01'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(bad, (247, 247), "bad row healed to first_seen = last_seen");
+        let good: (i64, i64) = conn
+            .query_row(
+                "SELECT first_seen, last_seen FROM devices WHERE mac='aa:bb:cc:dd:ee:02'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(good, (100, 900), "good row untouched");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
