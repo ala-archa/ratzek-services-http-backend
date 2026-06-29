@@ -50,6 +50,8 @@ pub struct DeviceMetrics {
     /// Average throughput over the last sampler interval (bytes/sec), or `null`
     /// when the device wasn't active in the latest tick / no interval yet.
     pub rate_bps: Option<i64>,
+    /// Had traffic in the most recent (fresh) sampler interval — see [`is_online`].
+    pub online: bool,
     pub hostname: Option<String>,
     pub vendor: Option<String>,
 }
@@ -70,6 +72,8 @@ pub struct DeviceRow {
     pub bytes_7d: i64,
     pub bytes_30d: i64,
     pub rate_bps: Option<i64>,
+    /// Had traffic in the most recent (fresh) sampler interval — see [`is_online`].
+    pub online: bool,
 }
 
 /// Aggregate dashboard stats for `/admin/status`.
@@ -116,6 +120,10 @@ pub struct LeaseObservation {
     pub ip: String,
     pub hostname: Option<String>,
     pub vendor: Option<String>,
+    /// Lease `cltt` (last client transaction) as unix epoch seconds — the device's
+    /// real "last seen on the network". `None` if the lease has no cltt, in which
+    /// case the sampler falls back to `now` only when first inserting the device.
+    pub last_seen: Option<i64>,
 }
 
 /// One ipset counter reading fed to [`DeviceMetricsStore::sample`].
@@ -282,6 +290,34 @@ fn rate_bps(
     }
 }
 
+/// Slack added to the sampler interval when judging "freshness" for `online`,
+/// to tolerate tick jitter.
+const ONLINE_SLACK_SECS: i64 = 60;
+/// Freshness fallback when no interval has been measured yet (first ticks).
+const ONLINE_FALLBACK_WINDOW_SECS: i64 = 360;
+
+/// Whether a device counts as **online**: it had positive traffic in the most
+/// recent sampler tick, and that tick is still fresh (the sampler isn't stalled).
+/// This is "had traffic in roughly the last sampler interval (~5 min)", not "holds
+/// a DHCP lease" — an idle-but-leased device reads as offline by design.
+fn is_online(
+    last_delta_bytes: i64,
+    last_delta_at: i64,
+    last_sample_at: i64,
+    interval: i64,
+    now: i64,
+) -> bool {
+    let window = if interval > 0 {
+        interval + ONLINE_SLACK_SECS
+    } else {
+        ONLINE_FALLBACK_WINDOW_SECS
+    };
+    last_sample_at != 0
+        && last_delta_at == last_sample_at
+        && last_delta_bytes > 0
+        && now - last_sample_at <= window
+}
+
 impl DeviceMetricsStore {
     /// Open (creating if needed) the metrics DB and ensure the schema exists.
     ///
@@ -350,22 +386,27 @@ impl DeviceMetricsStore {
             .map(|l| (l.ip.as_str(), l.mac.as_str()))
             .collect();
 
-        // 1) Upsert device + IP-history rows from active leases. Reset the
-        //    per-tick rate accumulator (`last_delta_bytes=0`) and stamp
-        //    `last_delta_at=now` for EVERY active device, so a device active but
-        //    idle this tick still reads as "active in the latest tick" (rate 0).
+        // 1) Upsert device + IP-history rows from active leases.
+        //    - `last_seen` tracks the lease `cltt` (real last-seen on the network),
+        //      NOT `now`: an unexpired-but-idle lease (cltt old) must not inflate it.
+        //      `MAX(last_seen, COALESCE(cltt, now))` keeps it monotonic; only a lease
+        //      with NO cltt at all falls back to `now` (we are observing it now).
+        //    - `first_seen` stays `now` (first time WE observed the MAC).
+        //    - Reset the per-tick rate accumulator (`last_delta_bytes=0`) and stamp
+        //      `last_delta_at=now` for EVERY active device, so an active-but-idle
+        //      device reads as "active in the latest tick" (rate 0).
         for l in leases {
             tx.execute(
                 "INSERT INTO devices (mac, first_seen, last_seen, last_ip, last_hostname, last_vendor, last_delta_at, last_delta_bytes)
-                 VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?2, 0)
+                 VALUES (?1, ?2, COALESCE(?6, ?2), ?3, ?4, ?5, ?2, 0)
                  ON CONFLICT(mac) DO UPDATE SET
-                   last_seen = excluded.last_seen,
+                   last_seen = MAX(last_seen, COALESCE(?6, ?2)),
                    last_ip = excluded.last_ip,
                    last_hostname = COALESCE(excluded.last_hostname, last_hostname),
                    last_vendor = COALESCE(excluded.last_vendor, last_vendor),
                    last_delta_at = excluded.last_delta_at,
                    last_delta_bytes = 0",
-                params![l.mac, now, l.ip, l.hostname, l.vendor],
+                params![l.mac, now, l.ip, l.hostname, l.vendor, l.last_seen],
             )?;
             tx.execute(
                 "INSERT INTO device_ips (mac, ip, first_seen, last_seen)
@@ -507,6 +548,13 @@ impl DeviceMetricsStore {
                     bytes_total: r.get(5)?,
                     packets_total: r.get(6)?,
                     rate_bps: rate_bps(last_delta_bytes, last_delta_at, last_sample_at, interval),
+                    online: is_online(
+                        last_delta_bytes,
+                        last_delta_at,
+                        last_sample_at,
+                        interval,
+                        now,
+                    ),
                     bytes_today: Some(0),
                     bytes_7d: Some(0),
                     bytes_30d: Some(0),
@@ -572,6 +620,13 @@ impl DeviceMetricsStore {
                 bytes_total: r.get(6)?,
                 packets_total: r.get(7)?,
                 rate_bps: rate_bps(last_delta_bytes, last_delta_at, last_sample_at, interval),
+                online: is_online(
+                    last_delta_bytes,
+                    last_delta_at,
+                    last_sample_at,
+                    interval,
+                    now,
+                ),
                 bytes_today: 0,
                 bytes_7d: 0,
                 bytes_30d: 0,
@@ -630,10 +685,21 @@ impl DeviceMetricsStore {
         };
 
         let devices_total = scalar("SELECT COUNT(*) FROM devices", &[])?;
-        let devices_online = scalar(
-            "SELECT COUNT(*) FROM devices WHERE last_delta_at = ?1 AND ?1 != 0",
-            &[&last_sample_at],
-        )?;
+        // online = had traffic in the latest tick, and that tick is fresh (mirrors
+        // `is_online`). Freshness is the same for all rows, so gate it once.
+        let window = if interval > 0 {
+            interval + ONLINE_SLACK_SECS
+        } else {
+            ONLINE_FALLBACK_WINDOW_SECS
+        };
+        let devices_online = if last_sample_at != 0 && now - last_sample_at <= window {
+            scalar(
+                "SELECT COUNT(*) FROM devices WHERE last_delta_at = ?1 AND last_delta_bytes > 0",
+                &[&last_sample_at],
+            )?
+        } else {
+            0
+        };
         let new_today = scalar(
             "SELECT COUNT(*) FROM devices WHERE first_seen >= ?1",
             &[&today],
@@ -724,6 +790,13 @@ impl DeviceMetricsStore {
                             last_sample_at,
                             interval,
                         ),
+                        online: is_online(
+                            last_delta_bytes,
+                            last_delta_at,
+                            last_sample_at,
+                            interval,
+                            now,
+                        ),
                         bytes_today: 0,
                         bytes_7d: 0,
                         bytes_30d: 0,
@@ -799,6 +872,7 @@ mod tests {
             ip: ip.into(),
             hostname: Some("host".into()),
             vendor: None,
+            last_seen: None,
         }
     }
     fn ctr(ip: &str, bytes: i64) -> IpsetCounter {
@@ -1080,10 +1154,85 @@ mod tests {
         .unwrap();
         let d = s.dashboard(now + 300, 5).unwrap();
         assert_eq!(d.devices_total, 2);
-        assert_eq!(d.devices_online, 2);
+        // online = had traffic in the latest tick: only `a` (b was flat).
+        assert_eq!(d.devices_online, 1);
         assert_eq!(d.traffic_today_bytes, 4000);
         assert_eq!(d.total_rate_bps, 13); // 4000 / 300
         assert_eq!(d.top_talkers.first().unwrap().mac, a);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn lease_cltt(mac: &str, ip: &str, cltt: i64) -> LeaseObservation {
+        LeaseObservation {
+            mac: mac.into(),
+            ip: ip.into(),
+            hostname: None,
+            vendor: None,
+            last_seen: Some(cltt),
+        }
+    }
+
+    #[test]
+    fn last_seen_tracks_cltt_not_now() {
+        let (s, dir) = store();
+        let now = 1_000_000;
+        let a = "aa:bb:cc:dd:ee:01";
+        let cltt = now - 3600; // device last talked to dhcpd an hour ago
+        s.sample(&[lease_cltt(a, "10.0.0.2", cltt)], &[], now, 730)
+            .unwrap();
+        let m = s.get_many(&[a.into()], now).unwrap();
+        assert_eq!(m[a].last_seen, Some(cltt), "last_seen = cltt, not now");
+        assert_eq!(m[a].first_seen, Some(now), "first_seen = first observation");
+
+        // Newer cltt advances last_seen; older cltt must NOT move it back (monotonic).
+        s.sample(&[lease_cltt(a, "10.0.0.2", now - 60)], &[], now + 300, 730)
+            .unwrap();
+        assert_eq!(
+            s.get_many(&[a.into()], now + 300).unwrap()[a].last_seen,
+            Some(now - 60)
+        );
+        s.sample(
+            &[lease_cltt(a, "10.0.0.2", now - 99_999)],
+            &[],
+            now + 600,
+            730,
+        )
+        .unwrap();
+        assert_eq!(
+            s.get_many(&[a.into()], now + 600).unwrap()[a].last_seen,
+            Some(now - 60),
+            "older cltt must not move last_seen backward"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn online_requires_recent_traffic_and_fresh_sample() {
+        let (s, dir) = store();
+        let now = 1_000_000;
+        let a = "aa:bb:cc:dd:ee:01"; // has traffic in tick 2
+        let b = "aa:bb:cc:dd:ee:02"; // active lease but idle
+        s.sample(
+            &[lease(a, "10.0.0.2"), lease(b, "10.0.0.3")],
+            &[ctr("10.0.0.2", 1000)],
+            now,
+            730,
+        )
+        .unwrap();
+        s.sample(
+            &[lease(a, "10.0.0.2"), lease(b, "10.0.0.3")],
+            &[ctr("10.0.0.2", 5000)],
+            now + 300,
+            730,
+        )
+        .unwrap();
+        let m = s.get_many(&[a.into(), b.into()], now + 300).unwrap();
+        assert!(m[a].online, "traffic in last tick -> online");
+        assert!(!m[b].online, "idle-but-leased -> offline");
+
+        // A stale sample (read far in the future) -> nobody is online.
+        let m = s.get_many(&[a.into()], now + 300 + 100_000).unwrap();
+        assert!(!m[a].online, "stale sample -> offline");
         std::fs::remove_dir_all(&dir).ok();
     }
 

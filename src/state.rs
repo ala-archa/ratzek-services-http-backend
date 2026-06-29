@@ -103,6 +103,8 @@ async fn sample_device_metrics(state: Arc<Mutex<State>>) {
                             ip: l.ip.clone(),
                             hostname: l.hostname.clone(),
                             vendor: l.vendor_class_identifier.clone(),
+                            // cltt = real "last seen on the network" (not sample time).
+                            last_seen: l.dates.cltt.as_ref().and_then(crate::dhcp::date_to_epoch),
                         })
                     })
                     .collect();

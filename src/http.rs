@@ -265,23 +265,6 @@ struct DhcpRecord {
     pub shaper: Option<crate::ipset::Entry>,
 }
 
-/// Convert a dhcpd lease `Date` (UTC, as written in `dhcpd.leases`) to unix epoch
-/// seconds. `None` if the calendar fields don't form a valid UTC instant.
-fn date_to_epoch(d: &dhcpd_parser::common::Date) -> Option<i64> {
-    use chrono::TimeZone;
-    chrono::Utc
-        .with_ymd_and_hms(
-            i32::try_from(d.year).ok()?,
-            u32::try_from(d.month).ok()?,
-            u32::try_from(d.day).ok()?,
-            u32::try_from(d.hour).ok()?,
-            u32::try_from(d.minute).ok()?,
-            u32::try_from(d.second).ok()?,
-        )
-        .single()
-        .map(|dt| dt.timestamp())
-}
-
 #[get("/api/v1/dhcp")]
 async fn dhcp_leases(
     state: Data<Arc<Mutex<State>>>,
@@ -328,8 +311,16 @@ async fn dhcp_leases(
             vendor_class_identifier: lease.vendor_class_identifier,
             starts: lease.dates.starts.map(|v| v.to_string()),
             ends: lease.dates.ends.map(|v| v.to_string()),
-            last_seen: lease.dates.cltt.as_ref().and_then(date_to_epoch),
-            tstp: lease.dates.tstp.as_ref().and_then(date_to_epoch),
+            last_seen: lease
+                .dates
+                .cltt
+                .as_ref()
+                .and_then(crate::dhcp::date_to_epoch),
+            tstp: lease
+                .dates
+                .tstp
+                .as_ref()
+                .and_then(crate::dhcp::date_to_epoch),
             acl: acl_entries.iter().find(|e| e.ip == lease.ip).cloned(),
             shaper: shaper_entries.iter().find(|e| e.ip == lease.ip).cloned(),
             ip: lease.ip,
@@ -910,16 +901,14 @@ fn build_unlimited_view(
     metrics: &HashMap<String, crate::device_metrics::DeviceMetrics>,
 ) -> UnlimitedClientView {
     let lease = leases.get(&c.ip);
-    // online = the reserved IP has an active lease held by THIS client's MAC.
-    let online = lease
-        .map(|l| l.active && l.mac.as_deref() == Some(c.mac.as_str()))
-        .unwrap_or(false);
-    // stale = the reserved IP is actively leased to a DIFFERENT MAC (online and
-    // stale are therefore mutually exclusive).
+    let m = metrics.get(&c.mac).cloned().unwrap_or_default();
+    // online = had traffic in the last sampler interval (from metrics), NOT "holds
+    // a lease". stale = the reserved IP is actively leased to a DIFFERENT MAC (a
+    // separate, lease-derived concern).
+    let online = m.online;
     let stale_reservation = lease
         .map(|l| l.active && l.mac.as_deref() != Some(c.mac.as_str()))
         .unwrap_or(false);
-    let m = metrics.get(&c.mac).cloned().unwrap_or_default();
     let hostname = lease.and_then(|l| l.hostname.clone()).or(m.hostname);
     let vendor = lease.and_then(|l| l.vendor.clone()).or(m.vendor);
     UnlimitedClientView {
@@ -975,9 +964,9 @@ async fn enrich_unlimited(
 /// A device-inventory row plus live flags.
 #[derive(Serialize)]
 struct DeviceView {
+    // `device` carries `online` (traffic-derived) which flattens to the top level.
     #[serde(flatten)]
     device: crate::device_metrics::DeviceRow,
-    online: bool,
     is_unlimited: bool,
 }
 
@@ -993,13 +982,9 @@ async fn admin_devices(
         "last_seen",
     )?;
 
-    let (metrics, leases_path, store) = {
+    let (metrics, store) = {
         let s = state.lock().await;
-        (
-            s.device_metrics().cloned(),
-            s.config().dhcpd_leases.clone(),
-            s.unlimited_clients().clone(),
-        )
+        (s.device_metrics().cloned(), s.unlimited_clients().clone())
     };
     // Metrics disabled -> empty inventory (not an error).
     let metrics = match metrics {
@@ -1010,13 +995,11 @@ async fn admin_devices(
         store.list().await.into_iter().map(|c| c.mac).collect();
 
     let now = chrono::Utc::now().timestamp();
-    let (rows, leases_map) = tokio::task::spawn_blocking(move || {
-        let rows = metrics.all_devices(now).unwrap_or_else(|e| {
+    let rows = tokio::task::spawn_blocking(move || {
+        metrics.all_devices(now).unwrap_or_else(|e| {
             error!("device-metrics all_devices failed: {e:#}");
             Vec::new()
-        });
-        let leases = read_leases_map(&leases_path);
-        (rows, leases)
+        })
     })
     .await
     .unwrap_or_default();
@@ -1024,18 +1007,9 @@ async fn admin_devices(
     let mut views: Vec<DeviceView> = rows
         .into_iter()
         .map(|d| {
-            // online = the device's last IP currently has an active lease held by
-            // this device's own MAC (not just any device on that IP).
-            let online = d
-                .last_ip
-                .as_ref()
-                .and_then(|ip| leases_map.get(ip))
-                .map(|l| l.active && l.mac.as_deref() == Some(d.mac.as_str()))
-                .unwrap_or(false);
             let is_unlimited = unlimited_macs.contains(&d.mac);
             DeviceView {
                 device: d,
-                online,
                 is_unlimited,
             }
         })
@@ -1077,9 +1051,9 @@ async fn admin_devices(
 /// A device row + daily traffic series + live flags (for `/devices/{mac}`).
 #[derive(Serialize)]
 struct DeviceDetailView {
+    // `device` carries `online` (traffic-derived) which flattens to the top level.
     #[serde(flatten)]
     device: crate::device_metrics::DeviceRow,
-    online: bool,
     is_unlimited: bool,
     daily: Vec<crate::device_metrics::DailyPoint>,
 }
@@ -1104,13 +1078,9 @@ async fn admin_device_detail(
         .transpose()?
         .unwrap_or(DEVICE_DETAIL_DEFAULT_DAYS)
         .clamp(1, DEVICE_DETAIL_MAX_DAYS);
-    let (metrics, leases_path, store) = {
+    let (metrics, store) = {
         let s = state.lock().await;
-        (
-            s.device_metrics().cloned(),
-            s.config().dhcpd_leases.clone(),
-            s.unlimited_clients().clone(),
-        )
+        (s.device_metrics().cloned(), s.unlimited_clients().clone())
     };
     let metrics = match metrics {
         Some(m) => m,
@@ -1120,17 +1090,12 @@ async fn admin_device_detail(
 
     let now = chrono::Utc::now().timestamp();
     let mac_q = mac.clone();
-    let (detail_res, leases_map) = tokio::task::spawn_blocking(move || {
-        (
-            metrics.device_detail(&mac_q, now, days),
-            read_leases_map(&leases_path),
-        )
-    })
-    .await
-    .map_err(|err| {
-        error!("device_detail task panicked: {err}");
-        APIError::InternalError
-    })?;
+    let detail_res = tokio::task::spawn_blocking(move || metrics.device_detail(&mac_q, now, days))
+        .await
+        .map_err(|err| {
+            error!("device_detail task panicked: {err}");
+            APIError::InternalError
+        })?;
 
     let detail = match detail_res {
         Ok(Some(d)) => d,
@@ -1140,16 +1105,9 @@ async fn admin_device_detail(
             return Err(APIError::InternalError);
         }
     };
-    let online = detail
-        .device
-        .last_ip
-        .as_ref()
-        .and_then(|ip| leases_map.get(ip))
-        .map(|l| l.active && l.mac.as_deref() == Some(mac.as_str()))
-        .unwrap_or(false);
+    // `online` (traffic-derived) is carried by `detail.device` and flattens out.
     Ok(HttpResponse::Ok().json(DeviceDetailView {
         device: detail.device,
-        online,
         is_unlimited,
         daily: detail.daily,
     }))
@@ -1605,26 +1563,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn date_to_epoch_converts_utc() {
-        use dhcpd_parser::common::Date;
-        let at = |year, month, day, hour, minute, second| {
-            date_to_epoch(&Date {
-                weekday: 0,
-                year,
-                month,
-                day,
-                hour,
-                minute,
-                second,
-            })
-        };
-        assert_eq!(at(1970, 1, 1, 0, 0, 0), Some(0));
-        assert_eq!(at(2000, 1, 1, 0, 0, 0), Some(946_684_800));
-        // Out-of-range calendar fields don't form a valid instant -> None.
-        assert_eq!(at(2020, 13, 1, 0, 0, 0), None);
-    }
-
-    #[test]
     fn admin_status_serializes_to_documented_shape() {
         let full = AdminStatus {
             internet_available: true,
@@ -1777,11 +1715,26 @@ mod tests {
     }
 
     #[test]
-    fn build_unlimited_view_active_lease_same_mac_is_online_not_stale() {
+    fn build_unlimited_view_online_comes_from_metrics_not_lease() {
         let mac = "aa:bb:cc:dd:ee:ff";
+        // Active lease for the same MAC, but no recent traffic in metrics -> offline:
+        // holding a lease must NOT imply online.
         let mut leases = HashMap::new();
         leases.insert("10.0.0.1".to_string(), lease(Some(mac), true, None));
-        let metrics = HashMap::new();
+        let empty = HashMap::new();
+        let view = build_unlimited_view(client(mac, "10.0.0.1"), &leases, &empty);
+        assert!(!view.online, "lease alone must not imply online");
+        assert!(!view.stale_reservation);
+
+        // Recent traffic in metrics -> online (lease same MAC -> not stale).
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            mac.to_string(),
+            crate::device_metrics::DeviceMetrics {
+                online: true,
+                ..Default::default()
+            },
+        );
         let view = build_unlimited_view(client(mac, "10.0.0.1"), &leases, &metrics);
         assert!(view.online);
         assert!(!view.stale_reservation);
@@ -1842,8 +1795,8 @@ mod tests {
                 bytes_7d: 7,
                 bytes_30d: 9,
                 rate_bps: Some(11),
+                online: true,
             },
-            online: true,
             is_unlimited: false,
         };
         let v = serde_json::to_value(&view).unwrap();
