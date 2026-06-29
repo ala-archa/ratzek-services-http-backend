@@ -26,12 +26,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SECONDS_PER_DAY: i64 = 86_400;
 /// SQLite `busy_timeout` for both the writer and short-lived readers.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Rolling window (in days) for the `bytes_7d` aggregate, inclusive of today.
 const TRAFFIC_WINDOW_DAYS: i64 = 7;
+/// Rolling window (in days) for the `bytes_30d` aggregate, inclusive of today.
+/// Also the widest window queried, so `traffic_daily` is read once per call.
+const MONTH_WINDOW_DAYS: i64 = 30;
 
 /// Per-device metrics joined into API listings. All optional so a device with no
 /// row (or a transient DB error) serializes as `null`s without breaking the response.
@@ -40,8 +43,13 @@ pub struct DeviceMetrics {
     pub first_seen: Option<i64>,
     pub last_seen: Option<i64>,
     pub bytes_total: Option<i64>,
+    pub packets_total: Option<i64>,
     pub bytes_today: Option<i64>,
     pub bytes_7d: Option<i64>,
+    pub bytes_30d: Option<i64>,
+    /// Average throughput over the last sampler interval (bytes/sec), or `null`
+    /// when the device wasn't active in the latest tick / no interval yet.
+    pub rate_bps: Option<i64>,
     pub hostname: Option<String>,
     pub vendor: Option<String>,
 }
@@ -57,8 +65,47 @@ pub struct DeviceRow {
     pub first_seen: Option<i64>,
     pub last_seen: Option<i64>,
     pub bytes_total: i64,
+    pub packets_total: i64,
     pub bytes_today: i64,
     pub bytes_7d: i64,
+    pub bytes_30d: i64,
+    pub rate_bps: Option<i64>,
+}
+
+/// Aggregate dashboard stats for `/admin/status`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DashboardStats {
+    pub devices_total: i64,
+    pub devices_online: i64,
+    pub new_today: i64,
+    pub traffic_today_bytes: i64,
+    pub traffic_7d_bytes: i64,
+    pub total_rate_bps: i64,
+    pub top_talkers: Vec<TopTalker>,
+}
+
+/// One entry of the dashboard "top talkers by today's traffic" list.
+#[derive(Debug, Clone, Serialize)]
+pub struct TopTalker {
+    pub mac: String,
+    pub last_ip: Option<String>,
+    pub hostname: Option<String>,
+    pub bytes_today: i64,
+}
+
+/// One day of traffic for a device, for the per-device history endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct DailyPoint {
+    pub day: i64,
+    pub bytes: i64,
+    pub packets: i64,
+}
+
+/// A device row plus its daily traffic series (for `/admin/devices/{mac}`).
+/// `online`/`is_unlimited` are filled by the HTTP layer (need leases / store).
+pub struct DeviceDetailData {
+    pub device: DeviceRow,
+    pub daily: Vec<DailyPoint>,
 }
 
 /// One active-lease observation fed to [`DeviceMetricsStore::sample`]. Decoupled
@@ -102,6 +149,7 @@ fn configure(conn: &Connection) -> Result<()> {
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
+    // Fresh DBs get the full v2 schema here (incl. the rate columns + `meta`).
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS devices (
             mac TEXT PRIMARY KEY,
@@ -111,7 +159,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
             last_hostname TEXT,
             last_vendor TEXT,
             bytes_total INTEGER NOT NULL DEFAULT 0,
-            packets_total INTEGER NOT NULL DEFAULT 0
+            packets_total INTEGER NOT NULL DEFAULT 0,
+            last_delta_bytes INTEGER NOT NULL DEFAULT 0,
+            last_delta_at INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE IF NOT EXISTS device_ips (
             mac TEXT NOT NULL,
@@ -133,9 +183,28 @@ fn init_schema(conn: &Connection) -> Result<()> {
             packets INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (mac, day)
          );
+         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER);
          CREATE INDEX IF NOT EXISTS idx_traffic_daily_day ON traffic_daily(day);",
     )?;
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    migrate(conn)?;
+    Ok(())
+}
+
+/// Idempotent schema migration. A fresh DB already has the v2 columns from the
+/// CREATE above (`user_version == 0`), so only the version bump runs. An existing
+/// v1 DB (`user_version == 1`) additionally gains the rate columns via ALTER.
+/// Gated strictly on `== 1` so it can never run twice.
+fn migrate(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version == 1 {
+        conn.execute_batch(
+            "ALTER TABLE devices ADD COLUMN last_delta_bytes INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE devices ADD COLUMN last_delta_at INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if version < SCHEMA_VERSION {
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
     Ok(())
 }
 
@@ -144,27 +213,73 @@ fn day_start(now: i64) -> i64 {
 }
 
 /// Start of the rolling `bytes_7d` window (inclusive of `today`).
-fn window_start(today: i64) -> i64 {
+fn week_start(today: i64) -> i64 {
     today - (TRAFFIC_WINDOW_DAYS - 1) * SECONDS_PER_DAY
 }
 
-/// Fold `(mac, day, bytes)` rows from `traffic_daily` into per-MAC
-/// `(bytes_today, bytes_7d)` totals. Callers pre-filter rows to the 7-day
-/// window via SQL, so every row contributes to `bytes_7d`; rows for `today`
-/// additionally contribute to `bytes_today`.
+/// Start of the rolling `bytes_30d` window (inclusive of `today`). This is the
+/// widest window read, so callers query `traffic_daily WHERE day >= month_start`.
+fn month_start(today: i64) -> i64 {
+    today - (MONTH_WINDOW_DAYS - 1) * SECONDS_PER_DAY
+}
+
+/// Fold `(mac, day, bytes)` rows (pre-filtered to the 30-day window) into per-MAC
+/// `(bytes_today, bytes_7d, bytes_30d)` totals.
 fn fold_daily(
     rows: impl IntoIterator<Item = (String, i64, i64)>,
     today: i64,
-) -> HashMap<String, (i64, i64)> {
-    let mut acc: HashMap<String, (i64, i64)> = HashMap::new();
+    week_ago: i64,
+) -> HashMap<String, (i64, i64, i64)> {
+    let mut acc: HashMap<String, (i64, i64, i64)> = HashMap::new();
     for (mac, day, bytes) in rows {
-        let entry = acc.entry(mac).or_insert((0, 0));
-        entry.1 += bytes; // bytes_7d
+        let entry = acc.entry(mac).or_insert((0, 0, 0));
+        entry.2 += bytes; // bytes_30d (whole window)
+        if day >= week_ago {
+            entry.1 += bytes; // bytes_7d
+        }
         if day == today {
             entry.0 += bytes; // bytes_today
         }
     }
     acc
+}
+
+/// Read `(last_sample_at, sample_interval)` from `meta` (0/0 if absent). Used to
+/// derive `rate_bps`: a device's rate is valid only when it was active in the
+/// latest tick (`last_delta_at == last_sample_at`) and the interval is positive.
+fn read_sample_meta(conn: &Connection) -> Result<(i64, i64)> {
+    let last_sample_at = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'last_sample_at'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let interval = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'sample_interval'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    Ok((last_sample_at, interval))
+}
+
+/// Compute `rate_bps` from a device's last-tick delta. `None` unless the device
+/// was active in the latest tick and the interval is positive (no division by 0).
+fn rate_bps(
+    last_delta_bytes: i64,
+    last_delta_at: i64,
+    last_sample_at: i64,
+    interval: i64,
+) -> Option<i64> {
+    if interval > 0 && last_delta_at == last_sample_at && last_sample_at != 0 {
+        Some(last_delta_bytes / interval)
+    } else {
+        None
+    }
 }
 
 impl DeviceMetricsStore {
@@ -220,21 +335,36 @@ impl DeviceMetricsStore {
         let mut stats = SampleStats::default();
         let day = day_start(now);
 
+        // Previous tick time, to compute the rate interval at the end.
+        let prev_sample_at: i64 = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'last_sample_at'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+
         let ip_to_mac: HashMap<&str, &str> = leases
             .iter()
             .map(|l| (l.ip.as_str(), l.mac.as_str()))
             .collect();
 
-        // 1) Upsert device + IP-history rows from active leases.
+        // 1) Upsert device + IP-history rows from active leases. Reset the
+        //    per-tick rate accumulator (`last_delta_bytes=0`) and stamp
+        //    `last_delta_at=now` for EVERY active device, so a device active but
+        //    idle this tick still reads as "active in the latest tick" (rate 0).
         for l in leases {
             tx.execute(
-                "INSERT INTO devices (mac, first_seen, last_seen, last_ip, last_hostname, last_vendor)
-                 VALUES (?1, ?2, ?2, ?3, ?4, ?5)
+                "INSERT INTO devices (mac, first_seen, last_seen, last_ip, last_hostname, last_vendor, last_delta_at, last_delta_bytes)
+                 VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?2, 0)
                  ON CONFLICT(mac) DO UPDATE SET
                    last_seen = excluded.last_seen,
                    last_ip = excluded.last_ip,
                    last_hostname = COALESCE(excluded.last_hostname, last_hostname),
-                   last_vendor = COALESCE(excluded.last_vendor, last_vendor)",
+                   last_vendor = COALESCE(excluded.last_vendor, last_vendor),
+                   last_delta_at = excluded.last_delta_at,
+                   last_delta_bytes = 0",
                 params![l.mac, now, l.ip, l.hostname, l.vendor],
             )?;
             tx.execute(
@@ -289,7 +419,8 @@ impl DeviceMetricsStore {
             if dbytes > 0 || dpackets > 0 {
                 tx.execute(
                     "UPDATE devices SET bytes_total = bytes_total + ?2,
-                       packets_total = packets_total + ?3 WHERE mac = ?1",
+                       packets_total = packets_total + ?3,
+                       last_delta_bytes = last_delta_bytes + ?2 WHERE mac = ?1",
                     params![mac, dbytes, dpackets],
                 )?;
                 tx.execute(
@@ -320,6 +451,20 @@ impl DeviceMetricsStore {
             )?;
         }
 
+        // Record this tick + the interval since the previous, for rate reads.
+        let interval = if prev_sample_at > 0 && now > prev_sample_at {
+            now - prev_sample_at
+        } else {
+            0
+        };
+        for (key, value) in [("last_sample_at", now), ("sample_interval", interval)] {
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+        }
+
         tx.commit()?;
         Ok(stats)
     }
@@ -338,15 +483,20 @@ impl DeviceMetricsStore {
         }
         let conn = self.read_conn()?;
         let today = day_start(now);
-        let week_ago = window_start(today);
+        let week_ago = week_start(today);
+        let month_ago = month_start(today);
+        let (last_sample_at, interval) = read_sample_meta(&conn)?;
         let placeholders = vec!["?"; macs.len()].join(",");
 
         let sql = format!(
-            "SELECT mac, first_seen, last_seen, last_hostname, last_vendor, bytes_total
+            "SELECT mac, first_seen, last_seen, last_hostname, last_vendor, bytes_total,
+                    packets_total, last_delta_bytes, last_delta_at
              FROM devices WHERE mac IN ({placeholders})"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(macs.iter()), |r| {
+            let last_delta_bytes: i64 = r.get(7)?;
+            let last_delta_at: i64 = r.get(8)?;
             Ok((
                 r.get::<_, String>(0)?,
                 DeviceMetrics {
@@ -355,8 +505,11 @@ impl DeviceMetricsStore {
                     hostname: r.get(3)?,
                     vendor: r.get(4)?,
                     bytes_total: r.get(5)?,
+                    packets_total: r.get(6)?,
+                    rate_bps: rate_bps(last_delta_bytes, last_delta_at, last_sample_at, interval),
                     bytes_today: Some(0),
                     bytes_7d: Some(0),
+                    bytes_30d: Some(0),
                 },
             ))
         })?;
@@ -365,10 +518,10 @@ impl DeviceMetricsStore {
             out.insert(mac, m);
         }
 
-        // Recent daily traffic (small: macs x <=7 days), aggregated in Rust.
+        // Daily traffic over the 30-day window (small), aggregated in Rust.
         let mut stmt = conn.prepare("SELECT mac, day, bytes FROM traffic_daily WHERE day >= ?1")?;
         let rows = stmt
-            .query_map(params![week_ago], |r| {
+            .query_map(params![month_ago], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
@@ -376,10 +529,11 @@ impl DeviceMetricsStore {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (mac, (today_bytes, week_bytes)) in fold_daily(rows, today) {
+        for (mac, (today_bytes, week_bytes, month_bytes)) in fold_daily(rows, today, week_ago) {
             if let Some(m) = out.get_mut(&mac) {
                 m.bytes_today = Some(today_bytes);
                 m.bytes_7d = Some(week_bytes);
+                m.bytes_30d = Some(month_bytes);
             }
         }
         Ok(out)
@@ -395,14 +549,19 @@ impl DeviceMetricsStore {
     pub fn all_devices(&self, now: i64) -> Result<Vec<DeviceRow>> {
         let conn = self.read_conn()?;
         let today = day_start(now);
-        let week_ago = window_start(today);
+        let week_ago = week_start(today);
+        let month_ago = month_start(today);
+        let (last_sample_at, interval) = read_sample_meta(&conn)?;
 
         let mut by_mac: HashMap<String, DeviceRow> = HashMap::new();
         let mut stmt = conn.prepare(
-            "SELECT mac, last_ip, last_hostname, last_vendor, first_seen, last_seen, bytes_total
+            "SELECT mac, last_ip, last_hostname, last_vendor, first_seen, last_seen,
+                    bytes_total, packets_total, last_delta_bytes, last_delta_at
              FROM devices",
         )?;
         let rows = stmt.query_map([], |r| {
+            let last_delta_bytes: i64 = r.get(8)?;
+            let last_delta_at: i64 = r.get(9)?;
             Ok(DeviceRow {
                 mac: r.get(0)?,
                 last_ip: r.get(1)?,
@@ -411,8 +570,11 @@ impl DeviceMetricsStore {
                 first_seen: r.get(4)?,
                 last_seen: r.get(5)?,
                 bytes_total: r.get(6)?,
+                packets_total: r.get(7)?,
+                rate_bps: rate_bps(last_delta_bytes, last_delta_at, last_sample_at, interval),
                 bytes_today: 0,
                 bytes_7d: 0,
+                bytes_30d: 0,
                 ips: Vec::new(),
             })
         })?;
@@ -432,7 +594,7 @@ impl DeviceMetricsStore {
 
         let mut stmt = conn.prepare("SELECT mac, day, bytes FROM traffic_daily WHERE day >= ?1")?;
         let rows = stmt
-            .query_map(params![week_ago], |r| {
+            .query_map(params![month_ago], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
@@ -440,14 +602,179 @@ impl DeviceMetricsStore {
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (mac, (today_bytes, week_bytes)) in fold_daily(rows, today) {
+        for (mac, (today_bytes, week_bytes, month_bytes)) in fold_daily(rows, today, week_ago) {
             if let Some(dev) = by_mac.get_mut(&mac) {
                 dev.bytes_today = today_bytes;
                 dev.bytes_7d = week_bytes;
+                dev.bytes_30d = month_bytes;
             }
         }
 
         Ok(by_mac.into_values().collect())
+    }
+
+    /// Aggregate dashboard stats. Best-effort (caller logs/degrades on error).
+    ///
+    /// # Errors
+    /// Returns an error if a read connection or any aggregate query fails.
+    pub fn dashboard(&self, now: i64, top_n: usize) -> Result<DashboardStats> {
+        let conn = self.read_conn()?;
+        let today = day_start(now);
+        let week_ago = week_start(today);
+        let (last_sample_at, interval) = read_sample_meta(&conn)?;
+
+        let scalar = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<i64> {
+            Ok(conn
+                .query_row(sql, p, |r| r.get::<_, Option<i64>>(0))?
+                .unwrap_or(0))
+        };
+
+        let devices_total = scalar("SELECT COUNT(*) FROM devices", &[])?;
+        let devices_online = scalar(
+            "SELECT COUNT(*) FROM devices WHERE last_delta_at = ?1 AND ?1 != 0",
+            &[&last_sample_at],
+        )?;
+        let new_today = scalar(
+            "SELECT COUNT(*) FROM devices WHERE first_seen >= ?1",
+            &[&today],
+        )?;
+        let traffic_today_bytes = scalar(
+            "SELECT SUM(bytes) FROM traffic_daily WHERE day = ?1",
+            &[&today],
+        )?;
+        let traffic_7d_bytes = scalar(
+            "SELECT SUM(bytes) FROM traffic_daily WHERE day >= ?1",
+            &[&week_ago],
+        )?;
+        let total_rate_bps = if interval > 0 && last_sample_at != 0 {
+            scalar(
+                "SELECT SUM(last_delta_bytes) FROM devices WHERE last_delta_at = ?1",
+                &[&last_sample_at],
+            )? / interval
+        } else {
+            0
+        };
+
+        let mut stmt = conn.prepare(
+            "SELECT t.mac, d.last_ip, d.last_hostname, SUM(t.bytes) AS b
+             FROM traffic_daily t LEFT JOIN devices d ON d.mac = t.mac
+             WHERE t.day = ?1 GROUP BY t.mac ORDER BY b DESC LIMIT ?2",
+        )?;
+        let top_talkers = stmt
+            .query_map(params![today, top_n as i64], |r| {
+                Ok(TopTalker {
+                    mac: r.get(0)?,
+                    last_ip: r.get(1)?,
+                    hostname: r.get(2)?,
+                    bytes_today: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(DashboardStats {
+            devices_total,
+            devices_online,
+            new_today,
+            traffic_today_bytes,
+            traffic_7d_bytes,
+            total_rate_bps,
+            top_talkers,
+        })
+    }
+
+    /// Per-device detail + daily traffic series over the last `days`. `None` if the
+    /// MAC is unknown. `online`/`is_unlimited` are filled by the caller.
+    ///
+    /// # Errors
+    /// Returns an error if a read connection or any query fails.
+    pub fn device_detail(
+        &self,
+        mac: &str,
+        now: i64,
+        days: i64,
+    ) -> Result<Option<DeviceDetailData>> {
+        let conn = self.read_conn()?;
+        let today = day_start(now);
+        let week_ago = week_start(today);
+        let month_ago = month_start(today);
+        let series_start = today - (days.max(1) - 1) * SECONDS_PER_DAY;
+        let (last_sample_at, interval) = read_sample_meta(&conn)?;
+
+        let device: Option<DeviceRow> = conn
+            .query_row(
+                "SELECT mac, last_ip, last_hostname, last_vendor, first_seen, last_seen,
+                        bytes_total, packets_total, last_delta_bytes, last_delta_at
+                 FROM devices WHERE mac = ?1",
+                params![mac],
+                |r| {
+                    let last_delta_bytes: i64 = r.get(8)?;
+                    let last_delta_at: i64 = r.get(9)?;
+                    Ok(DeviceRow {
+                        mac: r.get(0)?,
+                        last_ip: r.get(1)?,
+                        hostname: r.get(2)?,
+                        vendor: r.get(3)?,
+                        first_seen: r.get(4)?,
+                        last_seen: r.get(5)?,
+                        bytes_total: r.get(6)?,
+                        packets_total: r.get(7)?,
+                        rate_bps: rate_bps(
+                            last_delta_bytes,
+                            last_delta_at,
+                            last_sample_at,
+                            interval,
+                        ),
+                        bytes_today: 0,
+                        bytes_7d: 0,
+                        bytes_30d: 0,
+                        ips: Vec::new(),
+                    })
+                },
+            )
+            .optional()?;
+        let mut device = match device {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let mut stmt = conn.prepare("SELECT ip FROM device_ips WHERE mac = ?1 ORDER BY ip")?;
+        device.ips = stmt
+            .query_map(params![mac], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // bytes_today/7d/30d from the 30-day window.
+        let mut stmt =
+            conn.prepare("SELECT mac, day, bytes FROM traffic_daily WHERE mac = ?1 AND day >= ?2")?;
+        let agg = stmt
+            .query_map(params![mac, month_ago], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if let Some((t, w, m)) = fold_daily(agg, today, week_ago).remove(mac) {
+            device.bytes_today = t;
+            device.bytes_7d = w;
+            device.bytes_30d = m;
+        }
+
+        // The daily series (most-recent-first) over `days`.
+        let mut stmt = conn.prepare(
+            "SELECT day, bytes, packets FROM traffic_daily WHERE mac = ?1 AND day >= ?2 ORDER BY day DESC",
+        )?;
+        let daily = stmt
+            .query_map(params![mac, series_start], |r| {
+                Ok(DailyPoint {
+                    day: r.get(0)?,
+                    bytes: r.get(1)?,
+                    packets: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(Some(DeviceDetailData { device, daily }))
     }
 }
 
@@ -681,6 +1008,161 @@ mod tests {
         // Its IP baseline must be cleaned up too (no orphan in ip_samples).
         let m = s.get_many(&[stale.into()], 1000 * day).unwrap();
         assert!(!m.contains_key(stale));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rate_bps_from_last_interval() {
+        let (s, dir) = store();
+        let a = "aa:bb:cc:dd:ee:01"; // active with traffic in tick 2
+        let b = "aa:bb:cc:dd:ee:02"; // active but idle in tick 2
+        s.sample(
+            &[lease(a, "10.0.0.2"), lease(b, "10.0.0.3")],
+            &[ctr("10.0.0.2", 5000)],
+            1000,
+            730,
+        )
+        .unwrap();
+        // +3000 bytes on `a` over a 300s interval -> 10 bytes/sec.
+        s.sample(
+            &[lease(a, "10.0.0.2"), lease(b, "10.0.0.3")],
+            &[ctr("10.0.0.2", 8000)],
+            1300,
+            730,
+        )
+        .unwrap();
+        let m = s.get_many(&[a.into(), b.into()], 1300).unwrap();
+        assert_eq!(m[a].rate_bps, Some(10));
+        assert_eq!(m[b].rate_bps, Some(0), "active but idle -> 0, not null");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rate_bps_none_when_inactive_in_latest_tick() {
+        let (s, dir) = store();
+        let a = "aa:bb:cc:dd:ee:01";
+        let b = "aa:bb:cc:dd:ee:02";
+        s.sample(
+            &[lease(a, "10.0.0.2"), lease(b, "10.0.0.3")],
+            &[],
+            1000,
+            730,
+        )
+        .unwrap();
+        // Only `a` ticks now; `b` wasn't observed in the latest tick.
+        s.sample(&[lease(a, "10.0.0.2")], &[], 1300, 730).unwrap();
+        let m = s.get_many(&[a.into(), b.into()], 1300).unwrap();
+        assert_eq!(m[a].rate_bps, Some(0));
+        assert_eq!(m[b].rate_bps, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dashboard_aggregates() {
+        let (s, dir) = store();
+        let now = 1_000_000;
+        let a = "aa:bb:cc:dd:ee:01";
+        let b = "aa:bb:cc:dd:ee:02";
+        s.sample(
+            &[lease(a, "10.0.0.2"), lease(b, "10.0.0.3")],
+            &[ctr("10.0.0.2", 1000), ctr("10.0.0.3", 2000)],
+            now,
+            730,
+        )
+        .unwrap();
+        // `a` gains +4000 over 300s; `b` is flat.
+        s.sample(
+            &[lease(a, "10.0.0.2"), lease(b, "10.0.0.3")],
+            &[ctr("10.0.0.2", 5000), ctr("10.0.0.3", 2000)],
+            now + 300,
+            730,
+        )
+        .unwrap();
+        let d = s.dashboard(now + 300, 5).unwrap();
+        assert_eq!(d.devices_total, 2);
+        assert_eq!(d.devices_online, 2);
+        assert_eq!(d.traffic_today_bytes, 4000);
+        assert_eq!(d.total_rate_bps, 13); // 4000 / 300
+        assert_eq!(d.top_talkers.first().unwrap().mac, a);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn device_detail_returns_series_and_none_for_unknown() {
+        let (s, dir) = store();
+        let now = 1_000_000;
+        let a = "aa:bb:cc:dd:ee:01";
+        s.sample(&[lease(a, "10.0.0.2")], &[ctr("10.0.0.2", 1000)], now, 730)
+            .unwrap();
+        s.sample(
+            &[lease(a, "10.0.0.2")],
+            &[ctr("10.0.0.2", 4000)],
+            now + 300,
+            730,
+        )
+        .unwrap();
+        let detail = s.device_detail(a, now + 300, 30).unwrap().unwrap();
+        assert_eq!(detail.device.mac, a);
+        assert_eq!(detail.device.bytes_today, 3000);
+        assert_eq!(detail.daily.len(), 1);
+        assert_eq!(detail.daily[0].bytes, 3000);
+        assert!(s
+            .device_detail("ff:ff:ff:ff:ff:ff", now + 300, 30)
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_v1_to_v2_preserves_data() {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("dm-mig-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v1.sqlite");
+        let _ = std::fs::remove_file(&path);
+
+        // Hand-build a v1 DB (old schema, no rate columns / meta, user_version=1).
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE devices (
+                    mac TEXT PRIMARY KEY, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
+                    last_ip TEXT, last_hostname TEXT, last_vendor TEXT,
+                    bytes_total INTEGER NOT NULL DEFAULT 0, packets_total INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE device_ips (mac TEXT NOT NULL, ip TEXT NOT NULL, first_seen INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL, PRIMARY KEY (mac, ip));
+                 CREATE TABLE ip_samples (ip TEXT PRIMARY KEY, mac TEXT, last_bytes INTEGER NOT NULL,
+                    last_packets INTEGER NOT NULL);
+                 CREATE TABLE traffic_daily (mac TEXT NOT NULL, day INTEGER NOT NULL,
+                    bytes INTEGER NOT NULL DEFAULT 0, packets INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (mac, day));",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO devices (mac, first_seen, last_seen, last_ip, bytes_total, packets_total)
+                 VALUES ('aa:bb:cc:dd:ee:01', 100, 200, '10.0.0.2', 4242, 7)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1i64).unwrap();
+        }
+
+        // Opening migrates to v2 (adds rate columns + meta), preserving rows.
+        let s = DeviceMetricsStore::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+
+        let m = s
+            .get_many(&["aa:bb:cc:dd:ee:01".into()], 1_000_000)
+            .unwrap();
+        assert_eq!(m["aa:bb:cc:dd:ee:01"].bytes_total, Some(4242));
+        assert_eq!(m["aa:bb:cc:dd:ee:01"].packets_total, Some(7));
+        assert_eq!(m["aa:bb:cc:dd:ee:01"].rate_bps, None);
+
+        // Re-opening is a no-op (idempotent; ALTER must not run twice).
+        assert!(DeviceMetricsStore::open(&path).is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

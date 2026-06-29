@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use slog::{o, Drain};
 use slog_scope::error;
 
+mod blacklist;
 mod config;
 mod device_metrics;
 mod dhcp;
@@ -135,6 +136,11 @@ impl Application {
                         .service(http::unlimited_delete)
                         .service(http::unlimited_patch)
                         .service(http::admin_devices)
+                        .service(http::admin_device_detail)
+                        .service(http::blacklist_list)
+                        .service(http::blacklist_get)
+                        .service(http::blacklist_create)
+                        .service(http::blacklist_delete)
                 })
                 .bind(&http_listen)?
                 .run()

@@ -35,6 +35,10 @@ persistent_state_path: /var/tmp/ala-archa-http-backend.state
 unlimited_clients_path: /var/lib/ala-archa-http-backend/unlimited-clients.yaml
 # CIDR an admin may pick unlimited-client IPs from (must have an active lease).
 unlimited_subnet: "10.11.5.0/24"
+# MAC blacklist (admin CRUD via /api/v1/admin/blacklist). The backend owns and
+# rewrites this file; entries are checked in UNION with the static
+# `blacklisted_macs` below. Optional (defaults to this path).
+blacklist_path: /var/lib/ala-archa-http-backend/blacklist.yaml
 # dhcp_reservations: how the backend manages dhcpd `host` reservations for
 # unlimited clients. It owns the include file below (reference it from dhcpd.conf
 # with `include "/etc/dhcp/unlimited-hosts.conf";`), regenerates it from the store

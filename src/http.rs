@@ -136,13 +136,7 @@ async fn client_get(state: Data<Arc<Mutex<State>>>, req: HttpRequest) -> Result<
             };
 
             if let Client::Mac(client_mac) = client {
-                if state
-                    .config()
-                    .blacklisted_macs
-                    .iter()
-                    .map(|v| v.to_lowercase())
-                    .any(|v| v == client_mac)
-                {
+                if state.is_blacklisted(&client_mac).await {
                     let resp = ServiceInfo {
                         internet_clients_connected: shaper_entries.len(),
                         internet_connection_status: InternetConnectionStatus::ClientBlacklisted,
@@ -225,13 +219,7 @@ async fn client_register(
                     )
                 }
                 Client::Mac(mac) => {
-                    if state
-                        .config()
-                        .blacklisted_macs
-                        .iter()
-                        .map(|v| v.to_lowercase())
-                        .any(|v| v == mac)
-                    {
+                    if state.is_blacklisted(&mac).await {
                         error!("Blacklisted client attempted to register");
                         return Err(APIError::InternalError);
                     }
@@ -267,14 +255,31 @@ struct DhcpRecord {
     pub vendor_class_identifier: Option<String>,
     pub starts: Option<String>,
     pub ends: Option<String>,
-    /// Client-last-transaction time — when the device last talked to dhcpd
-    /// ("last seen on the network"). The ipset `acl`/`shaper` entries also carry
-    /// `bytes`/`packets` counters.
-    pub last_seen: Option<String>,
-    /// Last time dhcpd recorded a transaction for this lease.
-    pub tstp: Option<String>,
+    /// Client-last-transaction time (cltt) — when the device last talked to dhcpd
+    /// ("last seen on the network"), as **unix epoch seconds (UTC)**. The ipset
+    /// `acl`/`shaper` entries also carry `bytes`/`packets` counters.
+    pub last_seen: Option<i64>,
+    /// Last time dhcpd recorded a transaction for this lease, **unix epoch seconds (UTC)**.
+    pub tstp: Option<i64>,
     pub acl: Option<crate::ipset::Entry>,
     pub shaper: Option<crate::ipset::Entry>,
+}
+
+/// Convert a dhcpd lease `Date` (UTC, as written in `dhcpd.leases`) to unix epoch
+/// seconds. `None` if the calendar fields don't form a valid UTC instant.
+fn date_to_epoch(d: &dhcpd_parser::common::Date) -> Option<i64> {
+    use chrono::TimeZone;
+    chrono::Utc
+        .with_ymd_and_hms(
+            i32::try_from(d.year).ok()?,
+            u32::try_from(d.month).ok()?,
+            u32::try_from(d.day).ok()?,
+            u32::try_from(d.hour).ok()?,
+            u32::try_from(d.minute).ok()?,
+            u32::try_from(d.second).ok()?,
+        )
+        .single()
+        .map(|dt| dt.timestamp())
 }
 
 #[get("/api/v1/dhcp")]
@@ -323,8 +328,8 @@ async fn dhcp_leases(
             vendor_class_identifier: lease.vendor_class_identifier,
             starts: lease.dates.starts.map(|v| v.to_string()),
             ends: lease.dates.ends.map(|v| v.to_string()),
-            last_seen: lease.dates.cltt.map(|v| v.to_string()),
-            tstp: lease.dates.tstp.map(|v| v.to_string()),
+            last_seen: lease.dates.cltt.as_ref().and_then(date_to_epoch),
+            tstp: lease.dates.tstp.as_ref().and_then(date_to_epoch),
             acl: acl_entries.iter().find(|e| e.ip == lease.ip).cloned(),
             shaper: shaper_entries.iter().find(|e| e.ip == lease.ip).cloned(),
             ip: lease.ip,
@@ -388,6 +393,12 @@ struct AdminStatus {
     clients_in_acl: usize,
     clients_in_shaper: usize,
     dhcp_leases: LeaseCounts,
+    /// Device-metrics dashboard aggregates (`null` if metrics disabled/unavailable).
+    metrics: Option<crate::device_metrics::DashboardStats>,
+    /// Distinct blacklisted MACs (runtime store ∪ static config).
+    blacklisted_count: usize,
+    /// Unlimited clients whose reserved IP is actively leased to a different MAC.
+    stale_reservations: usize,
 }
 
 /// Collect the system status once, from persistent state + ipsets + DHCP leases.
@@ -421,6 +432,53 @@ async fn collect_status(state: &State) -> Result<AdminStatus, APIError> {
         abandoned: count(dhcpd_parser::leases::BindingState::Abandoned),
     };
 
+    // Device-metrics dashboard (best-effort: null on error/disabled).
+    let now = chrono::Utc::now().timestamp();
+    let metrics = state
+        .device_metrics()
+        .and_then(|m| match m.dashboard(now, 5) {
+            Ok(d) => Some(d),
+            Err(err) => {
+                error!("dashboard query failed: {err:#}");
+                None
+            }
+        });
+
+    // Distinct blacklisted MACs (store ∪ config).
+    let mut blacklisted_macs: std::collections::HashSet<String> = state
+        .blacklist()
+        .list()
+        .await
+        .into_iter()
+        .map(|e| e.mac)
+        .collect();
+    for m in &cfg.blacklisted_macs {
+        blacklisted_macs.insert(normalize_mac(m).unwrap_or_else(|| m.to_lowercase()));
+    }
+    let blacklisted_count = blacklisted_macs.len();
+
+    // Stale reservations: unlimited client IPs actively leased to another MAC.
+    let mut active_mac: HashMap<String, Option<String>> = HashMap::new();
+    for l in &leases {
+        if l.binding_state == dhcpd_parser::leases::BindingState::Active {
+            active_mac.insert(
+                l.ip.clone(),
+                l.hardware.as_ref().and_then(|h| normalize_mac(&h.mac)),
+            );
+        }
+    }
+    let stale_reservations = state
+        .unlimited_clients()
+        .list()
+        .await
+        .into_iter()
+        .filter(|c| {
+            active_mac
+                .get(&c.ip)
+                .is_some_and(|lease_mac| lease_mac.as_deref() != Some(c.mac.as_str()))
+        })
+        .count();
+
     let ps = state.persistent_state().await;
     Ok(AdminStatus {
         internet_available: ps.is_wide_network_available.unwrap_or(false),
@@ -432,6 +490,9 @@ async fn collect_status(state: &State) -> Result<AdminStatus, APIError> {
         clients_in_acl,
         clients_in_shaper,
         dhcp_leases: lease_counts,
+        metrics,
+        blacklisted_count,
+        stale_reservations,
     })
 }
 
@@ -836,8 +897,11 @@ struct UnlimitedClientView {
     first_seen: Option<i64>,
     last_seen: Option<i64>,
     bytes_total: Option<i64>,
+    packets_total: Option<i64>,
     bytes_today: Option<i64>,
     bytes_7d: Option<i64>,
+    bytes_30d: Option<i64>,
+    rate_bps: Option<i64>,
 }
 
 fn build_unlimited_view(
@@ -872,8 +936,11 @@ fn build_unlimited_view(
         first_seen: m.first_seen,
         last_seen: m.last_seen,
         bytes_total: m.bytes_total,
+        packets_total: m.packets_total,
         bytes_today: m.bytes_today,
         bytes_7d: m.bytes_7d,
+        bytes_30d: m.bytes_30d,
+        rate_bps: m.rate_bps,
     }
 }
 
@@ -1005,6 +1072,251 @@ async fn admin_devices(
     let total = views.len();
     let page = paginate(views, &params);
     Ok(json_with_total(&page, total))
+}
+
+/// A device row + daily traffic series + live flags (for `/devices/{mac}`).
+#[derive(Serialize)]
+struct DeviceDetailView {
+    #[serde(flatten)]
+    device: crate::device_metrics::DeviceRow,
+    online: bool,
+    is_unlimited: bool,
+    daily: Vec<crate::device_metrics::DailyPoint>,
+}
+
+/// Number of days of daily traffic history returned by `/devices/{mac}` when the
+/// `days` query param is absent, and the inclusive cap on what may be requested.
+const DEVICE_DETAIL_DEFAULT_DAYS: i64 = 30;
+const DEVICE_DETAIL_MAX_DAYS: i64 = 365;
+
+#[get("/api/v1/admin/devices/{mac}")]
+async fn admin_device_detail(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    path: web::Path<String>,
+    query: web::Query<HashMap<String, String>>,
+) -> Result<HttpResponse, APIError> {
+    let mac = normalize_mac(&path.into_inner()).ok_or(APIError::BadRequest)?;
+    // Optional `days` window for the daily series (clamped to a sane range).
+    let days = query
+        .get("days")
+        .map(|v| v.parse::<i64>().map_err(|_| APIError::BadRequest))
+        .transpose()?
+        .unwrap_or(DEVICE_DETAIL_DEFAULT_DAYS)
+        .clamp(1, DEVICE_DETAIL_MAX_DAYS);
+    let (metrics, leases_path, store) = {
+        let s = state.lock().await;
+        (
+            s.device_metrics().cloned(),
+            s.config().dhcpd_leases.clone(),
+            s.unlimited_clients().clone(),
+        )
+    };
+    let metrics = match metrics {
+        Some(m) => m,
+        None => return Err(APIError::NotFound),
+    };
+    let is_unlimited = store.list().await.into_iter().any(|c| c.mac == mac);
+
+    let now = chrono::Utc::now().timestamp();
+    let mac_q = mac.clone();
+    let (detail_res, leases_map) = tokio::task::spawn_blocking(move || {
+        (
+            metrics.device_detail(&mac_q, now, days),
+            read_leases_map(&leases_path),
+        )
+    })
+    .await
+    .map_err(|err| {
+        error!("device_detail task panicked: {err}");
+        APIError::InternalError
+    })?;
+
+    let detail = match detail_res {
+        Ok(Some(d)) => d,
+        Ok(None) => return Err(APIError::NotFound),
+        Err(err) => {
+            error!("device_detail failed: {err:#}");
+            return Err(APIError::InternalError);
+        }
+    };
+    let online = detail
+        .device
+        .last_ip
+        .as_ref()
+        .and_then(|ip| leases_map.get(ip))
+        .map(|l| l.active && l.mac.as_deref() == Some(mac.as_str()))
+        .unwrap_or(false);
+    Ok(HttpResponse::Ok().json(DeviceDetailView {
+        device: detail.device,
+        online,
+        is_unlimited,
+        daily: detail.daily,
+    }))
+}
+
+// --- MAC blacklist CRUD (union with config.blacklisted_macs) ---
+
+#[derive(Serialize)]
+struct BlacklistEntryView {
+    mac: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comment: Option<String>,
+    created_at: Option<i64>,
+    /// "store" (runtime, editable) or "config" (static, read-only).
+    source: &'static str,
+}
+
+/// Snapshot of the runtime store + static config entries as views.
+async fn blacklist_views(state: &Data<Arc<Mutex<State>>>) -> Vec<BlacklistEntryView> {
+    let (store, config_macs) = {
+        let s = state.lock().await;
+        (s.blacklist().clone(), s.config().blacklisted_macs.clone())
+    };
+    let mut views: Vec<BlacklistEntryView> = store
+        .list()
+        .await
+        .into_iter()
+        .map(|e| BlacklistEntryView {
+            mac: e.mac,
+            comment: e.comment,
+            created_at: e.created_at,
+            source: "store",
+        })
+        .collect();
+    let store_macs: std::collections::HashSet<String> =
+        views.iter().map(|v| v.mac.clone()).collect();
+    for m in config_macs {
+        let norm = normalize_mac(&m).unwrap_or_else(|| m.to_lowercase());
+        if !store_macs.contains(&norm) {
+            views.push(BlacklistEntryView {
+                mac: norm,
+                comment: None,
+                created_at: None,
+                source: "config",
+            });
+        }
+    }
+    views
+}
+
+#[get("/api/v1/admin/blacklist")]
+async fn blacklist_list(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    query: web::Query<HashMap<String, String>>,
+) -> Result<HttpResponse, APIError> {
+    let params = parse_list_params(&query, &["mac", "created_at"], "mac")?;
+    let mut items = blacklist_views(&state).await;
+    if let Some(q) = &params.q {
+        items.retain(|v| {
+            v.mac.to_lowercase().contains(q)
+                || v.comment
+                    .as_deref()
+                    .is_some_and(|s| s.to_lowercase().contains(q))
+        });
+    }
+    items.sort_by(|a, b| {
+        let primary = match params.sort.as_str() {
+            "created_at" => a.created_at.cmp(&b.created_at),
+            _ => a.mac.cmp(&b.mac),
+        };
+        ordered(primary, params.order).then_with(|| a.mac.cmp(&b.mac))
+    });
+    let total = items.len();
+    let page = paginate(items, &params);
+    Ok(json_with_total(&page, total))
+}
+
+#[get("/api/v1/admin/blacklist/{mac}")]
+async fn blacklist_get(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, APIError> {
+    let mac = normalize_mac(&path.into_inner()).ok_or(APIError::BadRequest)?;
+    match blacklist_views(&state)
+        .await
+        .into_iter()
+        .find(|v| v.mac == mac)
+    {
+        Some(v) => Ok(HttpResponse::Ok().json(v)),
+        None => Err(APIError::NotFound),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateBlacklist {
+    mac: String,
+    #[serde(default)]
+    comment: Option<String>,
+}
+
+#[post("/api/v1/admin/blacklist")]
+async fn blacklist_create(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    req: HttpRequest,
+    body: web::Json<CreateBlacklist>,
+) -> Result<HttpResponse, APIError> {
+    let admin_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
+    let mac = normalize_mac(&body.mac).ok_or(APIError::BadRequest)?;
+    // Validate the comment here (client error -> 400) so a store.add() failure can
+    // be treated unambiguously as a server error (persist I/O -> 500).
+    if body
+        .comment
+        .as_ref()
+        .is_some_and(|c| c.len() > crate::blacklist::MAX_COMMENT_LEN)
+    {
+        return Err(APIError::BadRequest);
+    }
+    let store = { state.lock().await.blacklist().clone() };
+    let _guard = store.lock_for_mutation().await;
+    if store.get(&mac).await.is_some() {
+        return Err(APIError::Conflict);
+    }
+    let created_at = chrono::Utc::now().timestamp();
+    let entry = crate::blacklist::BlacklistEntry {
+        mac: mac.clone(),
+        comment: body.comment.clone(),
+        created_at: Some(created_at),
+    };
+    if let Err(err) = store.add(entry).await {
+        error!("blacklist persist failed: {err}");
+        return Err(APIError::InternalError);
+    }
+    info!("Admin blacklisted mac={mac} from {admin_ip}");
+    Ok(HttpResponse::Created().json(BlacklistEntryView {
+        mac,
+        comment: body.comment.clone(),
+        created_at: Some(created_at),
+        source: "store",
+    }))
+}
+
+#[delete("/api/v1/admin/blacklist/{mac}")]
+async fn blacklist_delete(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, APIError> {
+    let admin_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
+    let mac = normalize_mac(&path.into_inner()).ok_or(APIError::BadRequest)?;
+    let store = { state.lock().await.blacklist().clone() };
+    let _guard = store.lock_for_mutation().await;
+    match store.remove(&mac).await {
+        Ok(true) => {
+            info!("Admin un-blacklisted mac={mac} from {admin_ip}");
+            Ok(HttpResponse::NoContent().finish())
+        }
+        // Not in the store: either unknown or a read-only config entry.
+        Ok(false) => Err(APIError::NotFound),
+        Err(err) => {
+            error!("blacklist remove failed: {err}");
+            Err(APIError::InternalError)
+        }
+    }
 }
 
 #[get("/api/v1/admin/unlimited-clients")]
@@ -1293,6 +1605,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn date_to_epoch_converts_utc() {
+        use dhcpd_parser::common::Date;
+        let at = |year, month, day, hour, minute, second| {
+            date_to_epoch(&Date {
+                weekday: 0,
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+            })
+        };
+        assert_eq!(at(1970, 1, 1, 0, 0, 0), Some(0));
+        assert_eq!(at(2000, 1, 1, 0, 0, 0), Some(946_684_800));
+        // Out-of-range calendar fields don't form a valid instant -> None.
+        assert_eq!(at(2020, 13, 1, 0, 0, 0), None);
+    }
+
+    #[test]
     fn admin_status_serializes_to_documented_shape() {
         let full = AdminStatus {
             internet_available: true,
@@ -1310,6 +1642,9 @@ mod tests {
                 active: 2,
                 abandoned: 0,
             },
+            metrics: None,
+            blacklisted_count: 4,
+            stale_reservations: 2,
         };
         let v = serde_json::to_value(&full).unwrap();
         assert_eq!(v["internet_available"], true);
@@ -1330,6 +1665,9 @@ mod tests {
                 active: 0,
                 abandoned: 0,
             },
+            metrics: None,
+            blacklisted_count: 0,
+            stale_reservations: 0,
         };
         let v = serde_json::to_value(&empty).unwrap();
         assert!(v["speedtest"].is_null());
@@ -1499,8 +1837,11 @@ mod tests {
                 first_seen: Some(100),
                 last_seen: Some(200),
                 bytes_total: 10,
+                packets_total: 2,
                 bytes_today: 5,
                 bytes_7d: 7,
+                bytes_30d: 9,
+                rate_bps: Some(11),
             },
             online: true,
             is_unlimited: false,
@@ -1527,6 +1868,7 @@ mod tests {
                 bytes_7d: Some(5),
                 hostname: Some("h".into()),
                 vendor: Some("v".into()),
+                ..Default::default()
             },
         );
         let leases = HashMap::new();

@@ -45,6 +45,10 @@ fn default_unlimited_clients_path() -> std::path::PathBuf {
     "/var/lib/ala-archa-http-backend/unlimited-clients.yaml".into()
 }
 
+fn default_blacklist_path() -> std::path::PathBuf {
+    "/var/lib/ala-archa-http-backend/blacklist.yaml".into()
+}
+
 fn default_unlimited_subnet() -> String {
     "10.11.5.0/24".to_string()
 }
@@ -141,6 +145,10 @@ pub struct Config {
     /// File backing the runtime-managed unlimited-clients store.
     #[serde(default = "default_unlimited_clients_path")]
     pub unlimited_clients_path: std::path::PathBuf,
+    /// File backing the runtime-managed MAC blacklist store (union with the
+    /// static `blacklisted_macs`).
+    #[serde(default = "default_blacklist_path")]
+    pub blacklist_path: std::path::PathBuf,
     /// CIDR an admin may pick unlimited-client IPs from.
     #[serde(default = "default_unlimited_subnet")]
     pub unlimited_subnet: String,

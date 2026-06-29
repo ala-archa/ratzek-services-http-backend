@@ -152,6 +152,8 @@ pub struct State {
     device_metrics: Option<Arc<crate::device_metrics::DeviceMetricsStore>>,
     /// Unix epoch of the last successful metrics sample (0 = never), for monitoring.
     metrics_last_sample: Arc<AtomicI64>,
+    /// Runtime MAC blacklist (union with `config.blacklisted_macs`).
+    blacklist: crate::blacklist::BlacklistStore,
 }
 
 impl State {
@@ -368,6 +370,14 @@ impl State {
             }
         });
 
+        // Fail-open: a blacklist load failure must NOT block all clients; fall back
+        // to an empty store (enforcement continues via config.blacklisted_macs).
+        let blacklist = crate::blacklist::BlacklistStore::load(&config.blacklist_path)
+            .unwrap_or_else(|err| {
+                error!("blacklist store unavailable, using config-only: {err:#}");
+                crate::blacklist::BlacklistStore::empty(&config.blacklist_path)
+            });
+
         let state = Arc::new(Mutex::new(Self {
             config: config.clone(),
             persistent_state: crate::persistent_state::PersistentStateGuard::load_from_yaml(
@@ -377,6 +387,7 @@ impl State {
             unlimited_clients,
             device_metrics,
             metrics_last_sample: Arc::new(AtomicI64::new(0)),
+            blacklist,
         }));
 
         Ok(state)
@@ -401,6 +412,22 @@ impl State {
     /// Unix epoch of the last successful metrics sample (0 = never).
     pub fn metrics_last_sample(&self) -> i64 {
         self.metrics_last_sample.load(Ordering::SeqCst)
+    }
+
+    pub fn blacklist(&self) -> &crate::blacklist::BlacklistStore {
+        &self.blacklist
+    }
+
+    /// Whether a (normalized, lowercase) MAC is blacklisted — runtime store in
+    /// union with the static `config.blacklisted_macs`. O(1) on the hot client
+    /// path (in-memory set + small config Vec). Single source of truth for the
+    /// blacklist check in `client_get`/`client_register`.
+    pub async fn is_blacklisted(&self, mac: &str) -> bool {
+        self.config
+            .blacklisted_macs
+            .iter()
+            .any(|v| v.to_lowercase() == mac)
+            || self.blacklist.contains(mac).await
     }
 
     /// Apply the unlimited-clients store to the live system, healing drift in
