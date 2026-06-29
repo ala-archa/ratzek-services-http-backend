@@ -846,7 +846,12 @@ fn build_unlimited_view(
     metrics: &HashMap<String, crate::device_metrics::DeviceMetrics>,
 ) -> UnlimitedClientView {
     let lease = leases.get(&c.ip);
-    let online = lease.map(|l| l.active).unwrap_or(false);
+    // online = the reserved IP has an active lease held by THIS client's MAC.
+    let online = lease
+        .map(|l| l.active && l.mac.as_deref() == Some(c.mac.as_str()))
+        .unwrap_or(false);
+    // stale = the reserved IP is actively leased to a DIFFERENT MAC (online and
+    // stale are therefore mutually exclusive).
     let stale_reservation = lease
         .map(|l| l.active && l.mac.as_deref() != Some(c.mac.as_str()))
         .unwrap_or(false);
@@ -952,11 +957,13 @@ async fn admin_devices(
     let mut views: Vec<DeviceView> = rows
         .into_iter()
         .map(|d| {
+            // online = the device's last IP currently has an active lease held by
+            // this device's own MAC (not just any device on that IP).
             let online = d
                 .last_ip
                 .as_ref()
                 .and_then(|ip| leases_map.get(ip))
-                .map(|l| l.active)
+                .map(|l| l.active && l.mac.as_deref() == Some(d.mac.as_str()))
                 .unwrap_or(false);
             let is_unlimited = unlimited_macs.contains(&d.mac);
             DeviceView {
@@ -1451,7 +1458,9 @@ mod tests {
         );
         let metrics = HashMap::new();
         let view = build_unlimited_view(client("aa:bb:cc:dd:ee:ff", "10.0.0.1"), &leases, &metrics);
-        assert!(view.online);
+        // IP held by another MAC: the reserved device is NOT online, and the
+        // reservation is stale (online/stale are mutually exclusive).
+        assert!(!view.online);
         assert!(view.stale_reservation);
     }
 
