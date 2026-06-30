@@ -10,6 +10,7 @@ mod device_metrics;
 mod dhcp;
 mod dhcp_hosts;
 mod error;
+mod history;
 mod http;
 mod ipset;
 mod mobile_provider;
@@ -138,6 +139,10 @@ impl Application {
                         .service(http::admin_devices)
                         .service(http::admin_device_detail)
                         .service(http::admin_device_traffic)
+                        .service(http::admin_device_disconnect)
+                        .service(http::admin_wan_speedtest)
+                        .service(http::admin_wan_balance)
+                        .service(http::admin_events)
                         .service(http::blacklist_list)
                         .service(http::blacklist_get)
                         .service(http::blacklist_create)

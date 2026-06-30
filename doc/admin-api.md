@@ -363,6 +363,10 @@ curl -b jar -X POST $BASE/api/v1/admin/logout
 | `GET /api/v1/admin/devices` | инвентарь устройств + метрики | да | да |
 | `GET /api/v1/admin/devices/{mac}` | устройство + дневной ряд трафика | да | да |
 | `GET /api/v1/admin/devices/{mac}/traffic` | ряд трафика (day/hour/5m) для графика | да | да |
+| `POST /api/v1/admin/devices/{mac}/disconnect` | мгновенный отзыв доступа (ipset del) | да | да |
+| `GET /api/v1/admin/wan/speedtest` | история speedtest (timeseries) | да | да |
+| `GET /api/v1/admin/wan/balance` | история баланса ISP (timeseries) | да | да |
+| `GET /api/v1/admin/events` | журнал событий (activity-feed / аудит) | да | да |
 | `GET /api/v1/admin/blacklist` | список чёрного списка MAC | да | да |
 | `POST /api/v1/admin/blacklist` | добавить в чёрный список | да | да |
 | `DELETE /api/v1/admin/blacklist/{mac}` | убрать из чёрного списка | да | да |
@@ -429,7 +433,7 @@ curl -i -b jar "$BASE/api/v1/admin/unlimited-clients?sort=ip&order=asc&page=1&pe
 
 | Эндпоинт | `sort` ∈ | Доменные фильтры |
 |---|---|---|
-| `GET /admin/devices` | `last_seen`(деф.), `first_seen`, `bytes_total`, `bytes_today`, `bytes_7d`, `rate_bps`, `mac`, `last_ip` | `online`, `is_unlimited` (bool); `seen_within_days=N` (int ≥0 — активные за N дней) |
+| `GET /admin/devices` | `last_seen`(деф.), `first_seen`, `bytes_total`, `bytes_today`, `bytes_7d`, `rate_bps`, `mac`, `last_ip` | `online`, `is_unlimited`, `has_acl`, `has_shaper`, `has_no_shape`, `is_blacklisted` (bool); `seen_within_days=N` (int ≥0) |
 | `GET /admin/unlimited-clients` | `name`(деф.), `ip`, `mac`, `comment`, `last_seen`, `bytes_total`, `created_at` | `stale_reservation`, `online` (bool) |
 | `GET /dhcp` | `ip`(деф.), `mac`, `hostname`, `ends`, `last_seen` | `has_mac`, `has_acl`, `has_shaper` (bool); `ip_prefix=<str>` |
 | `GET /admin/blacklist` | `mac`(деф.), `created_at` | `source` ∈ `{store, config}` (иначе `400`) |
@@ -497,10 +501,20 @@ substring по `mac`/`last_ip`/`hostname`/IP из истории. Заголов
   "bytes_today": 104857600, "bytes_7d": 1073741824, "bytes_30d": 4294967296,
   "rate_bps": 125000,                    // средняя скорость за последний интервал (null если неактивен)
   "online": true,                        // БЫЛ трафик за последний интервал сэмплера (~5 мин)
-  "is_unlimited": true                   // есть ли в сторе безлимитов
+  "is_unlimited": true,                  // MAC в сторе безлимитов
+  "has_acl": true,                       // есть доступ в интернет (IP в ipset acl)
+  "has_shaper": false,                   // под шейпингом (IP в ipset shaper)
+  "has_no_shape": true,                  // безлимит, активен сейчас (IP в ipset no_shape)
+  "is_blacklisted": false                // MAC в чёрном списке (стор ∪ конфиг)
 }
 ```
 Если `device_metrics` выключен — эндпоинт отдаёт `200` с пустым массивом.
+
+> **Классификация доступа** (`has_acl`/`has_shaper`/`has_no_shape`) — членство **текущих** IP устройства в
+> ipset'ах: IP берутся из активных dhcpd-аренд по MAC (как в disconnect; набор «держит», если в нём хоть
+> один текущий IP), а не из возможно устаревшего `last_ip`. Offline-устройство (нет аренды) → все флаги
+> `false`. `is_blacklisted` — по MAC. Best-effort: при сбое чтения ipset/аренд флаги `false`, не ошибка.
+> Фильтры — см. §10.
 
 > **`online`** = «был ненулевой трафик за последний (свежий) интервал сэмплера (~5 мин)», а НЕ
 > «держит DHCP-аренду». Подключённое, но полностью простаивающее устройство → `online=false`.
@@ -519,6 +533,7 @@ substring по `mac`/`last_ip`/`hostname`/IP из истории. Заголов
   "mac": "aa:bb:cc:dd:ee:ff", "last_ip": "10.11.5.50", "ips": ["..."],
   "first_seen": 1750000000, "last_seen": 1751200000,
   "bytes_total": 5368709120, "rate_bps": 125000, "online": true, "is_unlimited": true,
+  "has_acl": true, "has_shaper": false, "has_no_shape": true, "is_blacklisted": false,
   "daily": [                             // последние 30 дней, новые сверху; дни без трафика опущены
     { "day": 1751155200, "bytes": 104857600, "packets": 90000 },
     { "day": 1751068800, "bytes": 52428800,  "packets": 45000 }
@@ -550,6 +565,49 @@ substring по `mac`/`last_ip`/`hostname`/IP из истории. Заголов
 > `bytes` — **сумма за бакет** (не rate; мгновенная скорость — в `rate_bps` на `/devices`). Текущий
 > (незакрытый) бакет — частичный, это норма. **Переходный период:** `hour`/`5m` стартуют пустыми и
 > наполняются вперёд (≤48 ч для `5m`, ≤90 дней для `hour`); `day` отдаёт исторические данные сразу.
+
+### `POST /api/v1/admin/devices/{mac}/disconnect` (требует сессии)
+Мгновенный отзыв доступа: удаляет **все текущие IP** устройства (по активным dhcpd-арендам этого MAC)
+из ipset `acl`/`shaper`/`no_shape`. Дополняет blacklist (тот блокирует только будущую регистрацию;
+комбинация blacklist+disconnect = заблокирован и отключён сейчас). Тело не нужно.
+- `204` — успех (идемпотентно: повторный вызов на уже отключённом — тоже `204`).
+- `404` — у MAC нет активной аренды (нечего отключать); `400` — невалидный MAC.
+- `500` — не удалось прочитать аренды или часть `ipset del` упала (часть могла примениться; повтор безопасен).
+> Устройство сможет вернуться, заново пройдя портал (если не в blacklist) — по обычному
+> `POST /api/v1/client`.
+
+### `GET /api/v1/admin/wan/speedtest` · `GET /api/v1/admin/wan/balance` (требует сессии)
+История WAN: периодические замеры speedtest и баланса ISP (копятся cron'ами в SQLite). Параметры
+`from`/`to` (unix sec UTC, опц.; деф. `to=now`, `from=to−90 дней`). Точки — newest-first.
+```jsonc
+// GET /api/v1/admin/wan/speedtest
+{ "from": 1742400000, "to": 1750000000, "points": [
+  { "ts": 1749998000, "download": 52000000.0, "upload": 9000000.0, "ping": 23.5 }
+]}
+// GET /api/v1/admin/wan/balance
+{ "from": 1742400000, "to": 1750000000, "points": [ { "ts": 1749980000, "balance": 1450.0 } ]}
+```
+> Доступность интернета НЕ хранится как ряд по минутам — её падения/восстановления видны как события
+> `internet_down`/`internet_up` в `/admin/events`. При выключенном `history` все три эндпоинта → `404`
+> (отличимо от `200` с пустым `points` = включено, но данных пока нет).
+
+### `GET /api/v1/admin/events` (требует сессии)
+Журнал заметных событий (activity-feed + аудит). Параметры: `from`/`to` (деф. `to=now`, `from=to−30 дней`),
+`kind` (фильтр по одному значению из списка ниже; неизвестное → `400`), `limit` (деф. 200, макс. 10000).
+Точки — newest-first.
+```jsonc
+{ "from": 1747400000, "to": 1750000000, "points": [
+  { "id": 412, "ts": 1749999000, "kind": "new_device", "mac": "aa:bb:cc:dd:ee:01", "detail": "10.11.5.42" },
+  { "id": 411, "ts": 1749990000, "kind": "internet_down" },
+  { "id": 410, "ts": 1749980000, "kind": "low_balance", "detail": "950" }
+]}
+```
+Значения `kind`: `internet_up`, `internet_down` (переходы доступности WAN); `low_balance` (баланс пересёк порог
+вниз; `detail`=баланс); `new_device` (впервые увиденный MAC — требует включённого `device_metrics`;
+`mac`/`detail`=ip); `blacklist_add` / `blacklist_remove` / `disconnect` (админ-действия; `mac` + `detail`=IP
+админа или снятые IP). `mac`/`detail` опускаются, если не заданы. При выключенном `history` → `404`.
+> Журнал хранится столько же, сколько WAN-ряды — `history.retention_days` (деф. 90), включая
+> аудит-события (`blacklist_*`/`disconnect`). Нужен более долгий аудит — увеличь `retention_days`.
 
 ### `GET/POST/DELETE /api/v1/admin/blacklist` (требует сессии)
 Рантайм-управление чёрным списком MAC. Запись блокирует **будущую регистрацию** устройства

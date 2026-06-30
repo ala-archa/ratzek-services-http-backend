@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::{future::Future, sync::Arc};
 
 use actix_web::{
@@ -445,17 +445,9 @@ async fn collect_status(state: &State) -> Result<AdminStatus, APIError> {
         });
 
     // Distinct blacklisted MACs (store ∪ config).
-    let mut blacklisted_macs: std::collections::HashSet<String> = state
-        .blacklist()
-        .list()
+    let blacklisted_count = build_blacklisted_set(state.blacklist(), &cfg.blacklisted_macs)
         .await
-        .into_iter()
-        .map(|e| e.mac)
-        .collect();
-    for m in &cfg.blacklisted_macs {
-        blacklisted_macs.insert(normalize_mac(m).unwrap_or_else(|| m.to_lowercase()));
-    }
-    let blacklisted_count = blacklisted_macs.len();
+        .len();
 
     // Stale reservations: unlimited client IPs actively leased to another MAC.
     let mut active_mac: HashMap<String, Option<String>> = HashMap::new();
@@ -752,6 +744,10 @@ struct ListParams {
 
 /// Parse/validate `page`/`per_page`/`sort`/`order`/`q`. `sort` must be in
 /// `whitelist`; any invalid value yields `400` (not silently ignored).
+///
+/// Invariant: every entry in `whitelist` must have a matching arm in the caller's
+/// `sort_by` block — otherwise that field validates OK but falls through to the
+/// default sort (a silent bug). Keep the two in sync per endpoint.
 fn parse_list_params(
     query: &HashMap<String, String>,
     whitelist: &[&str],
@@ -981,13 +977,147 @@ async fn enrich_unlimited(
         .collect()
 }
 
-/// A device-inventory row plus live flags.
+/// MAC set that is blacklisted (runtime store ∪ static config), for joining whole
+/// device lists in one pass (batched counterpart of per-MAC `State::is_blacklisted`).
+async fn build_blacklisted_set(
+    store: &crate::blacklist::BlacklistStore,
+    config_macs: &[String],
+) -> HashSet<String> {
+    let mut set: HashSet<String> = store.list().await.into_iter().map(|e| e.mac).collect();
+    for m in config_macs {
+        set.insert(normalize_mac(m).unwrap_or_else(|| m.to_lowercase()));
+    }
+    set
+}
+
+/// Live access classification of a device (ipset membership by IP).
+#[derive(Default)]
+struct AccessFlags {
+    has_acl: bool,
+    has_shaper: bool,
+    has_no_shape: bool,
+}
+
+/// IP membership of the three access-control ipsets, for device classification.
+struct IpsetMembership {
+    acl: HashSet<String>,
+    shaper: HashSet<String>,
+    no_shape: HashSet<String>,
+}
+
+impl IpsetMembership {
+    fn empty() -> Self {
+        Self {
+            acl: HashSet::new(),
+            shaper: HashSet::new(),
+            no_shape: HashSet::new(),
+        }
+    }
+
+    /// Read the three sets into IP sets. Best-effort: a failing set logs and yields
+    /// empty, so a transient ipset error degrades the flags rather than failing the
+    /// whole listing. Blocking (subprocess) — call inside `spawn_blocking`.
+    fn read(acl: &str, shaper: &str, no_shape: &str) -> Self {
+        let read = |name: &str| -> HashSet<String> {
+            match crate::ipset::IPSet::new(name).entries() {
+                Ok(es) => es.into_iter().map(|e| e.ip).collect(),
+                Err(e) => {
+                    error!("device classification: ipset {name} read failed: {e:#}");
+                    HashSet::new()
+                }
+            }
+        };
+        Self {
+            acl: read(acl),
+            shaper: read(shaper),
+            no_shape: read(no_shape),
+        }
+    }
+
+    /// Flags for a device, given its CURRENT IPs (from live leases) — a set holds if
+    /// ANY current IP is a member. Empty `ips` (offline / no lease) → all false.
+    /// Using live-lease IPs (not the possibly-stale metrics `last_ip`) keeps the flags
+    /// consistent with the `disconnect` action, which also operates on live IPs.
+    fn flags_for(&self, ips: &[String]) -> AccessFlags {
+        let any = |set: &HashSet<String>| ips.iter().any(|ip| set.contains(ip));
+        AccessFlags {
+            has_acl: any(&self.acl),
+            has_shaper: any(&self.shaper),
+            has_no_shape: any(&self.no_shape),
+        }
+    }
+}
+
+/// Build `normalized MAC -> current IPs` from active dhcpd leases (for live
+/// classification + disconnect). Blocking (file read) — call inside `spawn_blocking`.
+fn active_lease_ips(leases_path: &std::path::Path) -> anyhow::Result<HashMap<String, Vec<String>>> {
+    use dhcpd_parser::leases::BindingState;
+    use dhcpd_parser::parser::LeasesMethods;
+    let leases = crate::dhcp::Dhcp::read(leases_path)?;
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for l in leases.all() {
+        if l.binding_state != BindingState::Active {
+            continue;
+        }
+        if let Some(mac) = l.hardware.as_ref().and_then(|h| normalize_mac(&h.mac)) {
+            let ips = map.entry(mac).or_default();
+            if !ips.contains(&l.ip) {
+                ips.push(l.ip);
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Best-effort variant for classification: a read failure logs and yields an empty
+/// map (degrades the flags instead of failing the listing).
+fn active_lease_ips_or_empty(leases_path: &std::path::Path) -> HashMap<String, Vec<String>> {
+    active_lease_ips(leases_path).unwrap_or_else(|e| {
+        error!("device classification: failed to read leases: {e:#}");
+        HashMap::new()
+    })
+}
+
+/// Everything the device-classification handlers clone out of `State` under one
+/// lock (named fields instead of a wide positional tuple).
+struct ClassifyDeps {
+    metrics: Option<std::sync::Arc<crate::device_metrics::DeviceMetricsStore>>,
+    unlimited: crate::unlimited_clients::UnlimitedClientsStore,
+    blacklist: crate::blacklist::BlacklistStore,
+    leases_path: std::path::PathBuf,
+    acl_name: String,
+    shaper_name: String,
+    no_shape_name: String,
+    config_macs: Vec<String>,
+}
+
+impl ClassifyDeps {
+    fn snapshot(s: &State) -> Self {
+        let c = s.config();
+        Self {
+            metrics: s.device_metrics().cloned(),
+            unlimited: s.unlimited_clients().clone(),
+            blacklist: s.blacklist().clone(),
+            leases_path: c.dhcpd_leases.clone(),
+            acl_name: c.ipset_acl_name.clone(),
+            shaper_name: c.ipset_shaper_name.clone(),
+            no_shape_name: c.ipset_no_shape_name.clone(),
+            config_macs: c.blacklisted_macs.clone(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct DeviceView {
     // `device` carries `online` (traffic-derived) which flattens to the top level.
     #[serde(flatten)]
     device: crate::device_metrics::DeviceRow,
     is_unlimited: bool,
+    // Live access classification (ipset membership by IP, blacklist by MAC).
+    has_acl: bool,
+    has_shaper: bool,
+    has_no_shape: bool,
+    is_blacklisted: bool,
 }
 
 #[get("/api/v1/admin/devices")]
@@ -1012,6 +1142,10 @@ async fn admin_devices(
     )?;
     let online_filter = parse_bool_param(&query, "online")?;
     let unlimited_filter = parse_bool_param(&query, "is_unlimited")?;
+    let acl_filter = parse_bool_param(&query, "has_acl")?;
+    let shaper_filter = parse_bool_param(&query, "has_shaper")?;
+    let no_shape_filter = parse_bool_param(&query, "has_no_shape")?;
+    let blacklisted_filter = parse_bool_param(&query, "is_blacklisted")?;
     let seen_within_days = match query.get("seen_within_days") {
         None => None,
         Some(s) => Some(
@@ -1022,35 +1156,57 @@ async fn admin_devices(
         ),
     };
 
-    let (metrics, store) = {
+    let deps = {
         let s = state.lock().await;
-        (s.device_metrics().cloned(), s.unlimited_clients().clone())
+        ClassifyDeps::snapshot(&s)
     };
     // Metrics disabled -> empty inventory (not an error).
-    let metrics = match metrics {
+    let metrics = match deps.metrics {
         Some(m) => m,
         None => return Ok(json_with_total(&Vec::<DeviceView>::new(), 0)),
     };
-    let unlimited_macs: std::collections::HashSet<String> =
-        store.list().await.into_iter().map(|c| c.mac).collect();
+    let unlimited_macs: HashSet<String> = deps
+        .unlimited
+        .list()
+        .await
+        .into_iter()
+        .map(|c| c.mac)
+        .collect();
+    let blacklisted = build_blacklisted_set(&deps.blacklist, &deps.config_macs).await;
+    let (acl_name, shaper_name, no_shape_name, leases_path) = (
+        deps.acl_name,
+        deps.shaper_name,
+        deps.no_shape_name,
+        deps.leases_path,
+    );
 
     let now = chrono::Utc::now().timestamp();
-    let rows = tokio::task::spawn_blocking(move || {
-        metrics.all_devices(now).unwrap_or_else(|e| {
+    let (rows, membership, lease_ips) = tokio::task::spawn_blocking(move || {
+        let rows = metrics.all_devices(now).unwrap_or_else(|e| {
             error!("device-metrics all_devices failed: {e:#}");
             Vec::new()
-        })
+        });
+        let membership = IpsetMembership::read(&acl_name, &shaper_name, &no_shape_name);
+        let lease_ips = active_lease_ips_or_empty(&leases_path);
+        (rows, membership, lease_ips)
     })
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|_| (Vec::new(), IpsetMembership::empty(), HashMap::new()));
 
+    let no_ips: Vec<String> = Vec::new();
     let mut views: Vec<DeviceView> = rows
         .into_iter()
         .map(|d| {
             let is_unlimited = unlimited_macs.contains(&d.mac);
+            let is_blacklisted = blacklisted.contains(&d.mac);
+            let flags = membership.flags_for(lease_ips.get(&d.mac).unwrap_or(&no_ips));
             DeviceView {
                 device: d,
                 is_unlimited,
+                has_acl: flags.has_acl,
+                has_shaper: flags.has_shaper,
+                has_no_shape: flags.has_no_shape,
+                is_blacklisted,
             }
         })
         .collect();
@@ -1060,6 +1216,18 @@ async fn admin_devices(
     }
     if let Some(want) = unlimited_filter {
         views.retain(|v| v.is_unlimited == want);
+    }
+    if let Some(want) = acl_filter {
+        views.retain(|v| v.has_acl == want);
+    }
+    if let Some(want) = shaper_filter {
+        views.retain(|v| v.has_shaper == want);
+    }
+    if let Some(want) = no_shape_filter {
+        views.retain(|v| v.has_no_shape == want);
+    }
+    if let Some(want) = blacklisted_filter {
+        views.retain(|v| v.is_blacklisted == want);
     }
     if let Some(days) = seen_within_days {
         let cutoff = now.saturating_sub(days.saturating_mul(86_400));
@@ -1108,6 +1276,10 @@ struct DeviceDetailView {
     #[serde(flatten)]
     device: crate::device_metrics::DeviceRow,
     is_unlimited: bool,
+    has_acl: bool,
+    has_shaper: bool,
+    has_no_shape: bool,
+    is_blacklisted: bool,
     daily: Vec<crate::device_metrics::DailyPoint>,
 }
 
@@ -1131,24 +1303,44 @@ async fn admin_device_detail(
         .transpose()?
         .unwrap_or(DEVICE_DETAIL_DEFAULT_DAYS)
         .clamp(1, DEVICE_DETAIL_MAX_DAYS);
-    let (metrics, store) = {
+    let deps = {
         let s = state.lock().await;
-        (s.device_metrics().cloned(), s.unlimited_clients().clone())
+        ClassifyDeps::snapshot(&s)
     };
-    let metrics = match metrics {
+    let metrics = match deps.metrics {
         Some(m) => m,
         None => return Err(APIError::NotFound),
     };
-    let is_unlimited = store.list().await.into_iter().any(|c| c.mac == mac);
+    let is_unlimited = deps
+        .unlimited
+        .list()
+        .await
+        .into_iter()
+        .any(|c| c.mac == mac);
+    let is_blacklisted = build_blacklisted_set(&deps.blacklist, &deps.config_macs)
+        .await
+        .contains(&mac);
+    let (acl_name, shaper_name, no_shape_name, leases_path) = (
+        deps.acl_name,
+        deps.shaper_name,
+        deps.no_shape_name,
+        deps.leases_path,
+    );
 
     let now = chrono::Utc::now().timestamp();
     let mac_q = mac.clone();
-    let detail_res = tokio::task::spawn_blocking(move || metrics.device_detail(&mac_q, now, days))
-        .await
-        .map_err(|err| {
-            error!("device_detail task panicked: {err}");
-            APIError::InternalError
-        })?;
+    let (detail_res, membership, lease_ips) = tokio::task::spawn_blocking(move || {
+        (
+            metrics.device_detail(&mac_q, now, days),
+            IpsetMembership::read(&acl_name, &shaper_name, &no_shape_name),
+            active_lease_ips_or_empty(&leases_path),
+        )
+    })
+    .await
+    .map_err(|err| {
+        error!("device_detail task panicked: {err}");
+        APIError::InternalError
+    })?;
 
     let detail = match detail_res {
         Ok(Some(d)) => d,
@@ -1158,10 +1350,15 @@ async fn admin_device_detail(
             return Err(APIError::InternalError);
         }
     };
+    let flags = membership.flags_for(lease_ips.get(&mac).map(Vec::as_slice).unwrap_or(&[]));
     // `online` (traffic-derived) is carried by `detail.device` and flattens out.
     Ok(HttpResponse::Ok().json(DeviceDetailView {
         device: detail.device,
         is_unlimited,
+        has_acl: flags.has_acl,
+        has_shaper: flags.has_shaper,
+        has_no_shape: flags.has_no_shape,
+        is_blacklisted,
         daily: detail.daily,
     }))
 }
@@ -1263,6 +1460,214 @@ async fn admin_device_traffic(
     }))
 }
 
+/// Immediately revoke a device's internet access: remove every active-lease IP of
+/// the MAC from the acl/shaper/no_shape ipsets. Complements the blacklist (which
+/// only blocks future registration). Resolves IPs from LIVE dhcpd leases (not the
+/// possibly-stale device-metrics `last_ip`), so it works without device_metrics.
+#[post("/api/v1/admin/devices/{mac}/disconnect")]
+async fn admin_device_disconnect(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, APIError> {
+    let admin_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
+    let mac = normalize_mac(&path.into_inner()).ok_or(APIError::BadRequest)?;
+    let (leases_path, acl, shaper, no_shape, history) = {
+        let s = state.lock().await;
+        let c = s.config();
+        (
+            c.dhcpd_leases.clone(),
+            c.ipset_acl_name.clone(),
+            c.ipset_shaper_name.clone(),
+            c.ipset_no_shape_name.clone(),
+            s.history().cloned(),
+        )
+    };
+
+    let mac_q = mac.clone();
+    // Returns: (read_ok, ips of this MAC, any del failed).
+    let (read_ok, ips, any_err) = tokio::task::spawn_blocking(move || {
+        let leases = match active_lease_ips(&leases_path) {
+            Ok(m) => m,
+            Err(e) => {
+                error!("disconnect: failed to read leases: {e:#}");
+                return (false, Vec::new(), false);
+            }
+        };
+        let ips = leases.get(&mac_q).cloned().unwrap_or_default();
+        // Try ALL dels (don't abort on the first error); `del` is idempotent.
+        let mut any_err = false;
+        for ip in &ips {
+            for set in [&acl, &shaper, &no_shape] {
+                if let Err(e) = crate::ipset::IPSet::new(set).del(ip) {
+                    error!("disconnect: ipset del {set} {ip} failed: {e:#}");
+                    any_err = true;
+                }
+            }
+        }
+        (true, ips, any_err)
+    })
+    .await
+    .map_err(|err| {
+        error!("disconnect task panicked: {err}");
+        APIError::InternalError
+    })?;
+
+    if !read_ok {
+        return Err(APIError::InternalError); // couldn't read leases (distinct from "no lease")
+    }
+    if ips.is_empty() {
+        return Err(APIError::NotFound); // no active lease for this MAC -> nothing to disconnect
+    }
+    // Audit the attempt regardless of partial failure (the dels that DID succeed
+    // already took effect).
+    info!("Admin disconnected mac={mac} ips={ips:?} from {admin_ip} (errors={any_err})");
+    // The successful dels already took effect, so log the event even on partial failure.
+    crate::history::record_event_best_effort(
+        history.as_deref(),
+        crate::history::kind::DISCONNECT,
+        Some(&mac),
+        Some(&ips.join(",")),
+    );
+    if any_err {
+        return Err(APIError::InternalError);
+    }
+    Ok(HttpResponse::NoContent().finish())
+}
+
+// --- WAN history + event log (require the optional `history` store) ---
+
+/// Default look-back window for the WAN series when `from` is omitted. Independent
+/// of `history.retention_days` (just the default view span; older data, if retained
+/// longer, is still reachable via an explicit `from`).
+const HISTORY_SERIES_DEFAULT_WINDOW_SECS: i64 = 90 * 86_400;
+/// Default look-back window and page size for `/admin/events`.
+const EVENTS_DEFAULT_WINDOW_SECS: i64 = 30 * 86_400;
+const EVENTS_DEFAULT_LIMIT: i64 = 200;
+
+/// Parse an optional `i64` query param (`400` on a non-integer value).
+fn parse_opt_i64(query: &HashMap<String, String>, key: &str) -> Result<Option<i64>, APIError> {
+    query
+        .get(key)
+        .map(|v| v.parse::<i64>().map_err(|_| APIError::BadRequest))
+        .transpose()
+}
+
+/// Resolve the `[from, to]` window for a history query: `to` defaults to `now`,
+/// `from` to `to - default_window`. `400` on a non-integer or inverted (`from > to`)
+/// range.
+fn parse_window(
+    query: &HashMap<String, String>,
+    now: i64,
+    default_window: i64,
+) -> Result<(i64, i64), APIError> {
+    let to = parse_opt_i64(query, "to")?.unwrap_or(now);
+    let from = parse_opt_i64(query, "from")?.unwrap_or(to.saturating_sub(default_window));
+    if from > to {
+        return Err(APIError::BadRequest);
+    }
+    Ok((from, to))
+}
+
+#[derive(Serialize)]
+struct WanSpeedtestResponse {
+    from: i64,
+    to: i64,
+    points: Vec<crate::history::SpeedtestPoint>,
+}
+
+#[get("/api/v1/admin/wan/speedtest")]
+async fn admin_wan_speedtest(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    query: web::Query<HashMap<String, String>>,
+) -> Result<HttpResponse, APIError> {
+    let history = { state.lock().await.history().cloned() };
+    let history = history.ok_or(APIError::NotFound)?; // feature off -> 404 (distinct from empty 200)
+    let now = chrono::Utc::now().timestamp();
+    let (from, to) = parse_window(&query, now, HISTORY_SERIES_DEFAULT_WINDOW_SECS)?;
+    let points = tokio::task::spawn_blocking(move || history.speedtest_series(from, to))
+        .await
+        .map_err(|err| {
+            error!("wan speedtest task panicked: {err}");
+            APIError::InternalError
+        })?
+        .map_err(|err| {
+            error!("wan speedtest read failed: {err:#}");
+            APIError::InternalError
+        })?;
+    Ok(HttpResponse::Ok().json(WanSpeedtestResponse { from, to, points }))
+}
+
+#[derive(Serialize)]
+struct WanBalanceResponse {
+    from: i64,
+    to: i64,
+    points: Vec<crate::history::BalancePoint>,
+}
+
+#[get("/api/v1/admin/wan/balance")]
+async fn admin_wan_balance(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    query: web::Query<HashMap<String, String>>,
+) -> Result<HttpResponse, APIError> {
+    let history = { state.lock().await.history().cloned() };
+    let history = history.ok_or(APIError::NotFound)?;
+    let now = chrono::Utc::now().timestamp();
+    let (from, to) = parse_window(&query, now, HISTORY_SERIES_DEFAULT_WINDOW_SECS)?;
+    let points = tokio::task::spawn_blocking(move || history.balance_series(from, to))
+        .await
+        .map_err(|err| {
+            error!("wan balance task panicked: {err}");
+            APIError::InternalError
+        })?
+        .map_err(|err| {
+            error!("wan balance read failed: {err:#}");
+            APIError::InternalError
+        })?;
+    Ok(HttpResponse::Ok().json(WanBalanceResponse { from, to, points }))
+}
+
+#[derive(Serialize)]
+struct EventsResponse {
+    from: i64,
+    to: i64,
+    points: Vec<crate::history::EventRow>,
+}
+
+#[get("/api/v1/admin/events")]
+async fn admin_events(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    query: web::Query<HashMap<String, String>>,
+) -> Result<HttpResponse, APIError> {
+    let history = { state.lock().await.history().cloned() };
+    let history = history.ok_or(APIError::NotFound)?;
+    let now = chrono::Utc::now().timestamp();
+    let (from, to) = parse_window(&query, now, EVENTS_DEFAULT_WINDOW_SECS)?;
+    let limit = parse_opt_i64(&query, "limit")?.unwrap_or(EVENTS_DEFAULT_LIMIT);
+    // Unknown `kind` -> 400 (not a silent empty result).
+    let kind = match query.get("kind") {
+        Some(k) if crate::history::kind::is_valid(k) => Some(k.clone()),
+        Some(_) => return Err(APIError::BadRequest),
+        None => None,
+    };
+    let points =
+        tokio::task::spawn_blocking(move || history.list_events(from, to, kind.as_deref(), limit))
+            .await
+            .map_err(|err| {
+                error!("events task panicked: {err}");
+                APIError::InternalError
+            })?
+            .map_err(|err| {
+                error!("events read failed: {err:#}");
+                APIError::InternalError
+            })?;
+    Ok(HttpResponse::Ok().json(EventsResponse { from, to, points }))
+}
+
 // --- MAC blacklist CRUD (union with config.blacklisted_macs) ---
 
 #[derive(Serialize)]
@@ -1316,13 +1721,13 @@ async fn blacklist_list(
 ) -> Result<HttpResponse, APIError> {
     let params = parse_list_params(&query, &["mac", "created_at"], "mac")?;
     // `source` filter: runtime store vs static config entries.
-    let source_filter = match query.get("source").map(String::as_str) {
+    let source_filter: Option<&str> = match query.get("source").map(String::as_str) {
         None => None,
-        Some(s @ ("store" | "config")) => Some(s.to_string()),
+        Some(s @ ("store" | "config")) => Some(s),
         Some(_) => return Err(APIError::BadRequest),
     };
     let mut items = blacklist_views(&state).await;
-    if let Some(src) = &source_filter {
+    if let Some(src) = source_filter {
         items.retain(|v| v.source == src);
     }
     if let Some(q) = &params.q {
@@ -1387,7 +1792,10 @@ async fn blacklist_create(
     {
         return Err(APIError::BadRequest);
     }
-    let store = { state.lock().await.blacklist().clone() };
+    let (store, history) = {
+        let s = state.lock().await;
+        (s.blacklist().clone(), s.history().cloned())
+    };
     let _guard = store.lock_for_mutation().await;
     if store.get(&mac).await.is_some() {
         return Err(APIError::Conflict);
@@ -1403,6 +1811,12 @@ async fn blacklist_create(
         return Err(APIError::InternalError);
     }
     info!("Admin blacklisted mac={mac} from {admin_ip}");
+    crate::history::record_event_best_effort(
+        history.as_deref(),
+        crate::history::kind::BLACKLIST_ADD,
+        Some(&mac),
+        Some(&admin_ip),
+    );
     Ok(HttpResponse::Created().json(BlacklistEntryView {
         mac,
         comment: body.comment.clone(),
@@ -1420,11 +1834,20 @@ async fn blacklist_delete(
 ) -> Result<HttpResponse, APIError> {
     let admin_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
     let mac = normalize_mac(&path.into_inner()).ok_or(APIError::BadRequest)?;
-    let store = { state.lock().await.blacklist().clone() };
+    let (store, history) = {
+        let s = state.lock().await;
+        (s.blacklist().clone(), s.history().cloned())
+    };
     let _guard = store.lock_for_mutation().await;
     match store.remove(&mac).await {
         Ok(true) => {
             info!("Admin un-blacklisted mac={mac} from {admin_ip}");
+            crate::history::record_event_best_effort(
+                history.as_deref(),
+                crate::history::kind::BLACKLIST_REMOVE,
+                Some(&mac),
+                Some(&admin_ip),
+            );
             Ok(HttpResponse::NoContent().finish())
         }
         // Not in the store: either unknown or a read-only config entry.
@@ -1806,6 +2229,47 @@ mod tests {
     }
 
     #[test]
+    fn ipset_membership_flags_for_joins_by_ip() {
+        let m = IpsetMembership {
+            acl: ["10.0.0.1".to_string()].into_iter().collect(),
+            shaper: ["10.0.0.1".to_string()].into_iter().collect(),
+            no_shape: HashSet::new(),
+        };
+        let f = |ips: &[&str]| {
+            let owned: Vec<String> = ips.iter().map(|s| s.to_string()).collect();
+            let g = m.flags_for(&owned);
+            (g.has_acl, g.has_shaper, g.has_no_shape)
+        };
+        // A set holds if ANY current IP is a member.
+        assert_eq!(f(&["10.0.0.1"]), (true, true, false));
+        assert_eq!(f(&["10.0.0.9"]), (false, false, false));
+        assert_eq!(f(&["10.0.0.9", "10.0.0.1"]), (true, true, false));
+        assert_eq!(f(&[]), (false, false, false));
+    }
+
+    #[tokio::test]
+    async fn build_blacklisted_set_unions_store_and_normalized_config() {
+        let dir = std::env::temp_dir().join(format!("bl-set-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bl.yaml");
+        let _ = std::fs::remove_file(&path);
+        let store = crate::blacklist::BlacklistStore::load(&path).unwrap();
+        store
+            .add(crate::blacklist::BlacklistEntry {
+                mac: "aa:bb:cc:dd:ee:01".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Config MAC in a non-canonical (upper) form must be normalized into the set.
+        let set = build_blacklisted_set(&store, &["AA:BB:CC:DD:EE:02".to_string()]).await;
+        assert!(set.contains("aa:bb:cc:dd:ee:01")); // from store
+        assert!(set.contains("aa:bb:cc:dd:ee:02")); // from config, normalized
+        assert_eq!(set.len(), 2);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn parse_bool_param_accepts_bool_forms_and_rejects_junk() {
         for v in ["true", "1"] {
             assert_eq!(
@@ -2006,10 +2470,16 @@ mod tests {
                 online: true,
             },
             is_unlimited: false,
+            has_acl: true,
+            has_shaper: false,
+            has_no_shape: true,
+            is_blacklisted: false,
         };
         let v = serde_json::to_value(&view).unwrap();
         // Flatten must not nest the row under a "device" key.
         assert!(v.get("device").is_none());
+        assert_eq!(v["has_acl"], true);
+        assert_eq!(v["is_blacklisted"], false);
         assert_eq!(v["mac"], "aa:bb:cc:dd:ee:ff");
         assert_eq!(v["online"], true);
         assert_eq!(v["is_unlimited"], false);

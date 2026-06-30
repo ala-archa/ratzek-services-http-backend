@@ -62,6 +62,16 @@ blacklist_path: /var/lib/ala-archa-http-backend/blacklist.yaml
 #   retention_hourly_days: 90    # drop hourly traffic buckets older than this (optional)
 #   retention_5min_hours: 48     # drop 5-minute traffic buckets older than this (optional)
 
+# history: optional WAN history + event log. Persists periodic speedtest/balance
+# readings and notable events (internet up/down, low balance, new device, blacklist
+# add/remove, disconnect) into a SQLite DB; surfaced at GET /api/v1/admin/wan/* and
+# GET /api/v1/admin/events. Best-effort: a DB error disables it but never blocks the
+# backend. Omit to disable (those endpoints then return 404). `new_device` events
+# additionally require `device_metrics` to be enabled.
+# history:
+#   db_path: /var/lib/ala-archa-http-backend/history.sqlite   # absolute
+#   retention_days: 90           # drop WAN readings / events older than this
+
 telegram:
   bot_token: "123456:ABC-asdasdasdasd"
   retry_crontab: "30 */5 * * * *"

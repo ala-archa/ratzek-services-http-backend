@@ -117,6 +117,23 @@ pub struct DeviceMetricsConfig {
     pub retention_5min_hours: i64,
 }
 
+fn default_history_retention_days() -> i64 {
+    90
+}
+
+/// Optional WAN history + event log: persists periodic speedtest/balance readings
+/// and notable events (internet up/down, low balance, new device, blacklist
+/// changes, disconnect) into a SQLite DB, surfaced at `GET /api/v1/admin/wan/*` and
+/// `GET /api/v1/admin/events`. Omit to disable. See `src/history.rs`.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct HistoryConfig {
+    /// Absolute path to the SQLite DB the backend owns.
+    pub db_path: std::path::PathBuf,
+    /// Drop WAN readings / events older than this many days (default 90).
+    #[serde(default = "default_history_retention_days")]
+    pub retention_days: i64,
+}
+
 /// Admin panel credentials. A single administrator authenticates with a login
 /// and an argon2 password hash (generate it via the `hash-password` subcommand).
 #[derive(Serialize, Deserialize, Clone)]
@@ -170,6 +187,8 @@ pub struct Config {
     pub dhcp_reservations: Option<DhcpReservations>,
     #[serde(default)]
     pub device_metrics: Option<DeviceMetricsConfig>,
+    #[serde(default)]
+    pub history: Option<HistoryConfig>,
 }
 
 impl Config {
@@ -225,6 +244,15 @@ impl Config {
             }
             if dm.retention_5min_hours < 0 {
                 anyhow::bail!("device_metrics.retention_5min_hours must be >= 0");
+            }
+        }
+
+        if let Some(h) = &self.history {
+            if !std::path::Path::new(&h.db_path).is_absolute() {
+                anyhow::bail!("history.db_path must be absolute, got {:?}", h.db_path);
+            }
+            if h.retention_days < 0 {
+                anyhow::bail!("history.retention_days must be >= 0");
             }
         }
 

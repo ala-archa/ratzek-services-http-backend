@@ -143,6 +143,9 @@ pub struct SampleStats {
     pub ips: usize,
     pub bytes_added: i64,
     pub resets: usize,
+    /// `(mac, ip)` of MACs seen for the FIRST time this pass — for `new_device`
+    /// events. Empty on the very first sample of a fresh DB (no false flood).
+    pub new_macs: Vec<(String, String)>,
 }
 
 /// Retention windows for the three traffic rollup levels, passed to
@@ -486,6 +489,16 @@ impl DeviceMetricsStore {
             .map(|l| (l.ip.as_str(), l.mac.as_str()))
             .collect();
 
+        // Known MACs before this pass, to detect first-time devices. On a FRESH DB
+        // (empty table) we suppress new_device detection so the first sample doesn't
+        // emit an event for every currently-active device.
+        let mut known_macs: std::collections::HashSet<String> = {
+            let mut stmt = tx.prepare("SELECT mac FROM devices")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let first_population = known_macs.is_empty();
+
         // 1) Upsert device + IP-history rows from active leases.
         //    - `first_seen` and `last_seen` BOTH track the lease `cltt` (real
         //      first/last contact with dhcpd), falling back to `now` only when the
@@ -500,6 +513,12 @@ impl DeviceMetricsStore {
         //      `last_delta_at=now` for EVERY active device, so an active-but-idle
         //      device reads as "active in the latest tick" (rate 0).
         for l in leases {
+            // First-time MAC (and not the initial population of a fresh DB) -> a
+            // `new_device` candidate. `insert` is true only on the first occurrence,
+            // so two leases of the same new MAC in one pass count once.
+            if !first_population && known_macs.insert(l.mac.clone()) {
+                stats.new_macs.push((l.mac.clone(), l.ip.clone()));
+            }
             tx.execute(
                 "INSERT INTO devices (mac, first_seen, last_seen, last_ip, last_hostname, last_vendor, last_delta_at, last_delta_bytes)
                  VALUES (?1, COALESCE(?6, ?2), COALESCE(?6, ?2), ?3, ?4, ?5, ?2, 0)
@@ -1095,6 +1114,43 @@ mod tests {
         let m = s.get_many(&["aa:bb:cc:dd:ee:01".into()], now).unwrap();
         assert_eq!(m["aa:bb:cc:dd:ee:01"].bytes_total, Some(0));
         assert_eq!(m["aa:bb:cc:dd:ee:01"].first_seen, Some(now));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn new_macs_detected_after_first_population() {
+        let (s, dir) = store();
+        // First sample on a FRESH DB: every device is "new", but we suppress the
+        // flood -> no new_macs.
+        let st = s
+            .sample(
+                &[lease("aa:bb:cc:dd:ee:01", "10.0.0.2")],
+                &[],
+                1000,
+                retention(730),
+            )
+            .unwrap();
+        assert!(
+            st.new_macs.is_empty(),
+            "fresh-DB first sample suppresses new_device"
+        );
+
+        // Second sample: a genuinely new MAC is reported; the existing one is not.
+        let st = s
+            .sample(
+                &[
+                    lease("aa:bb:cc:dd:ee:01", "10.0.0.2"), // already known
+                    lease("aa:bb:cc:dd:ee:02", "10.0.0.3"), // new
+                ],
+                &[],
+                2000,
+                retention(730),
+            )
+            .unwrap();
+        assert_eq!(
+            st.new_macs,
+            vec![("aa:bb:cc:dd:ee:02".to_string(), "10.0.0.3".to_string())]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

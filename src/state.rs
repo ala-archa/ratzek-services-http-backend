@@ -57,7 +57,7 @@ async fn check_is_wide_internet_available(config: &crate::config::Ping) -> bool 
 /// feed them to the store. The heavy (blocking) work runs in `spawn_blocking`.
 /// Best-effort: any failure is logged and the next tick retries.
 async fn sample_device_metrics(state: Arc<Mutex<State>>) {
-    let (store, leases_path, traffic_sets, retention, last_sample) = {
+    let (store, leases_path, traffic_sets, retention, last_sample, history) = {
         let s = state.lock().await;
         let store = match s.device_metrics.clone() {
             Some(st) => st,
@@ -87,6 +87,7 @@ async fn sample_device_metrics(state: Arc<Mutex<State>>) {
             ],
             retention,
             s.metrics_last_sample.clone(),
+            s.history.clone(),
         )
     };
 
@@ -144,9 +145,21 @@ async fn sample_device_metrics(state: Arc<Mutex<State>>) {
         Ok(Ok(stats)) => {
             last_sample.store(now, Ordering::SeqCst);
             info!(
-                "device-metrics sample: {} devices, {} ips, +{} bytes, {} counter resets",
-                stats.devices, stats.ips, stats.bytes_added, stats.resets
+                "device-metrics sample: {} devices, {} ips, +{} bytes, {} counter resets, {} new",
+                stats.devices,
+                stats.ips,
+                stats.bytes_added,
+                stats.resets,
+                stats.new_macs.len()
             );
+            for (mac, ip) in &stats.new_macs {
+                crate::history::record_event_best_effort(
+                    history.as_deref(),
+                    crate::history::kind::NEW_DEVICE,
+                    Some(mac),
+                    Some(ip),
+                );
+            }
         }
         Ok(Err(err)) => error!("device-metrics sample failed: {err:#}"),
         Err(err) => error!("device-metrics sample task panicked: {err}"),
@@ -164,6 +177,8 @@ pub struct State {
     metrics_last_sample: Arc<AtomicI64>,
     /// Runtime MAC blacklist (union with `config.blacklisted_macs`).
     blacklist: crate::blacklist::BlacklistStore,
+    /// Optional WAN-history + event-log store (None if disabled or DB couldn't open).
+    history: Option<Arc<crate::history::HistoryStore>>,
 }
 
 impl State {
@@ -182,16 +197,36 @@ impl State {
                         let config = { state1.lock().await.config.ping.clone() };
                         let is_wide_network_available =
                             check_is_wide_internet_available(&config).await;
-                        let state = state1.lock().await;
-                        let r = state
-                            .persistent_state
-                            .update(|persistent_state| {
-                                persistent_state.is_wide_network_available =
-                                    Some(is_wide_network_available)
-                            })
-                            .await;
-                        if let Err(err) = r {
-                            error!("Unable to update persistent state: {err}");
+                        // Update under the lock; return the PREVIOUS value, then drop the
+                        // lock BEFORE the history write (don't hold State across SQLite I/O).
+                        let (history, r) = {
+                            let state = state1.lock().await;
+                            let history = state.history.clone();
+                            let r = state
+                                .persistent_state
+                                .update(|persistent_state| {
+                                    let prev = persistent_state.is_wide_network_available;
+                                    persistent_state.is_wide_network_available =
+                                        Some(is_wide_network_available);
+                                    prev
+                                })
+                                .await;
+                            (history, r)
+                        };
+                        match r {
+                            Ok(prev) => {
+                                if let Some(kind) =
+                                    crate::history::net_transition(prev, is_wide_network_available)
+                                {
+                                    crate::history::record_event_best_effort(
+                                        history.as_deref(),
+                                        kind,
+                                        None,
+                                        None,
+                                    );
+                                }
+                            }
+                            Err(err) => error!("Unable to update persistent state: {err}"),
                         }
                     })
                 },
@@ -211,6 +246,9 @@ impl State {
                         match SpeedTest::run(&config).await {
                             Ok(speedtest) => {
                                 let state = state1.lock().await;
+                                let history = state.history.clone();
+                                // Clone before the value moves into the update closure.
+                                let st = speedtest.clone();
                                 let r = state
                                     .persistent_state
                                     .update(|persistent_state| {
@@ -219,6 +257,14 @@ impl State {
                                     .await;
                                 if let Err(err) = r {
                                     error!("Unable to update persistent state: {err}");
+                                }
+                                if let Some(h) = &history {
+                                    let now = chrono::Utc::now().timestamp();
+                                    if let Err(err) =
+                                        h.record_speedtest(now, st.download, st.upload, st.ping)
+                                    {
+                                        error!("history: record speedtest failed: {err:#}");
+                                    }
                                 }
 
                                 if let Some(mobile_provider) = &state.config.mobile_provider {
@@ -260,17 +306,42 @@ impl State {
                                     return;
                                 }
                             };
-                            let r = state1
-                                .lock()
-                                .await
+                            let st = state1.lock().await;
+                            let history = st.history.clone();
+                            let threshold = provider1.low_balance_threshold;
+                            // Return the PREVIOUS balance to detect a downward crossing.
+                            let r = st
                                 .persistent_state
                                 .update(|state| {
+                                    let prev = state.balance;
                                     state.balance = Some(balance);
+                                    prev
                                 })
                                 .await;
+                            drop(st);
 
-                            if let Err(err) = r {
-                                error!("Unable to update balance in persistent storage: {err}")
+                            match r {
+                                Ok(prev) => {
+                                    if let Some(h) = &history {
+                                        let now = chrono::Utc::now().timestamp();
+                                        if let Err(err) = h.record_balance(now, balance) {
+                                            error!("history: record balance failed: {err:#}");
+                                        }
+                                        if crate::history::balance_crossed_low(
+                                            prev, balance, threshold,
+                                        ) {
+                                            crate::history::record_event_best_effort(
+                                                history.as_deref(),
+                                                crate::history::kind::LOW_BALANCE,
+                                                None,
+                                                Some(&balance.to_string()),
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    error!("Unable to update balance in persistent storage: {err}")
+                                }
                             }
                         })
                     })?)
@@ -388,6 +459,19 @@ impl State {
                 crate::blacklist::BlacklistStore::empty(&config.blacklist_path)
             });
 
+        // Best-effort: a history-DB failure disables WAN history / events but never
+        // blocks startup (same policy as device-metrics).
+        let history =
+            config.history.as_ref().and_then(|h| {
+                match crate::history::HistoryStore::open(&h.db_path, h.retention_days) {
+                    Ok(store) => Some(Arc::new(store)),
+                    Err(err) => {
+                        error!("history DB unavailable, WAN history/events disabled: {err:#}");
+                        None
+                    }
+                }
+            });
+
         let state = Arc::new(Mutex::new(Self {
             config: config.clone(),
             persistent_state: crate::persistent_state::PersistentStateGuard::load_from_yaml(
@@ -398,6 +482,7 @@ impl State {
             device_metrics,
             metrics_last_sample: Arc::new(AtomicI64::new(0)),
             blacklist,
+            history,
         }));
 
         Ok(state)
@@ -426,6 +511,11 @@ impl State {
 
     pub fn blacklist(&self) -> &crate::blacklist::BlacklistStore {
         &self.blacklist
+    }
+
+    /// Optional WAN-history + event-log store (None if disabled or DB couldn't open).
+    pub fn history(&self) -> Option<&Arc<crate::history::HistoryStore>> {
+        self.history.as_ref()
     }
 
     /// Whether a (normalized, lowercase) MAC is blacklisted — runtime store in

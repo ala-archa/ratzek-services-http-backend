@@ -25,7 +25,18 @@ impl IPSet {
         let output = std::process::Command::new("ipset")
             .args(["save", &self.name])
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .output()?;
+
+        // Fail loudly on a non-zero exit (e.g. missing set / no permission) instead
+        // of silently treating empty stdout as an empty set.
+        if !output.status.success() {
+            bail!(
+                "ipset save {} failed: {}",
+                self.name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
 
         let output = String::from_utf8(output.stdout)
             .map_err(|err| anyhow!("Decode command output: {}", err))?;
