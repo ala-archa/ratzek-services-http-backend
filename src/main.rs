@@ -140,6 +140,7 @@ impl Application {
                         .service(http::admin_device_detail)
                         .service(http::admin_device_traffic)
                         .service(http::admin_device_disconnect)
+                        .service(http::admin_device_reset_shaper_counter)
                         .service(http::admin_wan_speedtest)
                         .service(http::admin_wan_balance)
                         .service(http::admin_events)

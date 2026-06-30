@@ -364,6 +364,7 @@ curl -b jar -X POST $BASE/api/v1/admin/logout
 | `GET /api/v1/admin/devices/{mac}` | устройство + дневной ряд трафика | да | да |
 | `GET /api/v1/admin/devices/{mac}/traffic` | ряд трафика (day/hour/5m) для графика | да | да |
 | `POST /api/v1/admin/devices/{mac}/disconnect` | мгновенный отзыв доступа (ipset del) | да | да |
+| `POST /api/v1/admin/devices/{mac}/reset-shaper-counter` | сброс счётчика shaper клиента | да | да |
 | `GET /api/v1/admin/wan/speedtest` | история speedtest (timeseries) | да | да |
 | `GET /api/v1/admin/wan/balance` | история баланса ISP (timeseries) | да | да |
 | `GET /api/v1/admin/events` | журнал событий (activity-feed / аудит) | да | да |
@@ -576,6 +577,16 @@ substring по `mac`/`last_ip`/`hostname`/IP из истории. Заголов
 > Устройство сможет вернуться, заново пройдя портал (если не в blacklist) — по обычному
 > `POST /api/v1/client`.
 
+### `POST /api/v1/admin/devices/{mac}/reset-shaper-counter` (требует сессии)
+Сбрасывает счётчик трафика клиента в сете `shaper`, удаляя его текущие IP из этого сета (счётчик живёт на
+записи ipset, поэтому удаление записи его обнуляет — `client_get` далее покажет `bytes_sent`=0). Доступ **не
+теряется** (клиент остаётся в `acl`); при ближайшей ре-регистрации (`POST /api/v1/client`) он снова попадёт в
+`shaper` с нулевым счётчиком. Тело не нужно.
+- `204` — успех; `404` — нет живого IP клиента в `shaper` (offline / не зарегистрирован / безлимит);
+  `400` — невалидный MAC; `500` — сбой чтения аренд/сета или `ipset del`.
+> **Не меняет класс шейпинга / скорость** — счётчик байт в бэкенде наблюдательный (квоты по байтам нет;
+> шейпинг — по членству в ipset). Сброс влияет только на индикатор `bytes_sent` и метрики.
+
 ### `GET /api/v1/admin/wan/speedtest` · `GET /api/v1/admin/wan/balance` (требует сессии)
 История WAN: периодические замеры speedtest и баланса ISP (копятся cron'ами в SQLite). Параметры
 `from`/`to` (unix sec UTC, опц.; деф. `to=now`, `from=to−90 дней`). Точки — newest-first.
@@ -604,10 +615,11 @@ substring по `mac`/`last_ip`/`hostname`/IP из истории. Заголов
 ```
 Значения `kind`: `internet_up`, `internet_down` (переходы доступности WAN); `low_balance` (баланс пересёк порог
 вниз; `detail`=баланс); `new_device` (впервые увиденный MAC — требует включённого `device_metrics`;
-`mac`/`detail`=ip); `blacklist_add` / `blacklist_remove` / `disconnect` (админ-действия; `mac` + `detail`=IP
-админа или снятые IP). `mac`/`detail` опускаются, если не заданы. При выключенном `history` → `404`.
+`mac`/`detail`=ip); `blacklist_add` / `blacklist_remove` / `disconnect` / `shaper_reset` (админ-действия;
+`mac` + `detail`=IP админа или затронутые IP). `mac`/`detail` опускаются, если не заданы. При выключенном
+`history` → `404`.
 > Журнал хранится столько же, сколько WAN-ряды — `history.retention_days` (деф. 90), включая
-> аудит-события (`blacklist_*`/`disconnect`). Нужен более долгий аудит — увеличь `retention_days`.
+> аудит-события (`blacklist_*`/`disconnect`/`shaper_reset`). Нужен более долгий аудит — увеличь `retention_days`.
 
 ### `GET/POST/DELETE /api/v1/admin/blacklist` (требует сессии)
 Рантайм-управление чёрным списком MAC. Запись блокирует **будущую регистрацию** устройства

@@ -37,6 +37,7 @@ pub mod kind {
     pub const BLACKLIST_ADD: &str = "blacklist_add";
     pub const BLACKLIST_REMOVE: &str = "blacklist_remove";
     pub const DISCONNECT: &str = "disconnect";
+    pub const SHAPER_RESET: &str = "shaper_reset";
 
     /// All known kinds, for validating the `/admin/events?kind=` filter.
     pub const ALL: &[&str] = &[
@@ -47,6 +48,7 @@ pub mod kind {
         BLACKLIST_ADD,
         BLACKLIST_REMOVE,
         DISCONNECT,
+        SHAPER_RESET,
     ];
 
     /// Whether `k` is a known event kind (used to reject `?kind=` junk with 400).

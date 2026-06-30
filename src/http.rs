@@ -1536,6 +1536,97 @@ async fn admin_device_disconnect(
     Ok(HttpResponse::NoContent().finish())
 }
 
+/// Reset a client's shaper byte counter by removing its active-lease IP(s) from the
+/// `shaper` ipset. The counter lives on the ipset entry, so dropping the entry zeroes
+/// it (`client_get` then reports `bytes_sent` 0). The client keeps internet access
+/// (stays in `acl`) and is re-added to `shaper` with a fresh counter on its next
+/// registration. Does NOT change the shaping class — the byte counter is observational
+/// in this backend (no byte quota); resetting it only affects the indicator/metrics.
+#[post("/api/v1/admin/devices/{mac}/reset-shaper-counter")]
+async fn admin_device_reset_shaper_counter(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    req: HttpRequest,
+    path: web::Path<String>,
+) -> Result<HttpResponse, APIError> {
+    let admin_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
+    let mac = normalize_mac(&path.into_inner()).ok_or(APIError::BadRequest)?;
+    let (leases_path, shaper, history) = {
+        let s = state.lock().await;
+        let c = s.config();
+        (
+            c.dhcpd_leases.clone(),
+            c.ipset_shaper_name.clone(),
+            s.history().cloned(),
+        )
+    };
+
+    let mac_q = mac.clone();
+    // Returns: (read_ok, IPs that were in shaper [del attempted], any del failed).
+    let (read_ok, reset_ips, any_err) = tokio::task::spawn_blocking(move || {
+        let leases = match active_lease_ips(&leases_path) {
+            Ok(m) => m,
+            Err(e) => {
+                error!("reset-shaper: failed to read leases: {e:#}");
+                return (false, Vec::new(), false);
+            }
+        };
+        let set = crate::ipset::IPSet::new(&shaper);
+        let members: HashSet<String> = match set.entries() {
+            Ok(es) => es.into_iter().map(|e| e.ip).collect(),
+            Err(e) => {
+                error!("reset-shaper: failed to read shaper set {shaper}: {e:#}");
+                return (false, Vec::new(), false);
+            }
+        };
+        // Only the MAC's live IPs that are actually in shaper (del is idempotent, but
+        // we report exactly what was reset and 404 when nothing matched).
+        let reset_ips: Vec<String> = match leases.get(&mac_q) {
+            Some(ips) => ips
+                .iter()
+                .filter(|ip| members.contains(ip.as_str()))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
+        let mut any_err = false;
+        for ip in &reset_ips {
+            if let Err(e) = set.del(ip) {
+                error!("reset-shaper: ipset del {shaper} {ip} failed: {e:#}");
+                any_err = true;
+            }
+        }
+        (true, reset_ips, any_err)
+    })
+    .await
+    .map_err(|err| {
+        error!("reset-shaper task panicked: {err}");
+        APIError::InternalError
+    })?;
+
+    if !read_ok {
+        return Err(APIError::InternalError); // couldn't read leases or the shaper set
+    }
+    if reset_ips.is_empty() {
+        return Err(APIError::NotFound); // no live IP of this MAC is in shaper
+    }
+    // Audit the attempt regardless of partial failure (the dels that DID succeed
+    // already took effect).
+    info!(
+        "Admin reset shaper counter mac={mac} ips={reset_ips:?} from {admin_ip} (errors={any_err})"
+    );
+    crate::history::record_event_best_effort(
+        history.as_deref(),
+        crate::history::kind::SHAPER_RESET,
+        Some(&mac),
+        Some(&reset_ips.join(",")),
+    );
+    if any_err {
+        return Err(APIError::InternalError);
+    }
+    Ok(HttpResponse::NoContent().finish())
+}
+
 // --- WAN history + event log (require the optional `history` store) ---
 
 /// Default look-back window for the WAN series when `from` is omitted. Independent
