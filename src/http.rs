@@ -2136,11 +2136,22 @@ async fn unlimited_create(
     // a client whose side effects didn't land.
     let mut desired = ctx.store.list().await;
     desired.push(client.clone());
-    if let Err(err) =
-        crate::dhcp_hosts::apply(&dr, &crate::dhcp_hosts::render(&desired, ctx.params.flavor)).await
+    match crate::dhcp_hosts::apply(&dr, &crate::dhcp_hosts::render(&desired, ctx.params.flavor))
+        .await
     {
-        error!("dhcp reservation apply failed: {err}");
-        return Err(APIError::InternalError);
+        // Daemon deliberately down (cutover window): the reservation is left pending
+        // for the next reconcile. ipset + store still proceed (store is the source of
+        // truth); surface it so the deferral isn't silent.
+        Ok(crate::dhcp_hosts::Applied::SkippedInactive) => warn!(
+            "unlimited create {}: DHCP reload skipped (daemon inactive) — reservation \
+             pending until reconcile",
+            client.ip
+        ),
+        Ok(_) => {}
+        Err(err) => {
+            error!("dhcp reservation apply failed: {err}");
+            return Err(APIError::InternalError);
+        }
     }
     if let Err(err) = no_shape.add(&client.ip, Some(0)) {
         error!("ipset add no_shape failed: {err}");
@@ -2208,14 +2219,22 @@ async fn unlimited_delete(
             .into_iter()
             .filter(|c| c.name != client.name)
             .collect();
-        if let Err(err) = crate::dhcp_hosts::apply(
+        match crate::dhcp_hosts::apply(
             dr,
             &crate::dhcp_hosts::render(&remaining, ctx.params.flavor),
         )
         .await
         {
-            error!("dhcp reservation apply (delete) failed: {err}");
-            return Err(APIError::InternalError);
+            Ok(crate::dhcp_hosts::Applied::SkippedInactive) => warn!(
+                "unlimited delete {}: DHCP reload skipped (daemon inactive) — removal \
+                 pending until reconcile",
+                client.name
+            ),
+            Ok(_) => {}
+            Err(err) => {
+                error!("dhcp reservation apply (delete) failed: {err}");
+                return Err(APIError::InternalError);
+            }
         }
     }
     let no_shape = crate::ipset::IPSet::new(&ctx.no_shape_name);

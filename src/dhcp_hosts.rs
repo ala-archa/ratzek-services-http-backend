@@ -1,14 +1,21 @@
-//! Manage dhcpd `host` reservations for unlimited clients via a generated
-//! include file, instead of OMAPI/omshell (which is unreliable on this box — an
-//! internal omshell threading race makes connects fail ~90% of the time, and the
-//! OMAPI model can't represent one MAC with two reservations).
+//! Manage DHCP reservations for unlimited clients via a generated file, instead of
+//! OMAPI/omshell (which is unreliable on this box — an internal omshell threading
+//! race makes connects fail ~90% of the time, and the OMAPI model can't represent
+//! one MAC with two reservations).
 //!
-//! The backend owns one include file (referenced by `include "...";` in
-//! `dhcpd.conf`), regenerates it from the unlimited-clients store on every CRUD
-//! change and on startup reconcile, validates the config with `dhcpd -t`, then
-//! restarts dhcpd. The store is the single source of truth; the file is derived.
+//! The backend owns one reservation file, regenerates it from the unlimited-clients
+//! store (the single source of truth) on every CRUD change and on startup reconcile,
+//! validates the config, then reloads the daemon. [`render`] emits the flavor's
+//! format (ISC `host {}` include vs dnsmasq `MAC,IP,name` hostsfile); [`apply`]
+//! writes + validates + reloads with rollback.
+//!
+//! Two optional [`DhcpReservations`] knobs support the ISC→dnsmasq migration (both
+//! `None` = historical ISC behaviour): `active_unit` (skip the reload when the
+//! daemon is deliberately down, so a cutover reconcile can't revive it) and
+//! `reload_log` (scrape the daemon log after reload — dnsmasq applies a hostsfile
+//! silently on SIGHUP, so `dnsmasq --test` can't catch a rejected reservation).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use slog_scope::{error, info, warn};
 
 use crate::config::DhcpReservations;
@@ -18,12 +25,15 @@ use crate::unlimited_clients::UnlimitedClient;
 /// never block the async worker indefinitely.
 const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Outcome of [`apply`]: whether dhcpd actually had to be restarted.
+/// Outcome of [`apply`]: whether the DHCP daemon actually had to be reloaded.
 #[must_use]
 #[derive(Debug, PartialEq, Eq)]
 pub enum Applied {
     Changed,
     Unchanged,
+    /// The configured `active_unit` was inactive, so the reload was skipped (the
+    /// change is left pending for the next reconcile). See `DhcpReservations::active_unit`.
+    SkippedInactive,
 }
 
 /// Render the include-file content from the store. Deterministic (sorted by
@@ -100,10 +110,18 @@ pub fn render(clients: &[UnlimitedClient], flavor: crate::dhcp::Flavor) -> Strin
     out
 }
 
-/// Write `content` to the include file, validate the dhcpd config, then restart
-/// dhcpd. No-ops (no restart) when the file already matches `content`. On a
-/// validation or restart failure the previous file content is restored so dhcpd
-/// is never left referencing a broken include.
+/// Write `content` to the reservation file, validate the config, then reload the
+/// daemon. No-ops ([`Applied::Unchanged`]) when the file already matches `content`.
+///
+/// Three outcomes: `Unchanged`, `Changed` (written + reloaded), and
+/// `SkippedInactive` (a configured `active_unit` was down — the change is left
+/// pending, nothing written or reloaded).
+///
+/// # Errors
+/// Returns an error (with the file always rolled back to its prior content) when:
+/// validation fails; the reload command fails; or, under `reload_log`, the daemon
+/// log reports a rejected reservation after the reload. Error messages flag the
+/// rare case where the rollback itself failed and the file is left broken.
 pub async fn apply(cfg: &DhcpReservations, content: &str) -> Result<Applied> {
     let path = &cfg.include_path;
     // Read the current include carefully: a missing file is a legitimate "no
@@ -120,6 +138,19 @@ pub async fn apply(cfg: &DhcpReservations, content: &str) -> Result<Applied> {
 
     if previous.as_deref() == Some(content) {
         return Ok(Applied::Unchanged);
+    }
+
+    // isc-guard: never (re)start a daemon that is deliberately stopped (cutover
+    // window). Leave the change pending — the next reconcile heals it once the
+    // flavor snapshot flips to dnsmasq.
+    if let Some(unit) = &cfg.active_unit {
+        if !unit_is_active(unit).await {
+            warn!(
+                "dhcp reservations: reload target {unit:?} is inactive — skipping apply \
+                 (pending until next reconcile)"
+            );
+            return Ok(Applied::SkippedInactive);
+        }
     }
 
     write_file(path, content)
@@ -142,45 +173,163 @@ pub async fn apply(cfg: &DhcpReservations, content: &str) -> Result<Applied> {
         }
     }
 
+    // For the dnsmasq post-reload scrape: note where the log ends BEFORE the reload
+    // so we only read lines the reload itself emits. `Some` iff a scrape is configured.
+    let scrape_from = cfg.reload_log.as_ref().map(|rl| log_len(&rl.file));
+
     if let Err(err) = run_cmd(&cfg.reload_command).await {
-        // Roll the file back and try once more to bring dhcpd up on the old config.
-        let restored = restore(path, previous.as_deref());
-        let recovery = run_cmd(&cfg.reload_command).await;
-        if let Err(ref re) = recovery {
-            error!("dhcpd recovery reload after rollback FAILED — dhcpd may be DOWN: {re}");
-        }
-        match (restored, recovery) {
-            (Ok(()), Ok(())) => bail!(
-                "dhcpd reload ({:?}) failed; reverted include and dhcpd recovered: {err}",
-                cfg.reload_command
-            ),
-            (Ok(()), Err(re)) => bail!(
-                "dhcpd reload ({:?}) failed; reverted include but recovery reload also \
-                 FAILED — dhcpd may be DOWN: {err} (recovery error: {re})",
-                cfg.reload_command
-            ),
-            (Err(se), Ok(())) => {
-                error!("dhcp include restore after failed reload FAILED: {se}");
-                bail!(
-                    "dhcpd reload ({:?}) failed AND include restore failed — \
-                     include LEFT BROKEN: {err} (restore error: {se})",
-                    cfg.reload_command
-                );
-            }
-            (Err(se), Err(re)) => {
-                error!("dhcp include restore after failed reload FAILED: {se}");
-                bail!(
-                    "dhcpd reload ({:?}) failed; include restore FAILED (LEFT BROKEN) AND \
-                     recovery reload FAILED — dhcpd may be DOWN: {err} \
-                     (restore error: {se}, recovery error: {re})",
-                    cfg.reload_command
-                );
-            }
+        return Err(rollback(
+            cfg,
+            path,
+            previous.as_deref(),
+            format!("dhcp reload ({:?}) failed: {err}", cfg.reload_command),
+        )
+        .await);
+    }
+
+    // dnsmasq applies the hostsfile silently on SIGHUP — `validate` (dnsmasq --test)
+    // can't catch a bad reservation line. Scrape the log the reload just wrote; a
+    // rejected reservation (e.g. duplicate IP) means the daemon is now serving a
+    // reservation set that doesn't match our file, so roll fully back.
+    if let (Some(rl), Some(from)) = (&cfg.reload_log, scrape_from) {
+        if let Some(errline) = scrape_reload_log(rl, path, from).await {
+            return Err(rollback(
+                cfg,
+                path,
+                previous.as_deref(),
+                format!("dnsmasq rejected a reservation ({errline:?})"),
+            )
+            .await);
         }
     }
 
     info!("dhcp reservations applied ({} bytes)", content.len());
     Ok(Applied::Changed)
+}
+
+/// Restore the reservation file to `previous` and re-run the reload to bring the
+/// daemon back onto the known-good file. Only called on a failure path — always
+/// returns an error describing the combined (restore, recovery-reload) outcome,
+/// prefixed by `cause`. A failed recovery reload / restore is additionally `error!`d
+/// (the network may be left degraded).
+async fn rollback(
+    cfg: &DhcpReservations,
+    path: &std::path::Path,
+    previous: Option<&str>,
+    cause: String,
+) -> anyhow::Error {
+    let restored = restore(path, previous);
+    let recovery = run_cmd(&cfg.reload_command).await;
+    if let Err(ref re) = recovery {
+        error!(
+            "dhcp reservations recovery reload after rollback FAILED — daemon may be DOWN: {re}"
+        );
+    }
+    match (restored, recovery) {
+        (Ok(()), Ok(())) => anyhow!("{cause}; reverted the file and reloaded onto it"),
+        (Ok(()), Err(re)) => anyhow!(
+            "{cause}; reverted the file but the recovery reload FAILED — daemon may be DOWN: {re}"
+        ),
+        (Err(se), _) => {
+            error!("dhcp reservations file restore after rollback FAILED: {se}");
+            anyhow!("{cause}; AND the file restore FAILED — file LEFT BROKEN: {se}")
+        }
+    }
+}
+
+/// Current length of the log file in bytes (0 if absent/unreadable) — the scrape
+/// start offset captured before a reload.
+fn log_len(file: &std::path::Path) -> u64 {
+    std::fs::metadata(file).map(|m| m.len()).unwrap_or(0)
+}
+
+/// `systemctl is-active --quiet <unit>`, bounded by [`CMD_TIMEOUT`]. A spawn error
+/// OR a timeout counts as inactive (fail-safe: skip the reload rather than risk
+/// reviving a deliberately-stopped daemon, and never hang `apply()` on a wedged
+/// systemd — this runs under the reservation mutation lock).
+async fn unit_is_active(unit: &str) -> bool {
+    let fut = tokio::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", unit])
+        .kill_on_drop(true)
+        .status();
+    matches!(tokio::time::timeout(CMD_TIMEOUT, fut).await, Ok(Ok(s)) if s.success())
+}
+
+/// Poll interval for [`scrape_reload_log`].
+const SCRAPE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Poll the dnsmasq log (from byte `start`) for the outcome of a hostsfile reload.
+/// Returns `Some(line)` for a hostsfile-referencing error line (→ rollback), else
+/// `None` (clean). Each pass scans the WHOLE new region and lets an error win over
+/// the success marker regardless of their order. `None` also covers two fail-open
+/// cases — the marker never appearing within the bounded poll, and the log being
+/// unreadable — because the reload already succeeded and a false rollback of a good
+/// reservation is worse than a missed error. An unreadable log is `error!`d LOUDLY
+/// (the safety net is blind); a merely-missing marker only `warn!`s.
+async fn scrape_reload_log(
+    rl: &crate::config::ReloadLog,
+    hostsfile: &std::path::Path,
+    start: u64,
+) -> Option<String> {
+    let path_str = hostsfile.to_string_lossy();
+    let timeout_secs = rl.timeout_secs.max(1);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut read_failed = false;
+    loop {
+        match read_from(&rl.file, start) {
+            Ok(text) => {
+                let mut saw_success = false;
+                for line in text.lines() {
+                    if !line.contains(path_str.as_ref()) {
+                        continue;
+                    }
+                    if line.contains(&rl.error_contains) {
+                        return Some(line.to_string());
+                    }
+                    if line.contains(&rl.success_contains) {
+                        saw_success = true;
+                    }
+                }
+                if saw_success {
+                    return None;
+                }
+            }
+            Err(e) => {
+                if !read_failed {
+                    read_failed = true;
+                    error!(
+                        "dnsmasq reload scrape: cannot read log {:?}: {e} — rejected \
+                         reservations will NOT be detected (safety net blind)",
+                        rl.file
+                    );
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if !read_failed {
+                warn!(
+                    "dnsmasq reload scrape: no success/error marker for {:?} within {}s — \
+                     assuming clean",
+                    hostsfile, timeout_secs
+                );
+            }
+            return None;
+        }
+        tokio::time::sleep(SCRAPE_POLL_INTERVAL).await;
+    }
+}
+
+/// Read `file` from byte offset `start` to EOF. `Err` only on a real open/read
+/// failure (missing file, EACCES) — which lets the scraper log loudly when its log
+/// source is unreadable. A rotation shorter than `start` yields `Ok("")` (seeking
+/// past EOF is not an error on Linux), i.e. "no new lines yet".
+fn read_from(file: &std::path::Path, start: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek};
+    let mut f = std::fs::File::open(file)?;
+    f.seek(std::io::SeekFrom::Start(start))?;
+    let mut buf = String::new();
+    f.read_to_string(&mut buf)?;
+    Ok(buf)
 }
 
 fn write_file(path: &std::path::Path, content: &str) -> Result<()> {
@@ -314,6 +463,8 @@ mod tests {
             include_path: path,
             validate_command: validate.into(),
             reload_command: reload.into(),
+            active_unit: None,
+            reload_log: None,
         }
     }
 
@@ -420,6 +571,226 @@ mod tests {
         assert_eq!(apply(&c, &new).await.unwrap(), Applied::Changed);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), new);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn dnsmasq_reservation(name: &str, mac: &str, ip: &str) -> String {
+        render(&[client(name, mac, ip)], crate::dhcp::Flavor::Dnsmasq)
+    }
+
+    #[tokio::test]
+    async fn apply_skips_reload_when_active_unit_inactive() {
+        // isc-guard: an inactive `active_unit` must skip validate+reload entirely
+        // and leave the on-disk include untouched (change pending for reconcile).
+        let dir = std::env::temp_dir().join(format!("dh-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosts.conf");
+        let ran = dir.join("ran");
+        std::fs::write(&path, "OLD INCLUDE\n").unwrap();
+
+        let mut c = cfg(
+            path.clone(),
+            &format!("touch {}", ran.display()),
+            &format!("touch {}", ran.display()),
+        );
+        c.active_unit = Some("ratzek-nonexistent-guard-unit.service".to_string());
+
+        assert_eq!(
+            apply(&c, "NEW CONTENT\n").await.unwrap(),
+            Applied::SkippedInactive
+        );
+        assert!(
+            !ran.exists(),
+            "validate/reload must not run under the guard"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "OLD INCLUDE\n",
+            "include must be untouched when the reload target is inactive"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn apply_rolls_back_when_dnsmasq_logs_reservation_error() {
+        // dnsmasq reload succeeds (exit 0) but logs a rejected reservation -> the
+        // scrape must detect it and roll the hostsfile fully back.
+        let dir = std::env::temp_dir().join(format!("dh-scrape-err-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosts");
+        let log = dir.join("dnsmasq.log");
+        let old = dnsmasq_reservation("old", "aa:bb:cc:dd:ee:01", "10.11.5.2");
+        std::fs::write(&path, &old).unwrap();
+        std::fs::write(&log, "old startup line\n").unwrap();
+
+        // reload "succeeds" but appends a real dnsmasq error line for THIS hostsfile.
+        let reload = format!(
+            "printf 'dnsmasq[1]: duplicate dhcp-host IP address 10.11.5.3 at line 2 of {}\\n' >> {}",
+            path.display(),
+            log.display()
+        );
+        let mut c = cfg(path.clone(), "true", &reload);
+        c.reload_log = Some(crate::config::ReloadLog {
+            file: log.clone(),
+            success_contains: "read".into(),
+            error_contains: "at line".into(),
+            timeout_secs: 2,
+        });
+        let new = dnsmasq_reservation("new", "aa:bb:cc:dd:ee:02", "10.11.5.3");
+
+        assert!(
+            apply(&c, &new).await.is_err(),
+            "a logged reservation error must fail the apply"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            old,
+            "hostsfile must be rolled back after a scrape error"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn apply_keeps_change_when_scrape_sees_success_marker() {
+        let dir = std::env::temp_dir().join(format!("dh-scrape-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosts");
+        let log = dir.join("dnsmasq.log");
+        std::fs::write(
+            &path,
+            dnsmasq_reservation("old", "aa:bb:cc:dd:ee:01", "10.11.5.2"),
+        )
+        .unwrap();
+        std::fs::write(&log, "old startup line\n").unwrap();
+
+        // reload logs the clean "read <hostsfile>" completion marker, no error.
+        let reload = format!(
+            "printf 'dnsmasq-dhcp[1]: read {}\\n' >> {}",
+            path.display(),
+            log.display()
+        );
+        let mut c = cfg(path.clone(), "true", &reload);
+        c.reload_log = Some(crate::config::ReloadLog {
+            file: log.clone(),
+            success_contains: "read".into(),
+            error_contains: "at line".into(),
+            timeout_secs: 2,
+        });
+        let new = dnsmasq_reservation("new", "aa:bb:cc:dd:ee:02", "10.11.5.3");
+
+        assert_eq!(apply(&c, &new).await.unwrap(), Applied::Changed);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            new,
+            "hostsfile kept on a clean reload"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn dnsmasq_scrape_cfg(path: PathBuf, log: PathBuf, reload: &str) -> DhcpReservations {
+        let mut c = cfg(path, "true", reload);
+        c.reload_log = Some(crate::config::ReloadLog {
+            file: log,
+            success_contains: "read".into(),
+            error_contains: "at line".into(),
+            timeout_secs: 1,
+        });
+        c
+    }
+
+    #[tokio::test]
+    async fn apply_is_clean_when_scrape_times_out_without_marker() {
+        // Fail-open: reload succeeds but logs nothing about the hostsfile -> the
+        // change is kept (a false rollback of a good reservation is worse). This is
+        // the path where a bad reservation could slip through, so pin it.
+        let dir = std::env::temp_dir().join(format!("dh-scrape-to-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosts");
+        let log = dir.join("dnsmasq.log");
+        std::fs::write(
+            &path,
+            dnsmasq_reservation("old", "aa:bb:cc:dd:ee:01", "10.11.5.2"),
+        )
+        .unwrap();
+        std::fs::write(&log, "old line\n").unwrap();
+
+        let reload = format!("printf 'unrelated dnsmasq chatter\\n' >> {}", log.display());
+        let c = dnsmasq_scrape_cfg(path.clone(), log, &reload);
+        let new = dnsmasq_reservation("new", "aa:bb:cc:dd:ee:02", "10.11.5.3");
+
+        assert_eq!(apply(&c, &new).await.unwrap(), Applied::Changed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), new);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn apply_ignores_error_line_before_the_reload_offset() {
+        // An OLD error line (with our hostsfile path) already in the log, from a
+        // previous reload, must NOT trigger a rollback — the scrape reads only bytes
+        // after the pre-reload offset. Guards the offset mechanism itself.
+        let dir = std::env::temp_dir().join(format!("dh-scrape-off-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosts");
+        let log = dir.join("dnsmasq.log");
+        std::fs::write(
+            &path,
+            dnsmasq_reservation("old", "aa:bb:cc:dd:ee:01", "10.11.5.2"),
+        )
+        .unwrap();
+        // Stale error referencing OUR hostsfile, written before this apply.
+        std::fs::write(
+            &log,
+            format!(
+                "dnsmasq[1]: bad DHCP host name at line 3 of {}\n",
+                path.display()
+            ),
+        )
+        .unwrap();
+
+        let reload = format!(
+            "printf 'dnsmasq-dhcp[1]: read {}\\n' >> {}",
+            path.display(),
+            log.display()
+        );
+        let c = dnsmasq_scrape_cfg(path.clone(), log, &reload);
+        let new = dnsmasq_reservation("new", "aa:bb:cc:dd:ee:02", "10.11.5.3");
+
+        assert_eq!(
+            apply(&c, &new).await.unwrap(),
+            Applied::Changed,
+            "a stale error before the offset must not roll back"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), new);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn apply_ignores_reload_error_for_a_different_hostsfile() {
+        // dnsmasq logs into a shared log; an error for ANOTHER file must not roll our
+        // change back. The path filter is load-bearing.
+        let dir = std::env::temp_dir().join(format!("dh-scrape-other-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hosts");
+        let log = dir.join("dnsmasq.log");
+        std::fs::write(
+            &path,
+            dnsmasq_reservation("old", "aa:bb:cc:dd:ee:01", "10.11.5.2"),
+        )
+        .unwrap();
+        std::fs::write(&log, "old line\n").unwrap();
+
+        // error for a different file + success marker for OURS in the same reload.
+        let reload = format!(
+            "printf 'dnsmasq[1]: bad DHCP host name at line 1 of /etc/other-hosts\\n\
+             dnsmasq-dhcp[1]: read {}\\n' >> {}",
+            path.display(),
+            log.display()
+        );
+        let c = dnsmasq_scrape_cfg(path.clone(), log, &reload);
+        let new = dnsmasq_reservation("new", "aa:bb:cc:dd:ee:02", "10.11.5.3");
+
+        assert_eq!(apply(&c, &new).await.unwrap(), Applied::Changed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), new);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

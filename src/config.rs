@@ -77,6 +77,51 @@ pub struct DhcpReservations {
     /// Command that makes dhcpd load the regenerated include.
     #[serde(default = "default_dhcpd_reload_command")]
     pub reload_command: String,
+    /// Optional systemd unit that `apply()` verifies is `is-active` BEFORE running
+    /// `reload_command`; if inactive, the reload is skipped
+    /// (`Applied::SkippedInactive`) instead of (re)starting the daemon. Used during
+    /// the ISC→dnsmasq cutover so a stale reconcile under flavor=isc can't revive a
+    /// deliberately-stopped dhcpd (split-brain). Unset (default) → no guard.
+    #[serde(default)]
+    pub active_unit: Option<String>,
+    /// Optional post-reload log scrape. dnsmasq applies `dhcp-hostsfile` silently
+    /// (`dnsmasq --test` can NOT catch a bad reservation line), so under dnsmasq the
+    /// only way to detect a rejected reservation is to read its log after the SIGHUP
+    /// reload. A match triggers a full rollback. Unset (default) → no scrape (ISC).
+    #[serde(default)]
+    pub reload_log: Option<ReloadLog>,
+}
+
+/// Post-reload log scrape config (dnsmasq). The daemon must log to `file`
+/// (`log-facility=<file>` + `log-dhcp` in dnsmasq.conf).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ReloadLog {
+    /// Absolute path to the dnsmasq log file to scrape.
+    pub file: std::path::PathBuf,
+    /// Substring marking that the reload finished reading the hostsfile (stop
+    /// scraping once a line with the hostsfile path + this is seen). Default `read`.
+    #[serde(default = "default_reload_success_contains")]
+    pub success_contains: String,
+    /// Substring on a hostsfile-referencing line that signals a rejected
+    /// reservation (dnsmasq logs `… at line N of <file>`). Default `at line`.
+    #[serde(default = "default_reload_error_contains")]
+    pub error_contains: String,
+    /// Bounded poll timeout (seconds) waiting for the success marker, `1..=60`
+    /// (it runs under the reservation mutation lock). Default 3.
+    #[serde(default = "default_reload_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_reload_success_contains() -> String {
+    "read".to_string()
+}
+
+fn default_reload_error_contains() -> String {
+    "at line".to_string()
+}
+
+fn default_reload_timeout_secs() -> u64 {
+    3
 }
 
 fn default_device_metrics_crontab() -> String {
@@ -237,6 +282,30 @@ impl Config {
                 anyhow::bail!(
                     "dhcp_reservations.validate_command and reload_command must be non-empty"
                 );
+            }
+            if let Some(rl) = &dr.reload_log {
+                if !std::path::Path::new(&rl.file).is_absolute() {
+                    anyhow::bail!(
+                        "dhcp_reservations.reload_log.file must be absolute, got {:?}",
+                        rl.file
+                    );
+                }
+                // Empty markers are footguns: an empty error_contains matches EVERY
+                // line (constant false rollback → network churn); an empty
+                // success_contains matches immediately (scrape never detects errors).
+                if rl.success_contains.trim().is_empty() || rl.error_contains.trim().is_empty() {
+                    anyhow::bail!(
+                        "dhcp_reservations.reload_log.success_contains and error_contains \
+                         must be non-empty"
+                    );
+                }
+                // Bound the scrape: it runs under the reservation mutation lock.
+                if rl.timeout_secs == 0 || rl.timeout_secs > 60 {
+                    anyhow::bail!(
+                        "dhcp_reservations.reload_log.timeout_secs must be in 1..=60, got {}",
+                        rl.timeout_secs
+                    );
+                }
             }
         }
 

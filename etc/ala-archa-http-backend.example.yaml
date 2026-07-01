@@ -57,6 +57,21 @@ blacklist_path: /var/lib/ala-archa-http-backend/blacklist.yaml
 #   include_path: /etc/dhcp/unlimited-hosts.conf      # absolute; backend owns/rewrites it
 #   validate_command: "dhcpd -t"                       # must fail on an invalid config
 #   reload_command: "systemctl restart isc-dhcp-server"
+#   # --- ISC→dnsmasq migration knobs (both optional; unset = current ISC behaviour) ---
+#   # active_unit: if set, apply() verifies this unit is `is-active` BEFORE reload and
+#   # skips the reload when it's down (so a stale reconcile can't revive a stopped
+#   # dhcpd during cutover). Set to isc-dhcp-server while arming the cutover.
+#   # active_unit: isc-dhcp-server
+#   # reload_log: under dnsmasq, `validate` (dnsmasq --test) can NOT catch a bad
+#   # reservation line, so after reload the backend scrapes the daemon log; a match
+#   # rolls the hostsfile fully back. Requires `log-dhcp` + `log-facility=<file>` in
+#   # dnsmasq.conf. Under dnsmasq set include_path->hostsfile, validate_command->
+#   # "dnsmasq --test -C /etc/ratzek-dnsmasq.conf", reload_command->"systemctl reload dnsmasq-ratzek".
+#   # reload_log:
+#   #   file: /var/log/ratzek-dnsmasq.log   # absolute; the dnsmasq log-facility target
+#   #   success_contains: "read"            # marks reload completion (default)
+#   #   error_contains: "at line"           # a hostsfile line with this = rejected (default)
+#   #   timeout_secs: 3                      # bounded scrape poll (default)
 
 # device_metrics: optional per-device metrics (first/last seen, accumulated traffic,
 # IP history) sampled periodically from dhcpd leases + ipset counters into SQLite and

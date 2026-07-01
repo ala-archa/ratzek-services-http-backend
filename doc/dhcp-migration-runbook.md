@@ -60,12 +60,13 @@ hostname-колонку, если клиент не прислал своё. `pa
 `f[1]`=mac, `f[2]`=ip, `f[3]`=hostname (`*`→None), `f[4]`=clientid (игнорируем). IPv6-строки
 (`duid …` header + не-dotted адрес) пропускаются. **Правок в парсере не требуется.**
 
-### 1.4 journald-курсор (для скрейпа на проде)
-В контейнере лог писался в файл (`log-facility=<path>`) — тогда скрейп просто читает хвост файла.
-На проде dnsmasq логирует в syslog→journald. Курсор до старта:
-`journalctl -u dnsmasq --show-cursor -n1 -o export | grep -oP '(?<=__CURSOR=).*'` (у `-n0` вывод
-пуст → берём `-n1`). Затем после reload: `journalctl -u dnsmasq --after-cursor=<cur> --no-pager`.
-Config-поля `apply()`: `log_unit` (journald-юнит) ИЛИ `cursor_file`/файл лога + `error_regex`.
+### 1.4 Реализация скрейпа — файловая (не journald)
+Скрейп сделан **файловым** (детерминированно, без journald-курсора): dnsmasq пишет в
+`log-facility=/var/log/ratzek-dnsmasq.log`; `apply()` запоминает длину файла ДО reload, после
+reload читает только новые байты и полл'ит (bounded ~timeout_secs) до маркера. Скоуп — строки,
+содержащие путь hostsfile: `error_contains` (`at line`) → rollback; `success_contains` (`read`)
+→ чисто. Config: `dhcp_reservations.reload_log{ file, success_contains, error_contains,
+timeout_secs }` (см. §5).
 
 ---
 
@@ -106,7 +107,9 @@ dhcp-host=e4:5f:01:ed:d5:56,10.11.5.1,ratzek-service-ether
 # backend-owned unlimited-client reservations (the 15), SIGHUP reload, no restart
 dhcp-hostsfile=/etc/dnsmasq.d/unlimited-hosts
 dhcp-leasefile=/var/lib/misc/dnsmasq.leases
+# logging -> a FILE the backend apply() scrapes for rejected reservations (§1.2/§5).
 log-dhcp
+log-facility=/var/log/ratzek-dnsmasq.log
 ```
 
 **НЕ трогаем:** BIND (:53), iptables/ipset, маршруты, openvpn, WAN, адреса `.1`.
@@ -172,16 +175,24 @@ WantedBy=timers.target
 
 ---
 
-## 5. Осталось в коде (0.1.26, инертно под isc) — по эмпирике §1
+## 5. Код 0.1.26 — РЕАЛИЗОВАНО (инертно под isc), по эмпирике §1
 
-- `apply()` dnsmasq-ветка: `validate=dnsmasq --test`; `reload=systemctl reload dnsmasq-ratzek`;
-  **после** — курсорный скрейп (§1.2/§1.4): default `error_regex=at line [0-9]+ of <hostsfile>`,
-  completion-маркер `read <hostsfile>`; при совпадении — rollback (restore+reload).
-- isc-guard: перед `restart isc` проверять `is-active isc` → `Applied::SkippedIscInactive`
-  (`warn!`+alarm, без restore).
-- Config-блок `dnsmasq{ hostsfile_path, validate_command, reload_command, log_unit, cursor_file,
-  error_regex }` (всё опц.; ветка живёт только при flavor=dnsmasq → деплой инертен).
-- Тест: `reload=0` + грязный лог → rollback. Bump 0.1.26. Задеплоить (инертно), соакнуть.
+Реализация — через опц. поля на существующем `dhcp_reservations` (без отдельного блока), обе
+`None` по умолчанию → текущее ISC-поведение (флейвор в `apply()` не нужен):
+- **isc-guard** `dhcp_reservations.active_unit: Option<String>` — если задан, `apply()` проверяет
+  `systemctl is-active <unit>` ПЕРЕД reload; inactive → `Applied::SkippedInactive` (warn, без
+  restart/restore; изменение pending до следующего reconcile). На окно арминга ставится
+  `active_unit: isc-dhcp-server`.
+- **скрейп** `dhcp_reservations.reload_log{ file, success_contains="read", error_contains="at line",
+  timeout_secs=3 }` — после успешного reload читает новые байты `file` от offset'а (снятого до
+  reload), скоуп по строкам с путём hostsfile; `error_contains` → полный rollback (restore+reload),
+  `success_contains` → чисто. Таймаут без маркера → чисто + warn.
+- **Под dnsmasq** `dhcp_reservations` перенастраивается: `include_path`→hostsfile,
+  `validate_command`→`dnsmasq --test -C /etc/ratzek-dnsmasq.conf`, `reload_command`→
+  `systemctl reload dnsmasq-ratzek`, `reload_log.file`→`/var/log/ratzek-dnsmasq.log`, `active_unit`
+  снят.
+- Тесты: guard-skip; scrape error→rollback; scrape success→Changed. Bump 0.1.26.
+  Деплой инертен (обе опции None на проде) → соакнуть.
 
 ---
 
