@@ -523,11 +523,6 @@ impl State {
         &self.config
     }
 
-    /// DHCP server flavor resolved at startup (for reservation rendering).
-    pub fn dhcp_flavor(&self) -> crate::dhcp::Flavor {
-        self.dhcp_flavor
-    }
-
     /// Lease-parsing inputs (flavor + lease length) bundled for `Dhcp::read`.
     pub fn dhcp_params(&self) -> crate::dhcp::DhcpParams {
         crate::dhcp::DhcpParams {
