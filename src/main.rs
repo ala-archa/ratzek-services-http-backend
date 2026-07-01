@@ -52,6 +52,15 @@ enum CommandLine {
         /// Path to the existing dhcpd.conf to read host reservations from
         dhcpd_conf: String,
     },
+    /// Render the unlimited-clients store as a dnsmasq `--dhcp-hostsfile` and write
+    /// it to `--out`. Used during the ISC→dnsmasq cutover to pre-populate the
+    /// reservations BEFORE dnsmasq starts (regardless of the detected flavor), so no
+    /// reserved IP can be handed to a dynamic client in the start→reconcile window.
+    RenderDnsmasqHostsfile {
+        /// Absolute path to write the hostsfile to.
+        #[clap(long)]
+        out: String,
+    },
 }
 
 /// Ala-Archa HTTP backend
@@ -159,6 +168,16 @@ impl Application {
                 Ok(())
             }
             CommandLine::MigrateUnlimited { dhcpd_conf } => migrate_unlimited(&config, dhcpd_conf),
+            CommandLine::RenderDnsmasqHostsfile { out } => {
+                let store =
+                    unlimited_clients::UnlimitedClientsStore::load(&config.unlimited_clients_path)?;
+                let clients = store.list().await;
+                let content = dhcp_hosts::render(&clients, dhcp::Flavor::Dnsmasq);
+                std::fs::write(out, &content)
+                    .with_context(|| format!("failed to write hostsfile {:?}", out))?;
+                eprintln!("Wrote {} reservation(s) to {:?}", clients.len(), out);
+                Ok(())
+            }
             CommandLine::Get(GetCommand::Balance) => {
                 let state = crate::state::State::new(&config).await?;
                 let state_guard = state.lock().await;

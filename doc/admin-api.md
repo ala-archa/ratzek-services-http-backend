@@ -483,6 +483,11 @@ dhcpd) и `tstp` — **оба unix-секунды (i64, UTC)** или `null`, е
 ```jsonc
 { "ip": "10.11.4.50", "last_seen": 1748767397, "tstp": 1748810597, "acl": null, "shaper": null }
 ```
+> **Под dnsmasq** (после миграции DHCP-сервера, `dhcp_flavor: dnsmasq`) формат аренд беднее ISC:
+> `client_hostname`/`vendor_class_identifier`/`starts`/`ends` всегда `null`; `last_seen` —
+> **приближение** `expiry − dhcp_lease_secs` (у dnsmasq нет cltt); `tstp` = момент истечения аренды.
+> Счётчики `free`/`abandoned` в `/admin/status` под dnsmasq обычно `0` (истёкшие аренды вычищаются;
+> редкая невычищенная истёкшая попадёт в `free`).
 > `starts`/`ends` пока **остаются строками** (легаси-формат dhcpd, показывать «как есть»);
 > перевод на epoch — отдельный аддитивный пункт (новые `starts_at`/`ends_at`), если понадобится.
 

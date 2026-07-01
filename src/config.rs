@@ -189,6 +189,20 @@ pub struct Config {
     pub device_metrics: Option<DeviceMetricsConfig>,
     #[serde(default)]
     pub history: Option<HistoryConfig>,
+    /// Which DHCP server backs the lease/reservation integration. `auto` (default)
+    /// detects the active daemon at startup; the inert migration deploy keeps ISC
+    /// behaviour until dnsmasq is the active daemon.
+    #[serde(default)]
+    pub dhcp_flavor: crate::dhcp::FlavorSetting,
+    /// Configured DHCP lease length in seconds. Only used to approximate `last_seen`
+    /// under dnsmasq (whose lease file lacks a client-last-transaction timestamp).
+    /// Keep in sync with the server's lease time (ISC/dnsmasq default 12h = 43200).
+    #[serde(default = "default_dhcp_lease_secs")]
+    pub dhcp_lease_secs: i64,
+}
+
+fn default_dhcp_lease_secs() -> i64 {
+    43_200
 }
 
 impl Config {
@@ -254,6 +268,12 @@ impl Config {
             if h.retention_days < 0 {
                 anyhow::bail!("history.retention_days must be >= 0");
             }
+        }
+
+        // A non-positive lease length would make the dnsmasq `last_seen` approximation
+        // (`expiry - dhcp_lease_secs`) land in the future / past the expiry.
+        if self.dhcp_lease_secs <= 0 {
+            anyhow::bail!("dhcp_lease_secs must be > 0, got {}", self.dhcp_lease_secs);
         }
 
         Ok(())

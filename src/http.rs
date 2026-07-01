@@ -8,8 +8,6 @@ use actix_web::{
     web::{self, Data},
     HttpRequest, HttpResponse,
 };
-use dhcpd_parser::leases::BindingState;
-use dhcpd_parser::parser::LeasesMethods;
 use serde::{Deserialize, Serialize};
 use slog_scope::{error, info, warn};
 use tokio::sync::Mutex;
@@ -92,7 +90,11 @@ where
 
     let dhcp_lease = {
         let state = state.lock().await;
-        match crate::dhcp::Dhcp::of_ip(&state.config().dhcpd_leases, &client_ip) {
+        match crate::dhcp::Dhcp::of_ip(
+            &state.config().dhcpd_leases,
+            state.dhcp_params(),
+            &client_ip,
+        ) {
             Ok(v) => v,
             Err(err) => {
                 error!("{}", err);
@@ -101,8 +103,8 @@ where
         }
     };
 
-    let client_mac = match dhcp_lease.hardware {
-        Some(v) => v.mac.to_lowercase(),
+    let client_mac = match dhcp_lease.mac {
+        Some(v) => v.to_lowercase(),
         None => {
             error!("Client's MAC not defined in DHCP leases file");
             return Err(APIError::InternalError);
@@ -299,35 +301,28 @@ async fn dhcp_leases(
             APIError::InternalError
         })?;
 
-    let mut items: Vec<DhcpRecord> = crate::dhcp::Dhcp::read(&state.config().dhcpd_leases)
-        .map_err(|err| {
-            error!("failed to read DHCP leases: {err}");
-            APIError::InternalError
-        })?
-        .all()
-        .into_iter()
-        .map(|lease| DhcpRecord {
-            mac: lease.hardware.map(|v| v.mac),
-            hostname: lease.hostname,
-            client_hostname: lease.client_hostname,
-            vendor_class_identifier: lease.vendor_class_identifier,
-            starts: lease.dates.starts.map(|v| v.to_string()),
-            ends: lease.dates.ends.map(|v| v.to_string()),
-            last_seen: lease
-                .dates
-                .cltt
-                .as_ref()
-                .and_then(crate::dhcp::date_to_epoch),
-            tstp: lease
-                .dates
-                .tstp
-                .as_ref()
-                .and_then(crate::dhcp::date_to_epoch),
-            acl: acl_entries.iter().find(|e| e.ip == lease.ip).cloned(),
-            shaper: shaper_entries.iter().find(|e| e.ip == lease.ip).cloned(),
-            ip: lease.ip,
-        })
-        .collect();
+    let mut items: Vec<DhcpRecord> =
+        crate::dhcp::Dhcp::read(&state.config().dhcpd_leases, state.dhcp_params())
+            .map_err(|err| {
+                error!("failed to read DHCP leases: {err}");
+                APIError::InternalError
+            })?
+            .all()
+            .into_iter()
+            .map(|lease| DhcpRecord {
+                mac: lease.mac,
+                hostname: lease.hostname,
+                client_hostname: lease.client_hostname,
+                vendor_class_identifier: lease.vendor,
+                starts: lease.starts,
+                ends: lease.ends,
+                last_seen: lease.cltt,
+                tstp: lease.tstp,
+                acl: acl_entries.iter().find(|e| e.ip == lease.ip).cloned(),
+                shaper: shaper_entries.iter().find(|e| e.ip == lease.ip).cloned(),
+                ip: lease.ip,
+            })
+            .collect();
 
     // Domain filters (for the admin "pick an IP" form).
     if let Some(prefix) = &ip_prefix {
@@ -417,19 +412,20 @@ async fn collect_status(state: &State) -> Result<AdminStatus, APIError> {
     let clients_in_acl = count_set(&cfg.ipset_acl_name)?;
     let clients_in_shaper = count_set(&cfg.ipset_shaper_name)?;
 
-    let leases = crate::dhcp::Dhcp::read(&cfg.dhcpd_leases)
+    let leases = crate::dhcp::Dhcp::read(&cfg.dhcpd_leases, state.dhcp_params())
         .map_err(|err| {
             error!("failed to read DHCP leases: {err}");
             APIError::InternalError
         })?
         .all();
-    let count = |s: dhcpd_parser::leases::BindingState| {
-        leases.iter().filter(|v| v.binding_state == s).count()
-    };
+    let count =
+        |s: crate::dhcp::BindingState| leases.iter().filter(|v| v.binding_state == s).count();
+    // Under dnsmasq the lease file normally holds only active leases (expired ones
+    // are pruned), so free/abandoned are usually 0.
     let lease_counts = LeaseCounts {
-        free: count(dhcpd_parser::leases::BindingState::Free),
-        active: count(dhcpd_parser::leases::BindingState::Active),
-        abandoned: count(dhcpd_parser::leases::BindingState::Abandoned),
+        free: count(crate::dhcp::BindingState::Free),
+        active: count(crate::dhcp::BindingState::Active),
+        abandoned: count(crate::dhcp::BindingState::Abandoned),
     };
 
     // Device-metrics dashboard (best-effort: null on error/disabled).
@@ -452,11 +448,8 @@ async fn collect_status(state: &State) -> Result<AdminStatus, APIError> {
     // Stale reservations: unlimited client IPs actively leased to another MAC.
     let mut active_mac: HashMap<String, Option<String>> = HashMap::new();
     for l in &leases {
-        if l.binding_state == dhcpd_parser::leases::BindingState::Active {
-            active_mac.insert(
-                l.ip.clone(),
-                l.hardware.as_ref().and_then(|h| normalize_mac(&h.mac)),
-            );
+        if l.binding_state == crate::dhcp::BindingState::Active {
+            active_mac.insert(l.ip.clone(), l.mac.as_ref().and_then(|m| normalize_mac(m)));
         }
     }
     let stale_reservations = state
@@ -680,6 +673,7 @@ struct UnlimitedCtx {
     subnet: ipnet::IpNet,
     dhcp_reservations: Option<crate::config::DhcpReservations>,
     leases: std::path::PathBuf,
+    params: crate::dhcp::DhcpParams,
     no_shape_name: String,
     acl_name: String,
 }
@@ -691,6 +685,7 @@ fn unlimited_ctx(state: &State) -> UnlimitedCtx {
         subnet: c.parsed_unlimited_subnet(),
         dhcp_reservations: c.dhcp_reservations.clone(),
         leases: c.dhcpd_leases.clone(),
+        params: state.dhcp_params(),
         no_shape_name: c.ipset_no_shape_name.clone(),
         acl_name: c.ipset_acl_name.clone(),
     }
@@ -702,9 +697,11 @@ fn unlimited_ctx(state: &State) -> UnlimitedCtx {
 async fn revert_reservations(
     dr: &crate::config::DhcpReservations,
     store: &crate::unlimited_clients::UnlimitedClientsStore,
+    flavor: crate::dhcp::Flavor,
 ) {
     let clients = store.list().await;
-    if let Err(err) = crate::dhcp_hosts::apply(dr, &crate::dhcp_hosts::render(&clients)).await {
+    let content = crate::dhcp_hosts::render(&clients, flavor);
+    if let Err(err) = crate::dhcp_hosts::apply(dr, &content).await {
         error!("rollback: dhcp reservations revert failed: {err} (reconcile will heal)");
     }
 }
@@ -860,8 +857,11 @@ struct LeaseInfo {
 
 /// Build an `ip -> latest lease` map from the leases file (empty on error). The
 /// last lease block for an IP wins (most recent).
-fn read_leases_map(path: &std::path::Path) -> HashMap<String, LeaseInfo> {
-    let dhcp = match crate::dhcp::Dhcp::read(path) {
+fn read_leases_map(
+    path: &std::path::Path,
+    params: crate::dhcp::DhcpParams,
+) -> HashMap<String, LeaseInfo> {
+    let dhcp = match crate::dhcp::Dhcp::read(path, params) {
         Ok(d) => d,
         Err(err) => {
             error!("device enrichment: failed to read leases: {err}");
@@ -874,10 +874,10 @@ fn read_leases_map(path: &std::path::Path) -> HashMap<String, LeaseInfo> {
             (
                 l.ip.clone(),
                 LeaseInfo {
-                    mac: l.hardware.as_ref().and_then(|h| normalize_mac(&h.mac)),
-                    active: l.binding_state == BindingState::Active,
+                    mac: l.mac.as_ref().and_then(|m| normalize_mac(m)),
+                    active: l.binding_state == crate::dhcp::BindingState::Active,
                     hostname: l.hostname.clone(),
-                    vendor: l.vendor_class_identifier.clone(),
+                    vendor: l.vendor.clone(),
                 },
             )
         })
@@ -954,12 +954,13 @@ fn build_unlimited_view(
 async fn enrich_unlimited(
     clients: Vec<UnlimitedClient>,
     leases_path: std::path::PathBuf,
+    params: crate::dhcp::DhcpParams,
     metrics: Option<Arc<crate::device_metrics::DeviceMetricsStore>>,
     now: i64,
 ) -> Vec<UnlimitedClientView> {
     let macs: Vec<String> = clients.iter().map(|c| c.mac.clone()).collect();
     let (leases_map, metrics_map) = tokio::task::spawn_blocking(move || {
-        let leases_map = read_leases_map(&leases_path);
+        let leases_map = read_leases_map(&leases_path, params);
         let metrics_map = metrics
             .and_then(|m| {
                 m.get_many(&macs, now)
@@ -1050,16 +1051,17 @@ impl IpsetMembership {
 
 /// Build `normalized MAC -> current IPs` from active dhcpd leases (for live
 /// classification + disconnect). Blocking (file read) — call inside `spawn_blocking`.
-fn active_lease_ips(leases_path: &std::path::Path) -> anyhow::Result<HashMap<String, Vec<String>>> {
-    use dhcpd_parser::leases::BindingState;
-    use dhcpd_parser::parser::LeasesMethods;
-    let leases = crate::dhcp::Dhcp::read(leases_path)?;
+fn active_lease_ips(
+    leases_path: &std::path::Path,
+    params: crate::dhcp::DhcpParams,
+) -> anyhow::Result<HashMap<String, Vec<String>>> {
+    let leases = crate::dhcp::Dhcp::read(leases_path, params)?;
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for l in leases.all() {
-        if l.binding_state != BindingState::Active {
+        if l.binding_state != crate::dhcp::BindingState::Active {
             continue;
         }
-        if let Some(mac) = l.hardware.as_ref().and_then(|h| normalize_mac(&h.mac)) {
+        if let Some(mac) = l.mac.as_ref().and_then(|m| normalize_mac(m)) {
             let ips = map.entry(mac).or_default();
             if !ips.contains(&l.ip) {
                 ips.push(l.ip);
@@ -1071,8 +1073,11 @@ fn active_lease_ips(leases_path: &std::path::Path) -> anyhow::Result<HashMap<Str
 
 /// Best-effort variant for classification: a read failure logs and yields an empty
 /// map (degrades the flags instead of failing the listing).
-fn active_lease_ips_or_empty(leases_path: &std::path::Path) -> HashMap<String, Vec<String>> {
-    active_lease_ips(leases_path).unwrap_or_else(|e| {
+fn active_lease_ips_or_empty(
+    leases_path: &std::path::Path,
+    params: crate::dhcp::DhcpParams,
+) -> HashMap<String, Vec<String>> {
+    active_lease_ips(leases_path, params).unwrap_or_else(|e| {
         error!("device classification: failed to read leases: {e:#}");
         HashMap::new()
     })
@@ -1085,6 +1090,7 @@ struct ClassifyDeps {
     unlimited: crate::unlimited_clients::UnlimitedClientsStore,
     blacklist: crate::blacklist::BlacklistStore,
     leases_path: std::path::PathBuf,
+    params: crate::dhcp::DhcpParams,
     acl_name: String,
     shaper_name: String,
     no_shape_name: String,
@@ -1099,6 +1105,7 @@ impl ClassifyDeps {
             unlimited: s.unlimited_clients().clone(),
             blacklist: s.blacklist().clone(),
             leases_path: c.dhcpd_leases.clone(),
+            params: s.dhcp_params(),
             acl_name: c.ipset_acl_name.clone(),
             shaper_name: c.ipset_shaper_name.clone(),
             no_shape_name: c.ipset_no_shape_name.clone(),
@@ -1173,11 +1180,12 @@ async fn admin_devices(
         .map(|c| c.mac)
         .collect();
     let blacklisted = build_blacklisted_set(&deps.blacklist, &deps.config_macs).await;
-    let (acl_name, shaper_name, no_shape_name, leases_path) = (
+    let (acl_name, shaper_name, no_shape_name, leases_path, dhcp_params) = (
         deps.acl_name,
         deps.shaper_name,
         deps.no_shape_name,
         deps.leases_path,
+        deps.params,
     );
 
     let now = chrono::Utc::now().timestamp();
@@ -1187,7 +1195,7 @@ async fn admin_devices(
             Vec::new()
         });
         let membership = IpsetMembership::read(&acl_name, &shaper_name, &no_shape_name);
-        let lease_ips = active_lease_ips_or_empty(&leases_path);
+        let lease_ips = active_lease_ips_or_empty(&leases_path, dhcp_params);
         (rows, membership, lease_ips)
     })
     .await
@@ -1320,11 +1328,12 @@ async fn admin_device_detail(
     let is_blacklisted = build_blacklisted_set(&deps.blacklist, &deps.config_macs)
         .await
         .contains(&mac);
-    let (acl_name, shaper_name, no_shape_name, leases_path) = (
+    let (acl_name, shaper_name, no_shape_name, leases_path, dhcp_params) = (
         deps.acl_name,
         deps.shaper_name,
         deps.no_shape_name,
         deps.leases_path,
+        deps.params,
     );
 
     let now = chrono::Utc::now().timestamp();
@@ -1333,7 +1342,7 @@ async fn admin_device_detail(
         (
             metrics.device_detail(&mac_q, now, days),
             IpsetMembership::read(&acl_name, &shaper_name, &no_shape_name),
-            active_lease_ips_or_empty(&leases_path),
+            active_lease_ips_or_empty(&leases_path, dhcp_params),
         )
     })
     .await
@@ -1473,11 +1482,12 @@ async fn admin_device_disconnect(
 ) -> Result<HttpResponse, APIError> {
     let admin_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
     let mac = normalize_mac(&path.into_inner()).ok_or(APIError::BadRequest)?;
-    let (leases_path, acl, shaper, no_shape, history) = {
+    let (leases_path, params, acl, shaper, no_shape, history) = {
         let s = state.lock().await;
         let c = s.config();
         (
             c.dhcpd_leases.clone(),
+            s.dhcp_params(),
             c.ipset_acl_name.clone(),
             c.ipset_shaper_name.clone(),
             c.ipset_no_shape_name.clone(),
@@ -1488,7 +1498,7 @@ async fn admin_device_disconnect(
     let mac_q = mac.clone();
     // Returns: (read_ok, ips of this MAC, any del failed).
     let (read_ok, ips, any_err) = tokio::task::spawn_blocking(move || {
-        let leases = match active_lease_ips(&leases_path) {
+        let leases = match active_lease_ips(&leases_path, params) {
             Ok(m) => m,
             Err(e) => {
                 error!("disconnect: failed to read leases: {e:#}");
@@ -1551,11 +1561,12 @@ async fn admin_device_reset_shaper_counter(
 ) -> Result<HttpResponse, APIError> {
     let admin_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
     let mac = normalize_mac(&path.into_inner()).ok_or(APIError::BadRequest)?;
-    let (leases_path, shaper, history) = {
+    let (leases_path, params, shaper, history) = {
         let s = state.lock().await;
         let c = s.config();
         (
             c.dhcpd_leases.clone(),
+            s.dhcp_params(),
             c.ipset_shaper_name.clone(),
             s.history().cloned(),
         )
@@ -1564,7 +1575,7 @@ async fn admin_device_reset_shaper_counter(
     let mac_q = mac.clone();
     // Returns: (read_ok, IPs that were in shaper [del attempted], any del failed).
     let (read_ok, reset_ips, any_err) = tokio::task::spawn_blocking(move || {
-        let leases = match active_lease_ips(&leases_path) {
+        let leases = match active_lease_ips(&leases_path, params) {
             Ok(m) => m,
             Err(e) => {
                 error!("reset-shaper: failed to read leases: {e:#}");
@@ -1972,11 +1983,12 @@ async fn unlimited_list(
     let stale_filter = parse_bool_param(&query, "stale_reservation")?;
     let online_filter = parse_bool_param(&query, "online")?;
 
-    let (store, leases_path, metrics) = {
+    let (store, leases_path, dhcp_params, metrics) = {
         let s = state.lock().await;
         (
             s.unlimited_clients().clone(),
             s.config().dhcpd_leases.clone(),
+            s.dhcp_params(),
             s.device_metrics().cloned(),
         )
     };
@@ -1997,7 +2009,7 @@ async fn unlimited_list(
     // Enrich the whole (q-filtered) list — the set is small (~tens) — so the
     // metrics/lease-derived fields are available for filtering and sorting.
     let now = chrono::Utc::now().timestamp();
-    let mut views = enrich_unlimited(items, leases_path, metrics, now).await;
+    let mut views = enrich_unlimited(items, leases_path, dhcp_params, metrics, now).await;
 
     if let Some(want) = stale_filter {
         views.retain(|v| v.stale_reservation == want);
@@ -2031,18 +2043,20 @@ async fn unlimited_get(
     state: Data<Arc<Mutex<State>>>,
     path: web::Path<String>,
 ) -> Result<HttpResponse, APIError> {
-    let (store, leases_path, metrics) = {
+    let (store, leases_path, dhcp_params, metrics) = {
         let s = state.lock().await;
         (
             s.unlimited_clients().clone(),
             s.config().dhcpd_leases.clone(),
+            s.dhcp_params(),
             s.device_metrics().cloned(),
         )
     };
     match store.get(&path.into_inner()).await {
         Some(client) => {
             let now = chrono::Utc::now().timestamp();
-            let mut views = enrich_unlimited(vec![client], leases_path, metrics, now).await;
+            let mut views =
+                enrich_unlimited(vec![client], leases_path, dhcp_params, metrics, now).await;
             Ok(HttpResponse::Ok().json(views.remove(0)))
         }
         None => Err(APIError::NotFound),
@@ -2076,7 +2090,7 @@ async fn unlimited_create(
     }
 
     // Derive the MAC from a current, active lease for the requested IP.
-    let lease = match crate::dhcp::Dhcp::of_ip(&ctx.leases, &body.ip) {
+    let lease = match crate::dhcp::Dhcp::of_ip(&ctx.leases, ctx.params, &body.ip) {
         Ok(l) => l,
         Err(err) => {
             warn!(
@@ -2086,11 +2100,11 @@ async fn unlimited_create(
             return Err(APIError::BadRequest);
         }
     };
-    if lease.binding_state != BindingState::Active {
+    if lease.binding_state != crate::dhcp::BindingState::Active {
         warn!("Lease for {:?} is not active", body.ip);
         return Err(APIError::BadRequest);
     }
-    let mac = match lease.hardware.and_then(|h| normalize_mac(&h.mac)) {
+    let mac = match lease.mac.and_then(|m| normalize_mac(&m)) {
         Some(m) => m,
         None => {
             warn!("Lease for {:?} has no usable MAC", body.ip);
@@ -2122,26 +2136,28 @@ async fn unlimited_create(
     // a client whose side effects didn't land.
     let mut desired = ctx.store.list().await;
     desired.push(client.clone());
-    if let Err(err) = crate::dhcp_hosts::apply(&dr, &crate::dhcp_hosts::render(&desired)).await {
+    if let Err(err) =
+        crate::dhcp_hosts::apply(&dr, &crate::dhcp_hosts::render(&desired, ctx.params.flavor)).await
+    {
         error!("dhcp reservation apply failed: {err}");
         return Err(APIError::InternalError);
     }
     if let Err(err) = no_shape.add(&client.ip, Some(0)) {
         error!("ipset add no_shape failed: {err}");
-        revert_reservations(&dr, &ctx.store).await;
+        revert_reservations(&dr, &ctx.store, ctx.params.flavor).await;
         return Err(APIError::InternalError);
     }
     if let Err(err) = acl.add(&client.ip, Some(0)) {
         error!("ipset add acl failed: {err}");
         rollback_ipset(&no_shape, &client.ip);
-        revert_reservations(&dr, &ctx.store).await;
+        revert_reservations(&dr, &ctx.store, ctx.params.flavor).await;
         return Err(APIError::InternalError);
     }
     if let Err(err) = ctx.store.add(client.clone()).await {
         error!("unlimited store add failed: {err}");
         rollback_ipset(&acl, &client.ip);
         rollback_ipset(&no_shape, &client.ip);
-        revert_reservations(&dr, &ctx.store).await;
+        revert_reservations(&dr, &ctx.store, ctx.params.flavor).await;
         return Err(APIError::InternalError);
     }
 
@@ -2157,7 +2173,7 @@ async fn unlimited_create(
         .await
         .unwrap_or_else(|| client.clone());
     let metrics = { state.lock().await.device_metrics().cloned() };
-    let view = enrich_unlimited(vec![stored], ctx.leases.clone(), metrics, now)
+    let view = enrich_unlimited(vec![stored], ctx.leases.clone(), ctx.params, metrics, now)
         .await
         .remove(0);
     Ok(HttpResponse::Created().json(view))
@@ -2192,7 +2208,11 @@ async fn unlimited_delete(
             .into_iter()
             .filter(|c| c.name != client.name)
             .collect();
-        if let Err(err) = crate::dhcp_hosts::apply(dr, &crate::dhcp_hosts::render(&remaining)).await
+        if let Err(err) = crate::dhcp_hosts::apply(
+            dr,
+            &crate::dhcp_hosts::render(&remaining, ctx.params.flavor),
+        )
+        .await
         {
             error!("dhcp reservation apply (delete) failed: {err}");
             return Err(APIError::InternalError);

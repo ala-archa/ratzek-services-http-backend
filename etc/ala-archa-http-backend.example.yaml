@@ -16,6 +16,14 @@ speedtest:
 
 dhcpd_leases: /var/lib/dhcp/dhcpd.leases
 
+# DHCP server flavor for the lease/reservation integration. `auto` (default) detects
+# the active daemon (dnsmasq vs isc-dhcp-server) at startup; leave unset to auto-detect
+# (stays ISC until dnsmasq becomes the active daemon).
+# dhcp_flavor: auto            # auto | isc | dnsmasq
+# Lease length in seconds — only used to approximate `last_seen` under dnsmasq (whose
+# lease file lacks a client-last-transaction timestamp). Match the server's lease time.
+# dhcp_lease_secs: 43200
+
 persistent_state_path: /var/tmp/ala-archa-http-backend.state
 
 # Admin panel credentials (optional). Generate password_hash with:

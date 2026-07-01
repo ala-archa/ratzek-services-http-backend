@@ -39,14 +39,21 @@ pub enum Applied {
 /// records verbatim. Note dhcpd allows several `host` blocks to share a
 /// `hardware ethernet` (one device, two reservations on different subnets) —
 /// this renderer supports that natively.
-pub fn render(clients: &[UnlimitedClient]) -> String {
+pub fn render(clients: &[UnlimitedClient], flavor: crate::dhcp::Flavor) -> String {
+    // dnsmasq `dhcp-host` is IPv4-only in the `MAC,IP,name` form; ISC accepts any IP.
+    let ipv4_only = flavor == crate::dhcp::Flavor::Dnsmasq;
     let mut sorted: Vec<&UnlimitedClient> = clients
         .iter()
         .filter(|c| {
+            let ip_ok = if ipv4_only {
+                c.ip.parse::<std::net::Ipv4Addr>().is_ok()
+            } else {
+                c.ip.parse::<std::net::IpAddr>().is_ok()
+            };
             let safe = crate::unlimited_clients::is_valid_name(&c.name)
                 && crate::unlimited_clients::normalize_mac(&c.mac).as_deref()
                     == Some(c.mac.as_str())
-                && c.ip.parse::<std::net::IpAddr>().is_ok();
+                && ip_ok;
             if !safe {
                 warn!(
                     "dhcp render: skipping unsafe client record (name={:?}, mac={:?}, ip={:?})",
@@ -58,16 +65,37 @@ pub fn render(clients: &[UnlimitedClient]) -> String {
         .collect();
     sorted.sort_by_key(|c| c.name.as_str());
 
-    let mut out = String::from(
-        "# Managed by ala-archa-http-backend. DO NOT EDIT.\n\
-         # Regenerated from the unlimited-clients store on every CRUD change and\n\
-         # on startup. Referenced from dhcpd.conf via `include`.\n",
-    );
-    for c in sorted {
-        out.push_str(&format!(
-            "host {} {{\n  hardware ethernet {};\n  fixed-address {};\n}}\n",
-            c.name, c.mac, c.ip
-        ));
+    let mut out = match flavor {
+        // ISC header kept byte-identical to the pre-migration output so an inert
+        // deploy produces no spurious `apply()` diff / dhcpd reload.
+        crate::dhcp::Flavor::Isc => String::from(
+            "# Managed by ala-archa-http-backend. DO NOT EDIT.\n\
+             # Regenerated from the unlimited-clients store on every CRUD change and\n\
+             # on startup. Referenced from dhcpd.conf via `include`.\n",
+        ),
+        crate::dhcp::Flavor::Dnsmasq => String::from(
+            "# Managed by ala-archa-http-backend. DO NOT EDIT.\n\
+             # Regenerated from the unlimited-clients store; read via dhcp-hostsfile.\n",
+        ),
+    };
+    match flavor {
+        crate::dhcp::Flavor::Isc => {
+            // ISC include: `host <name> { hardware ethernet <mac>; fixed-address <ip>; }`.
+            // dhcpd allows several host blocks sharing a MAC (one device, two subnets).
+            for c in sorted {
+                out.push_str(&format!(
+                    "host {} {{\n  hardware ethernet {};\n  fixed-address {};\n}}\n",
+                    c.name, c.mac, c.ip
+                ));
+            }
+        }
+        crate::dhcp::Flavor::Dnsmasq => {
+            // dnsmasq `--dhcp-hostsfile` line: `MAC,IP,name` (no `dhcp-host=` prefix).
+            // All reservations are single-IP; one line per client.
+            for c in sorted {
+                out.push_str(&format!("{},{},{}\n", c.mac, c.ip, c.name));
+            }
+        }
     }
     out
 }
@@ -226,7 +254,7 @@ mod tests {
             client("bravo", "aa:bb:cc:dd:ee:02", "10.11.5.3"),
             client("alpha", "aa:bb:cc:dd:ee:01", "10.11.5.2"),
         ];
-        let out = render(&clients);
+        let out = render(&clients, crate::dhcp::Flavor::Isc);
         assert!(out.starts_with("# Managed by ala-archa-http-backend"));
         // sorted by name: alpha before bravo
         assert!(out.find("host alpha").unwrap() < out.find("host bravo").unwrap());
@@ -243,10 +271,26 @@ mod tests {
             client("dev", mac, "10.11.5.221"),
             client("dev-private", mac, "10.11.4.221"),
         ];
-        let out = render(&clients);
+        let out = render(&clients, crate::dhcp::Flavor::Isc);
         assert_eq!(out.matches(&format!("hardware ethernet {mac};")).count(), 2);
         assert!(out.contains("fixed-address 10.11.5.221;"));
         assert!(out.contains("fixed-address 10.11.4.221;"));
+    }
+
+    #[test]
+    fn render_dnsmasq_hostsfile_format() {
+        let clients = vec![
+            client("bravo", "aa:bb:cc:dd:ee:02", "10.11.5.3"),
+            client("alpha", "aa:bb:cc:dd:ee:01", "10.11.5.2"),
+        ];
+        let out = render(&clients, crate::dhcp::Flavor::Dnsmasq);
+        assert!(out.starts_with("# Managed by ala-archa-http-backend"));
+        // `MAC,IP,name`, no `dhcp-host=` prefix, no `host {`; sorted by name.
+        assert!(out.contains("aa:bb:cc:dd:ee:01,10.11.5.2,alpha\n"));
+        assert!(out.contains("aa:bb:cc:dd:ee:02,10.11.5.3,bravo\n"));
+        assert!(!out.contains("dhcp-host="));
+        assert!(!out.contains("host "));
+        assert!(out.find(",alpha").unwrap() < out.find(",bravo").unwrap());
     }
 
     #[test]
@@ -259,7 +303,10 @@ mod tests {
             client("a", "aa:bb:cc:dd:ee:01", "10.11.5.2"),
             client("b", "aa:bb:cc:dd:ee:02", "10.11.5.3"),
         ];
-        assert_eq!(render(&a), render(&b));
+        assert_eq!(
+            render(&a, crate::dhcp::Flavor::Isc),
+            render(&b, crate::dhcp::Flavor::Isc)
+        );
     }
 
     fn cfg(path: PathBuf, validate: &str, reload: &str) -> DhcpReservations {
@@ -277,7 +324,10 @@ mod tests {
         let path = dir.join("hosts.conf");
         // marker files prove the commands did/didn't run
         let ran = dir.join("ran");
-        let content = render(&[client("a", "aa:bb:cc:dd:ee:01", "10.11.5.2")]);
+        let content = render(
+            &[client("a", "aa:bb:cc:dd:ee:01", "10.11.5.2")],
+            crate::dhcp::Flavor::Isc,
+        );
         std::fs::write(&path, &content).unwrap();
 
         let c = cfg(path.clone(), &format!("touch {}", ran.display()), "true");
@@ -295,12 +345,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dh-fail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hosts.conf");
-        let old = render(&[client("old", "aa:bb:cc:dd:ee:01", "10.11.5.2")]);
+        let old = render(
+            &[client("old", "aa:bb:cc:dd:ee:01", "10.11.5.2")],
+            crate::dhcp::Flavor::Isc,
+        );
         std::fs::write(&path, &old).unwrap();
 
         // validate always fails -> the bad content must be reverted to `old`
         let c = cfg(path.clone(), "false", "true");
-        let new = render(&[client("new", "aa:bb:cc:dd:ee:02", "10.11.5.3")]);
+        let new = render(
+            &[client("new", "aa:bb:cc:dd:ee:02", "10.11.5.3")],
+            crate::dhcp::Flavor::Isc,
+        );
         assert!(apply(&c, &new).await.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
 
@@ -312,12 +368,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dh-reload-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hosts.conf");
-        let old = render(&[client("old", "aa:bb:cc:dd:ee:01", "10.11.5.2")]);
+        let old = render(
+            &[client("old", "aa:bb:cc:dd:ee:01", "10.11.5.2")],
+            crate::dhcp::Flavor::Isc,
+        );
         std::fs::write(&path, &old).unwrap();
 
         // validate passes but reload fails -> the new content must be rolled back.
         let c = cfg(path.clone(), "true", "false");
-        let new = render(&[client("new", "aa:bb:cc:dd:ee:02", "10.11.5.3")]);
+        let new = render(
+            &[client("new", "aa:bb:cc:dd:ee:02", "10.11.5.3")],
+            crate::dhcp::Flavor::Isc,
+        );
         assert!(apply(&c, &new).await.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
 
@@ -332,7 +394,10 @@ mod tests {
         // No pre-existing include; validation fails -> the freshly written file
         // must be removed, leaving no include behind.
         let c = cfg(path.clone(), "false", "true");
-        let new = render(&[client("a", "aa:bb:cc:dd:ee:01", "10.11.5.2")]);
+        let new = render(
+            &[client("a", "aa:bb:cc:dd:ee:01", "10.11.5.2")],
+            crate::dhcp::Flavor::Isc,
+        );
         assert!(apply(&c, &new).await.is_err());
         assert!(
             !path.exists(),
@@ -348,7 +413,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hosts.conf");
         let c = cfg(path.clone(), "true", "true");
-        let new = render(&[client("a", "aa:bb:cc:dd:ee:01", "10.11.5.2")]);
+        let new = render(
+            &[client("a", "aa:bb:cc:dd:ee:01", "10.11.5.2")],
+            crate::dhcp::Flavor::Isc,
+        );
         assert_eq!(apply(&c, &new).await.unwrap(), Applied::Changed);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), new);
 

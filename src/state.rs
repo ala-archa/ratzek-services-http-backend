@@ -21,6 +21,30 @@ impl Drop for RunningGuard {
     }
 }
 
+/// Resolve the DHCP flavor at startup. For `auto`, probe the active daemon in a
+/// blocking task bounded by a timeout — a hung/degraded systemd must NEVER block the
+/// backend from starting (remote-only host). On timeout/failure fall back to `isc`
+/// (the known-good default). The resolved flavor is logged for cutover visibility.
+async fn resolve_dhcp_flavor(setting: crate::dhcp::FlavorSetting) -> crate::dhcp::Flavor {
+    use crate::dhcp::{Flavor, FlavorSetting};
+    let flavor = match setting {
+        FlavorSetting::Isc => Flavor::Isc,
+        FlavorSetting::Dnsmasq => Flavor::Dnsmasq,
+        FlavorSetting::Auto => {
+            let detect = tokio::task::spawn_blocking(Flavor::detect);
+            match tokio::time::timeout(std::time::Duration::from_secs(3), detect).await {
+                Ok(Ok(f)) => f,
+                _ => {
+                    error!("DHCP flavor auto-detect timed out/failed; falling back to isc");
+                    Flavor::Isc
+                }
+            }
+        }
+    };
+    info!("DHCP flavor: {flavor:?} (configured {setting:?})");
+    flavor
+}
+
 async fn check_is_wide_internet_available(config: &crate::config::Ping) -> bool {
     info!("Checking if wide network is available");
     let ping_client = match surge_ping::Client::new(&surge_ping::Config::new()) {
@@ -57,7 +81,7 @@ async fn check_is_wide_internet_available(config: &crate::config::Ping) -> bool 
 /// feed them to the store. The heavy (blocking) work runs in `spawn_blocking`.
 /// Best-effort: any failure is logged and the next tick retries.
 async fn sample_device_metrics(state: Arc<Mutex<State>>) {
-    let (store, leases_path, traffic_sets, retention, last_sample, history) = {
+    let (store, leases_path, traffic_sets, retention, last_sample, history, params) = {
         let s = state.lock().await;
         let store = match s.device_metrics.clone() {
             Some(st) => st,
@@ -88,32 +112,30 @@ async fn sample_device_metrics(state: Arc<Mutex<State>>) {
             retention,
             s.metrics_last_sample.clone(),
             s.history.clone(),
+            s.dhcp_params(),
         )
     };
 
     let now = chrono::Utc::now().timestamp();
     let result = tokio::task::spawn_blocking(
         move || -> anyhow::Result<crate::device_metrics::SampleStats> {
-            use dhcpd_parser::leases::BindingState;
-            use dhcpd_parser::parser::LeasesMethods;
-
             let observations: Vec<crate::device_metrics::LeaseObservation> =
-                crate::dhcp::Dhcp::read(&leases_path)?
+                crate::dhcp::Dhcp::read(&leases_path, params)?
                     .all()
                     .into_iter()
-                    .filter(|l| l.binding_state == BindingState::Active)
+                    .filter(|l| l.binding_state == crate::dhcp::BindingState::Active)
                     .filter_map(|l| {
                         let mac = l
-                            .hardware
+                            .mac
                             .as_ref()
-                            .and_then(|h| crate::unlimited_clients::normalize_mac(&h.mac))?;
+                            .and_then(|m| crate::unlimited_clients::normalize_mac(m))?;
                         Some(crate::device_metrics::LeaseObservation {
                             mac,
                             ip: l.ip.clone(),
                             hostname: l.hostname.clone(),
-                            vendor: l.vendor_class_identifier.clone(),
+                            vendor: l.vendor.clone(),
                             // cltt = real "last seen on the network" (not sample time).
-                            last_seen: l.dates.cltt.as_ref().and_then(crate::dhcp::date_to_epoch),
+                            last_seen: l.cltt,
                         })
                     })
                     .collect();
@@ -179,6 +201,8 @@ pub struct State {
     blacklist: crate::blacklist::BlacklistStore,
     /// Optional WAN-history + event-log store (None if disabled or DB couldn't open).
     history: Option<Arc<crate::history::HistoryStore>>,
+    /// DHCP server flavor, resolved once at startup (see [`crate::dhcp::Flavor`]).
+    dhcp_flavor: crate::dhcp::Flavor,
 }
 
 impl State {
@@ -472,6 +496,8 @@ impl State {
                 }
             });
 
+        let dhcp_flavor = resolve_dhcp_flavor(config.dhcp_flavor).await;
+
         let state = Arc::new(Mutex::new(Self {
             config: config.clone(),
             persistent_state: crate::persistent_state::PersistentStateGuard::load_from_yaml(
@@ -483,6 +509,7 @@ impl State {
             metrics_last_sample: Arc::new(AtomicI64::new(0)),
             blacklist,
             history,
+            dhcp_flavor,
         }));
 
         Ok(state)
@@ -494,6 +521,19 @@ impl State {
 
     pub fn config(&self) -> &crate::config::Config {
         &self.config
+    }
+
+    /// DHCP server flavor resolved at startup (for reservation rendering).
+    pub fn dhcp_flavor(&self) -> crate::dhcp::Flavor {
+        self.dhcp_flavor
+    }
+
+    /// Lease-parsing inputs (flavor + lease length) bundled for `Dhcp::read`.
+    pub fn dhcp_params(&self) -> crate::dhcp::DhcpParams {
+        crate::dhcp::DhcpParams {
+            flavor: self.dhcp_flavor,
+            lease_secs: self.config.dhcp_lease_secs,
+        }
     }
 
     pub fn unlimited_clients(&self) -> &crate::unlimited_clients::UnlimitedClientsStore {
@@ -569,7 +609,8 @@ impl State {
         //    file is fully derived from the store, so removed clients drop out
         //    automatically — no separate orphan-reservation prune is needed.
         if let Some(dr) = &self.config.dhcp_reservations {
-            match crate::dhcp_hosts::apply(dr, &crate::dhcp_hosts::render(&clients)).await {
+            let content = crate::dhcp_hosts::render(&clients, self.dhcp_flavor);
+            match crate::dhcp_hosts::apply(dr, &content).await {
                 Ok(applied) => info!("reconcile: dhcp reservations {applied:?}"),
                 Err(err) => error!("reconcile: dhcp reservations apply failed: {err}"),
             }
