@@ -1,11 +1,14 @@
 # Миграция DHCP: ISC dhcpd → dnsmasq (DHCP-only) — runbook
 
 Статус на 2026-07-01:
-- **Часть A** (код бэкенда) — задеплоена, инертна (`dhcp_flavor: auto` → на проде dnsmasq
-  неактивен → детект даёт `Isc` → поведение байт-в-байт как прежде). Соакается в проде.
-- **Часть B** (этот документ) — dnsmasq-конфиг + эмпирический pre-flight на dnsmasq **2.85**
-  (version-parity с прод-Debian 11). Ansible НЕ используется (морально устарел) — конфиги
-  кладутся на хост вручную в окне катовера.
+- **Часть A** (0.1.25) — задеплоена, инертна. Соакается в проде.
+- **0.1.26** (dnsmasq apply-scrape + isc-guard) — задеплоена, **инертна** (обе ручки
+  `active_unit`/`reload_log` не заданы → детект→Isc, поведение байт-в-байт как прежде;
+  подтверждено: flavor=Isc, reconcile `Unchanged`, dhcpd не тронут). Весь код катовера теперь
+  в проде → в окне Части C деплой кода НЕ нужен.
+- **Часть B** (этот документ) — dnsmasq-конфиг + эмпирический pre-flight + **репетиция катовера**
+  на dnsmasq **2.85** (version-parity с прод-Debian 11), всё в изоляции (netns/Docker, ноль
+  прода). Ansible НЕ используется (морально устарел) — конфиги кладутся на хост вручную.
 - **Часть C** (катовер) — НЕ выполнять без явного go и зелёного pre-flight.
 
 ⚠️ **Инвариант безопасности:** доступ к хосту ТОЛЬКО удалённый (openvpn `vpn-firstvds`
@@ -30,13 +33,13 @@
 ### 1.2 Реальные error-строки лога (для regex скрейпа)
 При старте/`SIGHUP`-reload с битой hostsfile dnsmasq (главный процесс, `dnsmasq[pid]:`) пишет:
 ```
-dnsmasq[725]: duplicate dhcp-host IP address 10.11.5.63 at line 5 of /etc/dnsmasq.d/unlimited-hosts
-dnsmasq[725]: bad hex constant at line 4 of /etc/dnsmasq.d/unlimited-hosts
-dnsmasq[725]: bad DHCP host name at line 6 of /etc/dnsmasq.d/unlimited-hosts
+dnsmasq[725]: duplicate dhcp-host IP address 10.11.5.63 at line 5 of /etc/ratzek-dnsmasq-hosts
+dnsmasq[725]: bad hex constant at line 4 of /etc/ratzek-dnsmasq-hosts
+dnsmasq[725]: bad DHCP host name at line 6 of /etc/ratzek-dnsmasq-hosts
 ```
 Маркер успешного применения (главный DHCP-процесс, `dnsmasq-dhcp[pid]:`):
 ```
-dnsmasq-dhcp[725]: read /etc/dnsmasq.d/unlimited-hosts
+dnsmasq-dhcp[725]: read /etc/ratzek-dnsmasq-hosts
 ```
 Чистый reload = **только** строка `read <hostsfile>`; при ошибке error-строки идут **перед** ней.
 Единый суффикс всех ошибок: **`at line <N> of <hostsfile>`**.
@@ -105,7 +108,7 @@ dhcp-host=30:de:4b:03:a9:89,10.11.4.1,ratzek-service
 dhcp-host=e4:5f:01:ed:d5:56,10.11.5.1,ratzek-service-ether
 
 # backend-owned unlimited-client reservations (the 15), SIGHUP reload, no restart
-dhcp-hostsfile=/etc/dnsmasq.d/unlimited-hosts
+dhcp-hostsfile=/etc/ratzek-dnsmasq-hosts
 dhcp-leasefile=/var/lib/misc/dnsmasq.leases
 # logging -> a FILE the backend apply() scrapes for rejected reservations (§1.2/§5).
 log-dhcp
@@ -157,6 +160,27 @@ OnUnitActiveSec=45
 WantedBy=timers.target
 ```
 
+### ⚠️ Установка dnsmasq — mind :53 (не сломать BIND!) — проверено в контейнере
+**Гоча (подтверждено, debian:11 + dnsmasq 2.85):** `apt-get install dnsmasq` **автоматически
+enable+start дефолтный `dnsmasq.service`** (postinst: `deb-systemd-helper enable` +
+`invoke-rc.d dnsmasq start`), а дефолтный `/etc/dnsmasq.conf` (весь закомментирован) поднимает
+**DNS-сервер на 0.0.0.0:53 и [::]:53** → **конфликт с BIND** = сломанный DNS на проде. Наивная
+установка ломает прод.
+
+**Безопасная последовательность (mask ДО install):**
+```sh
+systemctl mask dnsmasq            # symlink /etc/systemd/system/dnsmasq.service -> /dev/null;
+                                  # работает даже до установки пакета и шэдоует /lib-юнит
+apt-get install -y dnsmasq        # postinst-старт дефолта = no-op (masked)
+ss -ulnp | grep ':53'             # ПРОВЕРКА: dnsmasq НЕ должен появиться на :53 (только BIND)
+# наш отдельный юнит с port=0 -> только :67 (DHCP), с BIND не конфликтует
+systemctl daemon-reload           # после раскладки dnsmasq-ratzek.service (файлы, НЕ старт)
+```
+Проверено в изоляции: наш `port=0`-конфиг биндит только `:67` (DHCP), `:53` пуст. Дефолтный юнит
+остаётся masked весь трейл (в т.ч. чтобы ребут не поднял его на :53). backend-hostsfile —
+`/etc/ratzek-dnsmasq-hosts` (НЕ под `/etc/dnsmasq.d/` и без `.conf` → не подхватится conf-dir даже
+если дефолт когда-то оживёт).
+
 ---
 
 ## 4. Native брони — таблица решений
@@ -196,14 +220,50 @@ WantedBy=timers.target
 
 ---
 
+## 5a. Репетиция катовера (dry-run, dnsmasq 2.85, netns/Docker — ноль прода)
+
+Прогнаны два самых страшных неизвестных Части C в изоляции (2026-07-01, `debian:11`, dnsmasq
+2.85, veth/netns). **Оба закрыты.**
+
+### TEST A — dual-subnet eth0 (пункт №1 ABORT-дерева)
+Интерфейс с двумя адресами `10.11.3.2` (WAN) + `10.11.5.1` (клиент), dnsmasq с диапазоном
+только 10.11.5, **non-authoritative** (как §2).
+- **A1 PASS** — обычный клиент получил `10.11.5.104` (DISCOVER→OFFER→ACK); никаких 10.11.3.
+- **A2 PASS** — клиент, просящий чужой `10.11.3.99`, **НЕ получил DHCPNAK**: non-auth dnsmasq
+  молча выдал пуловый 10.11.5-адрес. Активной disruption чужих аренд нет.
+- **Вывод:** поведение = **паритет с текущим dhcpd** (dhcpd так же отдаёт 10.11.5 любому
+  броадкастеру на eth0 — отличить «10.11.3-устройство» от «10.11.5» в момент DISCOVER на общем
+  L2 нельзя ни тому, ни другому). dnsmasq **не хуже и не NAK'ает**. Регрессии нет. (Контраст
+  «authoritative→NAK» воспроизвести чисто не удалось — `dhclient` свалился в DISCOVER; на вывод
+  не влияет: наш конфиг non-auth и A2 прошёл.)
+
+### TEST B — реальный apply-scrape цикл (формат бэкенда + дубль IP)
+dnsmasq с `dhcp-hostsfile` в формате `render(Dnsmasq)` (`MAC,IP,name`), `log-facility=<file>`.
+- **B1 PASS** — чистый reload → `dnsmasq-dhcp[pid]: read /t/hosts` → совпадает с
+  `success_contains="read"`.
+- **B2 PASS** — дубль IP → SIGHUP → `dnsmasq[pid]: duplicate dhcp-host IP address 10.11.5.61
+  **at line 3 of /t/hosts**` → строка содержит путь + `at line` → скрейп **откатил бы**. Offset
+  (снятый до reload) отработал — читались только новые байты.
+- **Вывод:** apply-scrape замкнут на реальный dnsmasq 2.85 — дефолты кода (`read`/`at line` +
+  путь-скоуп) ловят именно то, что пишет эта связка на битой брони.
+
+### Остаточное (не блокирует Часть C)
+Более строгий NAK-контраст (scapy/nmap с чистым INIT-REBOOT REQUEST) — nice-to-have; core-
+безопасность (A2, non-auth = no NAK) подтверждена.
+
+---
+
 ## 6. Катовер (Часть C) — окно, обратимо. НЕ запускать без go.
 
 Предусловия: pre-flight зелёный; 0.1.26 задеплоен (детект→isc). Заморозить ВСЕ DHCP-мутации.
 **Бэкап ISC:** `cp` `dhcpd.leases` + `dhcpd.conf` + `unlimited-hosts.conf` в сторону.
 
-1. Положить `/etc/ratzek-dnsmasq.conf`, unit'ы (§2/§3). `--test` конфига на хосте.
+0. **Установить dnsmasq masked** (заранее, вне окна — §3 «Установка»): `systemctl mask dnsmasq;
+   apt-get install -y dnsmasq; ss -ulnp|grep :53` (dnsmasq НЕ на :53 — иначе STOP, чинить BIND).
+   Арм isc-guard: `active_unit: isc-dhcp-server` в конфиге backend + рестарт (инертно, пока isc жив).
+1. Положить `/etc/ratzek-dnsmasq.conf`, unit'ы (§2/§3), `daemon-reload`. `--test` конфига на хосте.
 2. **Populate hostsfile ДО старта:** `ratzek-services-http-backend render-dnsmasq-hostsfile
-   --out /etc/dnsmasq.d/unlimited-hosts` (15 броней; pos/bms уже статикой в конфиге). → dnsmasq
+   --out /etc/ratzek-dnsmasq-hosts` (15 броней; pos/bms уже статикой в конфиге). → dnsmasq
    стартует с ПОЛНЫМ набором (гонка .30/.89 закрыта).
 3. Вооружить dead-man (монотонный, ~15м): `systemd-run --on-active=15min --unit=dhcp-deadman
    <скрипт: flock; stop dnsmasq-ratzek; start isc-dhcp-server; restart backend; || start isc>`.
@@ -224,7 +284,7 @@ WantedBy=timers.target
 | После start dnsmasq нет DHCPACK N мин | dead-man сработает; или вручную: stop dnsmasq; start isc; restart backend |
 | pos-terminal(.30) / bms(.123) не держат IP | ABORT → откат (§ниже) |
 | .89 (или любой unlimited) ушёл чужому MAC | ABORT → откат |
-| Клиенты 10.11.3 (WAN) получают offer/NAK от dnsmasq | ABORT немедленно (dual-subnet утечка) |
+| dnsmasq шлёт **DHCPNAK** на 10.11.3 ИЛИ offer'ит адрес из 10.11.3-диапазона | ABORT немедленно (см. §5a: NAK — реальный disruptor; 10.11.5-offer WAN-броадкастеру = паритет с dhcpd, НЕ повод для ABORT) |
 | **SSH/openvpn отвалился** (сеть цела?) | last-resort: **power-cycle → ISC** (dhcpd enabled-на-boot) |
 | backend не читает leases / reconcile ошибки | не критично для сети; чинить после стабилизации DHCP |
 
