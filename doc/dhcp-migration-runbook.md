@@ -9,7 +9,32 @@
 - **Часть B** (этот документ) — dnsmasq-конфиг + эмпирический pre-flight + **репетиция катовера**
   на dnsmasq **2.85** (version-parity с прод-Debian 11), всё в изоляции (netns/Docker, ноль
   прода). Ansible НЕ используется (морально устарел) — конфиги кладутся на хост вручную.
-- **Часть C** (катовер) — НЕ выполнять без явного go и зелёного pre-flight.
+- **Стейджинг prep** (2026-07-02, инертно, на проде): ISC забэкаплен (`/root/dhcp-migration-backup/`);
+  `/etc/ratzek-dnsmasq.conf` + пустой `/etc/ratzek-dnsmasq-hosts` + `dnsmasq-ratzek.service`
+  (inactive/disabled) разложены; `dnsmasq --test` → OK на реальных интерфейсах; ничего не стартовано
+  (isc-dhcpd на :67 active, BIND на :53, backend 0.1.26 active — без изменений). `dnsmasq-base` 2.85
+  уже стоит → apt не нужен.
+- **Часть C — КАТОВЕР ВЫПОЛНЕН 2026-07-02 ~17:44.** dnsmasq-ratzek обслуживает :67, isc остановлен.
+  Верифицировано вживую: резервные клиенты получают брони (bms-1→.123, yura-phone→.224), пул
+  работает, **0 DHCPNAK, 0 активности на 10.11.3 WAN** (dual-subnet безопасен в проде), backend
+  flavor=Dnsmasq читает dnsmasq-аренды, reconcile Unchanged. Boot-fallback: isc enabled (ребут→ISC),
+  dnsmasq-ratzek disabled+active. Соак 24ч.
+- **⚠️ КОД-БАГ (для 0.1.27):** `Flavor::detect()` хардкодит имя юнита `dnsmasq`, а прод-юнит —
+  `dnsmasq-ratzek` → авто-детект НЕ находит dnsmasq и падает в Isc-фолбэк. **Обход:** явно задан
+  `dhcp_flavor: dnsmasq` в конфиге (детект не вызывается). На свитче это проявилось: backend
+  стартовал flavor=Isc, отрендерил ISC-`host{}` в dnsmasq-hostsfile → dnsmasq отверг
+  (`bad DHCP host name at line 4`) → **apply-scrape поймал и откатил** (защита сработала в бою).
+  В 0.1.27: убрать авто-детект (при финализации isc-адаптер уходит) ИЛИ сделать имя юнита конфигом.
+- **OS-финализация ВЫПОЛНЕНА 2026-07-02** (соак сокращён — функционально всё зелёное): dnsmasq-ratzek
+  **enabled**, isc-dhcp-server **disabled**, liveness-пробник (`dnsmasq-liveness.timer`, 45с) активен.
+  Состояние консистентно (runtime=boot=dnsmasq); ребут больше не регрессирует на ISC/.89-баг.
+  Довод сокращения: держать лимб (runtime=dnsmasq, boot=isc) на хосте, склонном к ребутам
+  (электричество/зависания), опаснее, чем консистентный dnsmasq. **ISC-escape-hatch сохранён**
+  (пакет+config+бэкапы + задеплоен 0.1.26 с isc-адаптером → откат `.isc`-конфиг+enable isc возможен).
+- **Осталось — код-уборка 0.1.27 (единственный необратимый шаг, ОТЛОЖЕН):** убрать isc-адаптер +
+  `dhcpd_parser` + `migrate-unlimited`, починить flavor-detect-баг. Держим как escape-hatch; делать,
+  когда пройдёт больше циклов renewal и уверенность в отсутствии отката будет полной. Спешки нет —
+  функционального выигрыша от удаления кода нет.
 
 ⚠️ **Инвариант безопасности:** доступ к хосту ТОЛЬКО удалённый (openvpn `vpn-firstvds`
 10.8.0.10 → SSH). Наш канал не зависит от клиентского DHCP. Сеть не ломать. dhcpd — горячий
@@ -160,8 +185,14 @@ OnUnitActiveSec=45
 WantedBy=timers.target
 ```
 
-### ⚠️ Установка dnsmasq — mind :53 (не сломать BIND!) — проверено в контейнере
-**Гоча (подтверждено, debian:11 + dnsmasq 2.85):** `apt-get install dnsmasq` **автоматически
+### ⚠️ Установка dnsmasq — mind :53 (не сломать BIND!)
+**На ratzek apt НЕ нужен (проверено 2026-07-02 read-only):** `dnsmasq-base` **2.85 уже стоит** →
+бинарь `/usr/sbin/dnsmasq` есть; полный пакет `dnsmasq` и его авто-юнит `/lib/systemd/system/
+dnsmasq.service` **отсутствуют** → нашему `dnsmasq-ratzek.service` (указывает на `/usr/sbin/dnsmasq`)
+apt не требуется вовсе. Это **снимает всю гочу для этого хоста** (ни :53-конфликта, ни
+dependency-churn). Ниже — что делать, если бы пакета-бинаря не было.
+
+**Гоча (общий случай, подтверждено debian:11 + dnsmasq 2.85):** `apt-get install dnsmasq` **автоматически
 enable+start дефолтный `dnsmasq.service`** (postinst: `deb-systemd-helper enable` +
 `invoke-rc.d dnsmasq start`), а дефолтный `/etc/dnsmasq.conf` (весь закомментирован) поднимает
 **DNS-сервер на 0.0.0.0:53 и [::]:53** → **конфликт с BIND** = сломанный DNS на проде. Наивная
@@ -196,6 +227,14 @@ systemctl daemon-reload           # после раскладки dnsmasq-ratzek
 > Расхождение с ред.4 плана: план предлагал SKIP для ratzek-service/-ether. Здесь — мигрировать
 > для полной parity (drop брони риск-нее, чем сохранить: сохранение = текущее поведение dhcpd).
 > Решение — за оператором; при подтверждении «vestigial» строки можно убрать.
+
+> **Native vs unlimited — взаимоисключающи по IP (подтверждено на соаке).** Нельзя завести
+> unlimited-клиента (API) на IP, который уже объявлен нативной `dhcp-host=` в
+> `ratzek-dnsmasq.conf`: dnsmasq на reload даст `duplicate dhcp-host IP address <ip>`, apply-scrape
+> откатит, create упадёт до записи в store (безопасно). Чтобы перевести native-бронь (напр. bms-1
+> .123, pos-terminal .30) в unlimited: сначала удалить её `dhcp-host=`-строку из `ratzek-dnsmasq.conf`
+> + `reload`, затем добавить через API. Замечание: native фиксирует только IP (без ipset-доступа);
+> unlimited даёт IP + `acl`+`no_shape`.
 
 ---
 
