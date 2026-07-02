@@ -46,15 +46,8 @@ enum CommandLine {
         /// Plaintext password to hash
         password: String,
     },
-    /// Build the unlimited-clients store file from no_shaping_ips + dhcpd.conf
-    /// hosts (one-time migration; writes the file, applies nothing).
-    MigrateUnlimited {
-        /// Path to the existing dhcpd.conf to read host reservations from
-        dhcpd_conf: String,
-    },
     /// Render the unlimited-clients store as a dnsmasq `--dhcp-hostsfile` and write
-    /// it to `--out`. Used during the ISC→dnsmasq cutover to pre-populate the
-    /// reservations BEFORE dnsmasq starts (regardless of the detected flavor), so no
+    /// it to `--out`. Used to pre-populate reservations before dnsmasq starts, so no
     /// reserved IP can be handed to a dynamic client in the start→reconcile window.
     RenderDnsmasqHostsfile {
         /// Absolute path to write the hostsfile to.
@@ -116,8 +109,8 @@ impl Application {
                 // Heal unlimited-clients drift on boot. Non-fatal and bounded so a
                 // failed dhcpd reload / ipset op can't block startup.
                 match tokio::time::timeout(
-                    // Generous: reconcile may regenerate the dhcpd include and
-                    // restart dhcpd. Non-fatal — heals on next start.
+                    // Generous: reconcile may regenerate the dnsmasq hostsfile and
+                    // reload dnsmasq. Non-fatal — heals on next start.
                     std::time::Duration::from_secs(90),
                     async { state.lock().await.reconcile_unlimited().await },
                 )
@@ -167,12 +160,11 @@ impl Application {
                 // Handled early in `run()` before the config/logger are loaded.
                 Ok(())
             }
-            CommandLine::MigrateUnlimited { dhcpd_conf } => migrate_unlimited(&config, dhcpd_conf),
             CommandLine::RenderDnsmasqHostsfile { out } => {
                 let store =
                     unlimited_clients::UnlimitedClientsStore::load(&config.unlimited_clients_path)?;
                 let clients = store.list().await;
-                let content = dhcp_hosts::render(&clients, dhcp::Flavor::Dnsmasq);
+                let content = dhcp_hosts::render(&clients);
                 std::fs::write(out, &content)
                     .with_context(|| format!("failed to write hostsfile {:?}", out))?;
                 eprintln!("Wrote {} reservation(s) to {:?}", clients.len(), out);
@@ -227,80 +219,6 @@ impl Application {
             error!("Failed with error: {:#}", err);
         }
     }
-}
-
-/// One-time migration: cross-reference `no_shaping_ips` with the `host`
-/// reservations in `dhcpd.conf` and print the resulting unlimited-clients YAML
-/// to stdout (review, then redirect into `unlimited_clients_path`). Applies
-/// nothing to the live system.
-fn migrate_unlimited(config: &config::Config, dhcpd_conf: &str) -> Result<()> {
-    use std::collections::{HashMap, HashSet};
-
-    let content = std::fs::read_to_string(dhcpd_conf)
-        .with_context(|| format!("Failed to read {:?}", dhcpd_conf))?;
-    let parsed = dhcpd_parser::parser::parse(content)
-        .map_err(|err| anyhow::anyhow!("Failed to parse {:?}: {}", dhcpd_conf, err))?;
-
-    let mut host_by_ip: HashMap<&str, &dhcpd_parser::parser::Host> = HashMap::new();
-    for host in &parsed.hosts {
-        for ip in &host.fixed_addresses {
-            host_by_ip.insert(ip.as_str(), host);
-        }
-    }
-
-    let mut clients: Vec<unlimited_clients::UnlimitedClient> = Vec::new();
-    let mut seen_names: HashSet<String> = HashSet::new();
-    let mut skipped = 0usize;
-
-    let mut ips: Vec<&String> = config.no_shaping_ips.iter().collect();
-    ips.sort();
-    for ip in ips {
-        let host = match host_by_ip.get(ip.as_str()) {
-            Some(h) => h,
-            None => {
-                eprintln!("WARNING: no host block for {ip} in {dhcpd_conf}; skipped");
-                skipped += 1;
-                continue;
-            }
-        };
-        let mac = host
-            .mac
-            .as_deref()
-            .and_then(unlimited_clients::normalize_mac);
-        let mac = match mac {
-            Some(m) => m,
-            None => {
-                eprintln!(
-                    "WARNING: host {} ({ip}) has no usable MAC; skipped",
-                    host.name
-                );
-                skipped += 1;
-                continue;
-            }
-        };
-        if !seen_names.insert(host.name.clone()) {
-            eprintln!("WARNING: duplicate host name {} ({ip}); skipped", host.name);
-            skipped += 1;
-            continue;
-        }
-        clients.push(unlimited_clients::UnlimitedClient {
-            name: host.name.clone(),
-            mac,
-            ip: ip.clone(),
-            comment: None,
-            ..Default::default()
-        });
-    }
-
-    clients.sort_by(|a, b| a.name.cmp(&b.name));
-    print!("{}", serde_yaml::to_string(&clients)?);
-    eprintln!(
-        "Migrated {} client(s), {} skipped. Review, then write to {:?}.",
-        clients.len(),
-        skipped,
-        config.unlimited_clients_path
-    );
-    Ok(())
 }
 
 #[actix_web::main]

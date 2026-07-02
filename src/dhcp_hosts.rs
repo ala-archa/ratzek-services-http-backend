@@ -1,19 +1,17 @@
-//! Manage DHCP reservations for unlimited clients via a generated file, instead of
-//! OMAPI/omshell (which is unreliable on this box — an internal omshell threading
-//! race makes connects fail ~90% of the time, and the OMAPI model can't represent
-//! one MAC with two reservations).
+//! Manage DHCP reservations for unlimited clients via a generated dnsmasq
+//! `dhcp-hostsfile`, instead of OMAPI/omshell (unreliable on this box — an internal
+//! omshell threading race made connects fail ~90% of the time).
 //!
-//! The backend owns one reservation file, regenerates it from the unlimited-clients
-//! store (the single source of truth) on every CRUD change and on startup reconcile,
-//! validates the config, then reloads the daemon. [`render`] emits the flavor's
-//! format (ISC `host {}` include vs dnsmasq `MAC,IP,name` hostsfile); [`apply`]
-//! writes + validates + reloads with rollback.
+//! The backend owns one hostsfile, regenerates it from the unlimited-clients store
+//! (the single source of truth) on every CRUD change and on startup reconcile,
+//! validates the config (`dnsmasq --test`), then reloads dnsmasq (SIGHUP). [`render`]
+//! emits `MAC,IP,name` lines; [`apply`] writes + validates + reloads with rollback.
 //!
-//! Two optional [`DhcpReservations`] knobs support the ISC→dnsmasq migration (both
-//! `None` = historical ISC behaviour): `active_unit` (skip the reload when the
-//! daemon is deliberately down, so a cutover reconcile can't revive it) and
-//! `reload_log` (scrape the daemon log after reload — dnsmasq applies a hostsfile
-//! silently on SIGHUP, so `dnsmasq --test` can't catch a rejected reservation).
+//! Two optional [`DhcpReservations`] knobs: `active_unit` (skip the reload when the
+//! target daemon is deliberately down, leaving the change pending for the next
+//! reconcile) and `reload_log` (scrape the daemon log after reload — dnsmasq applies
+//! a hostsfile silently on SIGHUP, so `dnsmasq --test` can't catch a rejected
+//! reservation).
 
 use anyhow::{anyhow, bail, Context, Result};
 use slog_scope::{error, info, warn};
@@ -21,7 +19,7 @@ use slog_scope::{error, info, warn};
 use crate::config::DhcpReservations;
 use crate::unlimited_clients::UnlimitedClient;
 
-/// Timeout for the external dhcpd validate/reload commands. A hung command must
+/// Timeout for the external validate/reload commands. A hung command must
 /// never block the async worker indefinitely.
 const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -36,34 +34,25 @@ pub enum Applied {
     SkippedInactive,
 }
 
-/// Render the include-file content from the store. Deterministic (sorted by
-/// `name`) so an unchanged store yields a byte-identical file — that lets
-/// [`apply`] skip the dhcpd restart when nothing changed.
+/// Render the dnsmasq hostsfile content from the store. Deterministic (sorted by
+/// `name`) so an unchanged store yields a byte-identical file — that lets [`apply`]
+/// skip the reload when nothing changed.
 ///
 /// Defense in depth: although `name`/`mac`/`ip` are validated on the write path
 /// (`is_valid_name`, `normalize_mac`, `UnlimitedClient::validate`),
 /// `UnlimitedClientsStore::load` does NOT re-validate YAML read from disk. A
-/// hand-edited or corrupted store could therefore carry values that would inject
-/// arbitrary directives into the dhcpd include. So we re-check each record here
-/// and skip (with a `warn!`) anything that does not pass, emitting only safe
-/// records verbatim. Note dhcpd allows several `host` blocks to share a
-/// `hardware ethernet` (one device, two reservations on different subnets) —
-/// this renderer supports that natively.
-pub fn render(clients: &[UnlimitedClient], flavor: crate::dhcp::Flavor) -> String {
-    // dnsmasq `dhcp-host` is IPv4-only in the `MAC,IP,name` form; ISC accepts any IP.
-    let ipv4_only = flavor == crate::dhcp::Flavor::Dnsmasq;
+/// hand-edited or corrupted store could carry values that inject extra fields/lines
+/// into the hostsfile, so we re-check each record here and skip (with a `warn!`)
+/// anything that does not pass, emitting only safe records verbatim.
+pub fn render(clients: &[UnlimitedClient]) -> String {
     let mut sorted: Vec<&UnlimitedClient> = clients
         .iter()
         .filter(|c| {
-            let ip_ok = if ipv4_only {
-                c.ip.parse::<std::net::Ipv4Addr>().is_ok()
-            } else {
-                c.ip.parse::<std::net::IpAddr>().is_ok()
-            };
+            // dnsmasq `dhcp-host` is IPv4-only in the `MAC,IP,name` form.
             let safe = crate::unlimited_clients::is_valid_name(&c.name)
                 && crate::unlimited_clients::normalize_mac(&c.mac).as_deref()
                     == Some(c.mac.as_str())
-                && ip_ok;
+                && c.ip.parse::<std::net::Ipv4Addr>().is_ok();
             if !safe {
                 warn!(
                     "dhcp render: skipping unsafe client record (name={:?}, mac={:?}, ip={:?})",
@@ -75,37 +64,15 @@ pub fn render(clients: &[UnlimitedClient], flavor: crate::dhcp::Flavor) -> Strin
         .collect();
     sorted.sort_by_key(|c| c.name.as_str());
 
-    let mut out = match flavor {
-        // ISC header kept byte-identical to the pre-migration output so an inert
-        // deploy produces no spurious `apply()` diff / dhcpd reload.
-        crate::dhcp::Flavor::Isc => String::from(
-            "# Managed by ala-archa-http-backend. DO NOT EDIT.\n\
-             # Regenerated from the unlimited-clients store on every CRUD change and\n\
-             # on startup. Referenced from dhcpd.conf via `include`.\n",
-        ),
-        crate::dhcp::Flavor::Dnsmasq => String::from(
-            "# Managed by ala-archa-http-backend. DO NOT EDIT.\n\
-             # Regenerated from the unlimited-clients store; read via dhcp-hostsfile.\n",
-        ),
-    };
-    match flavor {
-        crate::dhcp::Flavor::Isc => {
-            // ISC include: `host <name> { hardware ethernet <mac>; fixed-address <ip>; }`.
-            // dhcpd allows several host blocks sharing a MAC (one device, two subnets).
-            for c in sorted {
-                out.push_str(&format!(
-                    "host {} {{\n  hardware ethernet {};\n  fixed-address {};\n}}\n",
-                    c.name, c.mac, c.ip
-                ));
-            }
-        }
-        crate::dhcp::Flavor::Dnsmasq => {
-            // dnsmasq `--dhcp-hostsfile` line: `MAC,IP,name` (no `dhcp-host=` prefix).
-            // All reservations are single-IP; one line per client.
-            for c in sorted {
-                out.push_str(&format!("{},{},{}\n", c.mac, c.ip, c.name));
-            }
-        }
+    // dnsmasq `--dhcp-hostsfile` lines: `MAC,IP,name` (no `dhcp-host=` prefix), one
+    // per client. Deterministic (sorted) so an unchanged store yields a byte-identical
+    // file and [`apply`] can skip the reload.
+    let mut out = String::from(
+        "# Managed by ala-archa-http-backend. DO NOT EDIT.\n\
+         # Regenerated from the unlimited-clients store; read via dhcp-hostsfile.\n",
+    );
+    for c in sorted {
+        out.push_str(&format!("{},{},{}\n", c.mac, c.ip, c.name));
     }
     out
 }
@@ -124,15 +91,16 @@ pub fn render(clients: &[UnlimitedClient], flavor: crate::dhcp::Flavor) -> Strin
 /// rare case where the rollback itself failed and the file is left broken.
 pub async fn apply(cfg: &DhcpReservations, content: &str) -> Result<Applied> {
     let path = &cfg.include_path;
-    // Read the current include carefully: a missing file is a legitimate "no
+    // Read the current hostsfile carefully: a missing file is a legitimate "no
     // previous content" case, but any other error (e.g. EACCES) must NOT be
     // masked as "file absent" — otherwise restore would `remove_file` and wipe
-    // an include we simply failed to read.
+    // a hostsfile we simply failed to read.
     let previous = match std::fs::read_to_string(path) {
         Ok(s) => Some(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
-            return Err(e).with_context(|| format!("failed to read dhcp include {:?}", path));
+            return Err(e)
+                .with_context(|| format!("failed to read reservations hostsfile {:?}", path));
         }
     };
 
@@ -140,9 +108,8 @@ pub async fn apply(cfg: &DhcpReservations, content: &str) -> Result<Applied> {
         return Ok(Applied::Unchanged);
     }
 
-    // isc-guard: never (re)start a daemon that is deliberately stopped (cutover
-    // window). Leave the change pending — the next reconcile heals it once the
-    // flavor snapshot flips to dnsmasq.
+    // active_unit guard: never (re)start a daemon that is deliberately stopped.
+    // Leave the change pending — the next reconcile heals it once the daemon is back.
     if let Some(unit) = &cfg.active_unit {
         if !unit_is_active(unit).await {
             warn!(
@@ -154,19 +121,19 @@ pub async fn apply(cfg: &DhcpReservations, content: &str) -> Result<Applied> {
     }
 
     write_file(path, content)
-        .with_context(|| format!("failed to write dhcp include {:?}", path))?;
+        .with_context(|| format!("failed to write reservations hostsfile {:?}", path))?;
 
     if let Err(err) = run_cmd(&cfg.validate_command).await {
         match restore(path, previous.as_deref()) {
             Ok(()) => bail!(
-                "dhcpd validation ({:?}) failed; reverted include: {err}",
+                "dhcp reservations validation ({:?}) failed; reverted hostsfile: {err}",
                 cfg.validate_command
             ),
             Err(re) => {
-                error!("dhcp include restore after failed validation FAILED: {re}");
+                error!("hostsfile restore after failed validation FAILED: {re}");
                 bail!(
-                    "dhcpd validation ({:?}) failed AND include restore failed — \
-                     include LEFT BROKEN: {err} (restore error: {re})",
+                    "dhcp reservations validation ({:?}) failed AND hostsfile restore failed — \
+                     hostsfile LEFT BROKEN: {err} (restore error: {re})",
                     cfg.validate_command
                 );
             }
@@ -345,9 +312,9 @@ fn write_file(path: &std::path::Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Restore the include file to its previous content (or delete it if there was
+/// Restore the hostsfile to its previous content (or delete it if there was
 /// none). Returns the result so the caller can report when a rollback itself
-/// failed (i.e. the include is left in a broken state).
+/// failed (i.e. the hostsfile is left in a broken state).
 fn restore(path: &std::path::Path, previous: Option<&str>) -> Result<()> {
     match previous {
         Some(prev) => write_file(path, prev),
@@ -398,43 +365,14 @@ mod tests {
     }
 
     #[test]
-    fn render_is_sorted_and_well_formed() {
-        let clients = vec![
-            client("bravo", "aa:bb:cc:dd:ee:02", "10.11.5.3"),
-            client("alpha", "aa:bb:cc:dd:ee:01", "10.11.5.2"),
-        ];
-        let out = render(&clients, crate::dhcp::Flavor::Isc);
-        assert!(out.starts_with("# Managed by ala-archa-http-backend"));
-        // sorted by name: alpha before bravo
-        assert!(out.find("host alpha").unwrap() < out.find("host bravo").unwrap());
-        assert!(out.contains(
-            "host alpha {\n  hardware ethernet aa:bb:cc:dd:ee:01;\n  fixed-address 10.11.5.2;\n}\n"
-        ));
-    }
-
-    #[test]
-    fn render_supports_one_mac_two_reservations() {
-        // One device dual-homed on .4 and .5 — two host blocks, same MAC.
-        let mac = "d4:3a:2c:a1:3d:b4";
-        let clients = vec![
-            client("dev", mac, "10.11.5.221"),
-            client("dev-private", mac, "10.11.4.221"),
-        ];
-        let out = render(&clients, crate::dhcp::Flavor::Isc);
-        assert_eq!(out.matches(&format!("hardware ethernet {mac};")).count(), 2);
-        assert!(out.contains("fixed-address 10.11.5.221;"));
-        assert!(out.contains("fixed-address 10.11.4.221;"));
-    }
-
-    #[test]
     fn render_dnsmasq_hostsfile_format() {
         let clients = vec![
             client("bravo", "aa:bb:cc:dd:ee:02", "10.11.5.3"),
             client("alpha", "aa:bb:cc:dd:ee:01", "10.11.5.2"),
         ];
-        let out = render(&clients, crate::dhcp::Flavor::Dnsmasq);
+        let out = render(&clients);
         assert!(out.starts_with("# Managed by ala-archa-http-backend"));
-        // `MAC,IP,name`, no `dhcp-host=` prefix, no `host {`; sorted by name.
+        // `MAC,IP,name`, no `dhcp-host=` prefix, no ISC `host {`; sorted by name.
         assert!(out.contains("aa:bb:cc:dd:ee:01,10.11.5.2,alpha\n"));
         assert!(out.contains("aa:bb:cc:dd:ee:02,10.11.5.3,bravo\n"));
         assert!(!out.contains("dhcp-host="));
@@ -452,10 +390,7 @@ mod tests {
             client("a", "aa:bb:cc:dd:ee:01", "10.11.5.2"),
             client("b", "aa:bb:cc:dd:ee:02", "10.11.5.3"),
         ];
-        assert_eq!(
-            render(&a, crate::dhcp::Flavor::Isc),
-            render(&b, crate::dhcp::Flavor::Isc)
-        );
+        assert_eq!(render(&a), render(&b));
     }
 
     fn cfg(path: PathBuf, validate: &str, reload: &str) -> DhcpReservations {
@@ -475,10 +410,7 @@ mod tests {
         let path = dir.join("hosts.conf");
         // marker files prove the commands did/didn't run
         let ran = dir.join("ran");
-        let content = render(
-            &[client("a", "aa:bb:cc:dd:ee:01", "10.11.5.2")],
-            crate::dhcp::Flavor::Isc,
-        );
+        let content = render(&[client("a", "aa:bb:cc:dd:ee:01", "10.11.5.2")]);
         std::fs::write(&path, &content).unwrap();
 
         let c = cfg(path.clone(), &format!("touch {}", ran.display()), "true");
@@ -496,18 +428,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dh-fail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hosts.conf");
-        let old = render(
-            &[client("old", "aa:bb:cc:dd:ee:01", "10.11.5.2")],
-            crate::dhcp::Flavor::Isc,
-        );
+        let old = render(&[client("old", "aa:bb:cc:dd:ee:01", "10.11.5.2")]);
         std::fs::write(&path, &old).unwrap();
 
         // validate always fails -> the bad content must be reverted to `old`
         let c = cfg(path.clone(), "false", "true");
-        let new = render(
-            &[client("new", "aa:bb:cc:dd:ee:02", "10.11.5.3")],
-            crate::dhcp::Flavor::Isc,
-        );
+        let new = render(&[client("new", "aa:bb:cc:dd:ee:02", "10.11.5.3")]);
         assert!(apply(&c, &new).await.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
 
@@ -519,18 +445,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dh-reload-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hosts.conf");
-        let old = render(
-            &[client("old", "aa:bb:cc:dd:ee:01", "10.11.5.2")],
-            crate::dhcp::Flavor::Isc,
-        );
+        let old = render(&[client("old", "aa:bb:cc:dd:ee:01", "10.11.5.2")]);
         std::fs::write(&path, &old).unwrap();
 
         // validate passes but reload fails -> the new content must be rolled back.
         let c = cfg(path.clone(), "true", "false");
-        let new = render(
-            &[client("new", "aa:bb:cc:dd:ee:02", "10.11.5.3")],
-            crate::dhcp::Flavor::Isc,
-        );
+        let new = render(&[client("new", "aa:bb:cc:dd:ee:02", "10.11.5.3")]);
         assert!(apply(&c, &new).await.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
 
@@ -542,17 +462,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dh-none-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hosts.conf");
-        // No pre-existing include; validation fails -> the freshly written file
-        // must be removed, leaving no include behind.
+        // No pre-existing hostsfile; validation fails -> the freshly written file
+        // must be removed, leaving no hostsfile behind.
         let c = cfg(path.clone(), "false", "true");
-        let new = render(
-            &[client("a", "aa:bb:cc:dd:ee:01", "10.11.5.2")],
-            crate::dhcp::Flavor::Isc,
-        );
+        let new = render(&[client("a", "aa:bb:cc:dd:ee:01", "10.11.5.2")]);
         assert!(apply(&c, &new).await.is_err());
         assert!(
             !path.exists(),
-            "include must not exist after rollback of a new file"
+            "hostsfile must not exist after rollback of a new file"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -564,10 +481,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hosts.conf");
         let c = cfg(path.clone(), "true", "true");
-        let new = render(
-            &[client("a", "aa:bb:cc:dd:ee:01", "10.11.5.2")],
-            crate::dhcp::Flavor::Isc,
-        );
+        let new = render(&[client("a", "aa:bb:cc:dd:ee:01", "10.11.5.2")]);
         assert_eq!(apply(&c, &new).await.unwrap(), Applied::Changed);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), new);
 
@@ -575,18 +489,18 @@ mod tests {
     }
 
     fn dnsmasq_reservation(name: &str, mac: &str, ip: &str) -> String {
-        render(&[client(name, mac, ip)], crate::dhcp::Flavor::Dnsmasq)
+        render(&[client(name, mac, ip)])
     }
 
     #[tokio::test]
     async fn apply_skips_reload_when_active_unit_inactive() {
-        // isc-guard: an inactive `active_unit` must skip validate+reload entirely
-        // and leave the on-disk include untouched (change pending for reconcile).
+        // active_unit guard: an inactive `active_unit` must skip validate+reload entirely
+        // and leave the on-disk hostsfile untouched (change pending for reconcile).
         let dir = std::env::temp_dir().join(format!("dh-guard-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hosts.conf");
         let ran = dir.join("ran");
-        std::fs::write(&path, "OLD INCLUDE\n").unwrap();
+        std::fs::write(&path, "OLD HOSTSFILE\n").unwrap();
 
         let mut c = cfg(
             path.clone(),
@@ -605,8 +519,8 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "OLD INCLUDE\n",
-            "include must be untouched when the reload target is inactive"
+            "OLD HOSTSFILE\n",
+            "hostsfile must be untouched when the reload target is inactive"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

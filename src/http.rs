@@ -691,16 +691,15 @@ fn unlimited_ctx(state: &State) -> UnlimitedCtx {
     }
 }
 
-/// Re-render the dhcpd include from the current store and re-apply it, undoing a
+/// Re-render the dnsmasq hostsfile from the current store and re-apply it, undoing a
 /// reservation written earlier in a transaction that then failed. Best-effort;
 /// startup reconcile heals any residue.
 async fn revert_reservations(
     dr: &crate::config::DhcpReservations,
     store: &crate::unlimited_clients::UnlimitedClientsStore,
-    flavor: crate::dhcp::Flavor,
 ) {
     let clients = store.list().await;
-    let content = crate::dhcp_hosts::render(&clients, flavor);
+    let content = crate::dhcp_hosts::render(&clients);
     if let Err(err) = crate::dhcp_hosts::apply(dr, &content).await {
         error!("rollback: dhcp reservations revert failed: {err} (reconcile will heal)");
     }
@@ -2131,15 +2130,13 @@ async fn unlimited_create(
     let no_shape = crate::ipset::IPSet::new(&ctx.no_shape_name);
     let acl = crate::ipset::IPSet::new(&ctx.acl_name);
 
-    // Transaction: dhcp reservation (gated by `dhcpd -t`) -> ipset -> store.
+    // Transaction: dhcp reservation (gated by `dnsmasq --test`) -> ipset -> store.
     // Compensate in reverse on failure; store is written last so it never records
     // a client whose side effects didn't land.
     let mut desired = ctx.store.list().await;
     desired.push(client.clone());
-    match crate::dhcp_hosts::apply(&dr, &crate::dhcp_hosts::render(&desired, ctx.params.flavor))
-        .await
-    {
-        // Daemon deliberately down (cutover window): the reservation is left pending
+    match crate::dhcp_hosts::apply(&dr, &crate::dhcp_hosts::render(&desired)).await {
+        // Daemon deliberately down: the reservation is left pending
         // for the next reconcile. ipset + store still proceed (store is the source of
         // truth); surface it so the deferral isn't silent.
         Ok(crate::dhcp_hosts::Applied::SkippedInactive) => warn!(
@@ -2155,20 +2152,20 @@ async fn unlimited_create(
     }
     if let Err(err) = no_shape.add(&client.ip, Some(0)) {
         error!("ipset add no_shape failed: {err}");
-        revert_reservations(&dr, &ctx.store, ctx.params.flavor).await;
+        revert_reservations(&dr, &ctx.store).await;
         return Err(APIError::InternalError);
     }
     if let Err(err) = acl.add(&client.ip, Some(0)) {
         error!("ipset add acl failed: {err}");
         rollback_ipset(&no_shape, &client.ip);
-        revert_reservations(&dr, &ctx.store, ctx.params.flavor).await;
+        revert_reservations(&dr, &ctx.store).await;
         return Err(APIError::InternalError);
     }
     if let Err(err) = ctx.store.add(client.clone()).await {
         error!("unlimited store add failed: {err}");
         rollback_ipset(&acl, &client.ip);
         rollback_ipset(&no_shape, &client.ip);
-        revert_reservations(&dr, &ctx.store, ctx.params.flavor).await;
+        revert_reservations(&dr, &ctx.store).await;
         return Err(APIError::InternalError);
     }
 
@@ -2210,7 +2207,7 @@ async fn unlimited_delete(
 
     // Side effects first (idempotent). If any fails, keep the store entry so the
     // client stays consistently unlimited; admin retries.
-    // Regenerate the dhcpd include without this client (gated by `dhcpd -t`).
+    // Regenerate the dnsmasq hostsfile without this client (gated by `dnsmasq --test`).
     if let Some(dr) = &ctx.dhcp_reservations {
         let remaining: Vec<_> = ctx
             .store
@@ -2219,12 +2216,7 @@ async fn unlimited_delete(
             .into_iter()
             .filter(|c| c.name != client.name)
             .collect();
-        match crate::dhcp_hosts::apply(
-            dr,
-            &crate::dhcp_hosts::render(&remaining, ctx.params.flavor),
-        )
-        .await
-        {
+        match crate::dhcp_hosts::apply(dr, &crate::dhcp_hosts::render(&remaining)).await {
             Ok(crate::dhcp_hosts::Applied::SkippedInactive) => warn!(
                 "unlimited delete {}: DHCP reload skipped (daemon inactive) — removal \
                  pending until reconcile",

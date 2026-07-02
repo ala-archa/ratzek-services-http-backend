@@ -2,7 +2,7 @@
 authors = ["Evgenii Lepikhin <e.lepikhin@corp.mail.ru>"]
 edition = "2021"
 name = "ala-archa-http-backend"
-version = "0.1.26"
+version = "0.1.27"
 
 [profile.release]
 # Release compile-time optimizations
@@ -42,7 +42,6 @@ actix-web = "4.3"
 derive_more = "0.99"
 surge-ping = "0.7"
 tokio = { version = "1.25", features = ["process", "rt", "macros"] }
-dhcpd_parser = { git = "https://github.com/ala-archa/dhcpd-parser", rev = "13c6fac0e69ce080e009396bfb7fa70882601d8e" }
 prometheus_exporter_base = "1.4"
 tokio-cron-scheduler = "0.13.0"
 reqwest = { version = "0.12.9", features = ["json"] }

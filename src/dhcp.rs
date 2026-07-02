@@ -1,78 +1,22 @@
-//! Backend-owned DHCP lease model + parsers, abstracting over the DHCP server
-//! flavor (EOL ISC dhcpd vs dnsmasq). Consumers depend only on [`Lease`] /
-//! [`Leases`] here, never on `dhcpd_parser` directly, so the flavor can be swapped
-//! at runtime and the parser dependency dropped once ISC is gone.
-//!
-//! The model is a **superset**: the ISC adapter fills every field (behavior stays
-//! byte-identical to the old code), while the dnsmasq adapter leaves ISC-only fields
-//! `None` and derives what it can from the leaner `dnsmasq.leases` format.
+//! Backend-owned DHCP lease model + dnsmasq lease-file parser. Consumers depend
+//! only on [`Lease`] / [`Leases`] here. (Historically this abstracted over ISC
+//! dhcpd too; after the dnsmasq migration finalized, the ISC adapter and the
+//! `dhcpd_parser` dependency were dropped — the backend is dnsmasq-only.)
 
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 
-/// Which DHCP server the box is running. Selected once at startup (see
-/// `State::dhcp_flavor`) from the active daemon; the whole rest of the backend
-/// reads that single snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Flavor {
-    Isc,
-    Dnsmasq,
-}
-
-/// Systemd unit names probed by [`Flavor::detect`].
-const DNSMASQ_UNIT: &str = "dnsmasq";
-const ISC_UNIT: &str = "isc-dhcp-server";
-
-impl Flavor {
-    fn is_active(unit: &str) -> bool {
-        std::process::Command::new("systemctl")
-            .args(["is-active", "--quiet", unit])
-            .status()
-            .is_ok_and(|s| s.success())
-    }
-
-    /// Auto-detect the flavor from the active daemon (blocking: spawns `systemctl`).
-    /// neither-active → `Isc` (the known-good fallback); both-active → `Isc` + warns.
-    /// Callers must run this off the async executor (see `State::new` — it wraps this
-    /// in `spawn_blocking` + a timeout so a hung systemd can't block startup).
-    pub fn detect() -> Self {
-        let dnsmasq = Self::is_active(DNSMASQ_UNIT);
-        let isc = Self::is_active(ISC_UNIT);
-        match (dnsmasq, isc) {
-            (true, true) => {
-                slog_scope::error!(
-                    "DHCP flavor auto-detect: BOTH dnsmasq and isc-dhcp-server active — \
-                     falling back to isc (known-good). Fix the cutover state."
-                );
-                Self::Isc
-            }
-            (true, false) => Self::Dnsmasq,
-            // dnsmasq inactive (incl. neither active) -> isc fallback.
-            (false, _) => Self::Isc,
-        }
-    }
-}
-
-/// Config value for the DHCP flavor (`auto` by default).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum FlavorSetting {
-    #[default]
-    Auto,
-    Isc,
-    Dnsmasq,
-}
-
-/// The two lease-parsing inputs that always travel together: the resolved server
-/// `flavor` and the configured lease length (for the dnsmasq `last_seen` approx).
+/// Lease-parsing input: the configured DHCP lease length, used to approximate
+/// `last_seen`/`cltt` (dnsmasq's lease file has no client-last-transaction time).
 /// Snapshot once from `State` (see `State::dhcp_params`) and pass to `Dhcp::read`.
 #[derive(Debug, Clone, Copy)]
 pub struct DhcpParams {
-    pub flavor: Flavor,
     pub lease_secs: i64,
 }
 
-/// Lease binding state (backend-owned so `dhcpd_parser` can be removed at finalize).
+/// Lease binding state. dnsmasq's lease file normally holds only active leases;
+/// an expired-but-not-yet-pruned one maps to `Free`. `Abandoned` is retained for
+/// the API contract but never produced under dnsmasq.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingState {
     Active,
@@ -80,28 +24,28 @@ pub enum BindingState {
     Abandoned,
 }
 
-/// One DHCP lease, superset over ISC and dnsmasq. See module docs.
+/// One DHCP lease. Some fields (`client_hostname`, `vendor`, `starts`, `ends`) are
+/// ISC-era and always `None` under dnsmasq — kept so the `/dhcp` API contract (the
+/// frontend expects these keys) is preserved.
 #[derive(Debug, Clone)]
 pub struct Lease {
-    /// Hardware (MAC) address as written by the server. `None` if absent (ISC can
-    /// have MAC-less leases; dnsmasq always has one).
+    /// Hardware (MAC) address as written by the server.
     pub mac: Option<String>,
     pub ip: String,
     pub hostname: Option<String>,
-    /// ISC `client-hostname`. Always `None` under dnsmasq.
+    /// Always `None` under dnsmasq (kept for the `/dhcp` contract).
     pub client_hostname: Option<String>,
-    /// ISC `vendor-class-identifier`. Always `None` under dnsmasq.
+    /// Always `None` under dnsmasq (kept for the `/dhcp` contract).
     pub vendor: Option<String>,
     pub binding_state: BindingState,
-    /// ISC `starts` as its raw display string. `None` under dnsmasq (kept a string,
-    /// NOT epoch, to preserve the `/dhcp` contract).
+    /// Always `None` under dnsmasq (kept for the `/dhcp` contract).
     pub starts: Option<String>,
-    /// ISC `ends` as its raw display string. `None` under dnsmasq.
+    /// Always `None` under dnsmasq (kept for the `/dhcp` contract).
     pub ends: Option<String>,
-    /// Client-last-transaction time ("last seen"), unix epoch sec UTC. Under dnsmasq
-    /// this is approximated as `expiry - lease_secs` (`None` for an infinite lease).
+    /// Client-last-transaction time ("last seen"), unix epoch sec UTC — approximated
+    /// as `expiry - lease_secs` (`None` for an infinite lease).
     pub cltt: Option<i64>,
-    /// Last transaction time, unix epoch sec UTC. Under dnsmasq = the lease `expiry`.
+    /// Last transaction time, unix epoch sec UTC = the lease `expiry`.
     pub tstp: Option<i64>,
 }
 
@@ -121,24 +65,28 @@ impl Leases {
 pub struct Dhcp;
 
 impl Dhcp {
-    /// Parse the lease file for the given [`DhcpParams`] (flavor + lease length).
+    /// Parse the dnsmasq lease file.
     ///
     /// # Errors
-    /// Returns an error if the file cannot be read, or (ISC only) fails to parse.
+    /// Returns an error if the file cannot be read.
     pub fn read(leases: &Path, params: DhcpParams) -> Result<Leases> {
         let s = std::fs::read_to_string(leases)
             .with_context(|| format!("Failed to read {leases:?}"))?;
-        let v = match params.flavor {
-            Flavor::Isc => parse_isc(&s, leases)?,
-            Flavor::Dnsmasq => parse_dnsmasq(&s, params.lease_secs, chrono::Utc::now().timestamp()),
-        };
+        let v = parse_dnsmasq(&s, params.lease_secs, chrono::Utc::now().timestamp());
+        // A non-empty file that yields zero leases usually means a wrong path or a
+        // non-dnsmasq lease format — surface it rather than silently showing "no clients".
+        if v.is_empty() && !s.trim().is_empty() {
+            slog_scope::warn!(
+                "Dhcp::read: {leases:?} is non-empty but parsed 0 leases — wrong path or format?"
+            );
+        }
         Ok(Leases(v))
     }
 
     /// Find the lease for `ip`.
     ///
     /// # Errors
-    /// Returns an error if the file can't be read/parsed, or no lease matches `ip`.
+    /// Returns an error if the file can't be read, or no lease matches `ip`.
     pub fn of_ip(leases: &Path, params: DhcpParams, ip: &str) -> Result<Lease> {
         Self::read(leases, params)?
             .of_ip(ip)
@@ -146,38 +94,7 @@ impl Dhcp {
     }
 }
 
-/// ISC `dhcpd.leases` adapter — fills the full superset (behaviour identical to the
-/// pre-migration code).
-fn parse_isc(s: &str, path: &Path) -> Result<Vec<Lease>> {
-    use dhcpd_parser::leases::BindingState as B;
-    use dhcpd_parser::parser::LeasesMethods;
-    let parsed = dhcpd_parser::parser::parse(s.to_string())
-        .map_err(|err| anyhow!("Failed to parse {:?}: {}", path, err))?;
-    let out = parsed
-        .leases
-        .all()
-        .into_iter()
-        .map(|l| Lease {
-            mac: l.hardware.map(|h| h.mac),
-            ip: l.ip,
-            hostname: l.hostname,
-            client_hostname: l.client_hostname,
-            vendor: l.vendor_class_identifier,
-            binding_state: match l.binding_state {
-                B::Active => BindingState::Active,
-                B::Free => BindingState::Free,
-                B::Abandoned => BindingState::Abandoned,
-            },
-            starts: l.dates.starts.map(|d| d.to_string()),
-            ends: l.dates.ends.map(|d| d.to_string()),
-            cltt: l.dates.cltt.as_ref().and_then(date_to_epoch),
-            tstp: l.dates.tstp.as_ref().and_then(date_to_epoch),
-        })
-        .collect();
-    Ok(out)
-}
-
-/// dnsmasq lease-file adapter. Each lease is a line:
+/// dnsmasq lease-file parser. Each lease is a line:
 /// `<expiry_epoch> <mac> <ip> <hostname|*> <clientid|*>`. IPv6/DUID lines (which
 /// carry `duid` on their own line or a non-dotted address) are skipped silently;
 /// any OTHER malformed line is skipped but counted and logged once (so a corrupt
@@ -235,45 +152,9 @@ fn parse_dnsmasq(s: &str, lease_secs: i64, now: i64) -> Vec<Lease> {
     out
 }
 
-/// Convert a dhcpd lease `Date` (UTC, as written in `dhcpd.leases`) to unix epoch
-/// seconds. `None` if the calendar fields don't form a valid UTC instant.
-fn date_to_epoch(d: &dhcpd_parser::common::Date) -> Option<i64> {
-    use chrono::TimeZone;
-    chrono::Utc
-        .with_ymd_and_hms(
-            i32::try_from(d.year).ok()?,
-            u32::try_from(d.month).ok()?,
-            u32::try_from(d.day).ok()?,
-            u32::try_from(d.hour).ok()?,
-            u32::try_from(d.minute).ok()?,
-            u32::try_from(d.second).ok()?,
-        )
-        .single()
-        .map(|dt| dt.timestamp())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn date_to_epoch_converts_utc() {
-        use dhcpd_parser::common::Date;
-        let at = |year, month, day, hour, minute, second| {
-            date_to_epoch(&Date {
-                weekday: 0,
-                year,
-                month,
-                day,
-                hour,
-                minute,
-                second,
-            })
-        };
-        assert_eq!(at(1970, 1, 1, 0, 0, 0), Some(0));
-        assert_eq!(at(2000, 1, 1, 0, 0, 0), Some(946_684_800));
-        assert_eq!(at(2020, 13, 1, 0, 0, 0), None);
-    }
 
     #[test]
     fn dnsmasq_parse_basic_and_sentinels() {
@@ -309,29 +190,29 @@ duid 00:01:00:01
     }
 
     #[test]
-    fn isc_adapter_maps_fields_verbatim() {
-        // Guards the "inert under flavor=isc" invariant: the superset must carry the
-        // same field values the consumers read from `dhcpd_parser` directly before.
+    fn dnsmasq_parse_skips_malformed_lines() {
+        // <3 fields, and a non-numeric expiry — both malformed, dropped from output.
         let s = "\
-lease 10.11.5.60 {
-  starts 5 2024/01/05 10:00:00;
-  ends 5 2024/01/05 22:00:00;
-  cltt 5 2024/01/05 10:00:00;
-  binding state active;
-  hardware ethernet aa:bb:cc:dd:ee:01;
-  client-hostname \"laptop\";
-}";
-        let v = parse_isc(s, Path::new("test")).unwrap();
-        let l = v
-            .iter()
-            .find(|l| l.ip == "10.11.5.60")
-            .expect("lease parsed");
-        assert_eq!(l.mac.as_deref(), Some("aa:bb:cc:dd:ee:01"));
-        assert_eq!(l.binding_state, BindingState::Active);
-        // cltt 2024-01-05 10:00:00 UTC -> epoch, computed inside the adapter (was
-        // `date_to_epoch(dates.cltt)` in the consumer before).
-        assert_eq!(l.cltt, Some(1_704_448_800));
-        // starts/ends stay display strings (contract of /dhcp), not epochs.
-        assert!(l.starts.is_some() && l.ends.is_some());
+too few
+notanumber aa:bb:cc:dd:ee:09 10.11.5.70 name *
+1000043200 aa:bb:cc:dd:ee:01 10.11.5.60 laptop *
+";
+        let v = parse_dnsmasq(s, 43_200, 1_000_000_000);
+        assert_eq!(v.len(), 1, "only the well-formed line survives");
+        assert_eq!(v[0].ip, "10.11.5.60");
+    }
+
+    #[test]
+    fn leases_of_ip_hit_and_miss() {
+        let v = parse_dnsmasq("1000043200 aa:bb:cc:dd:ee:01 10.11.5.60 x *", 43_200, 1);
+        let leases = Leases(v);
+        // consuming of_ip: build twice to test hit then miss.
+        assert!(leases.of_ip("10.11.5.60").is_some());
+        let leases2 = Leases(parse_dnsmasq(
+            "1000043200 aa:bb:cc:dd:ee:01 10.11.5.60 x *",
+            43_200,
+            1,
+        ));
+        assert!(leases2.of_ip("10.11.5.99").is_none());
     }
 }

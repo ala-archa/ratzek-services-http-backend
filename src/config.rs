@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, net::IpAddr};
+use std::net::IpAddr;
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub enum LogLevel {
@@ -53,41 +53,34 @@ fn default_unlimited_subnet() -> String {
     "10.11.5.0/24".to_string()
 }
 
-fn default_dhcpd_validate_command() -> String {
-    "dhcpd -t".to_string()
-}
-
-fn default_dhcpd_reload_command() -> String {
-    "systemctl restart isc-dhcp-server".to_string()
-}
-
-/// How the backend manages dhcpd `host` reservations: it owns an include file
-/// (referenced from `dhcpd.conf` via `include "...";`), regenerates it from the
-/// unlimited-clients store, validates the config with `validate_command`, then
-/// applies it with `reload_command`. Replaces the OMAPI/omshell path, which is
-/// unreliable on this host. See `src/dhcp_hosts.rs`.
+/// How the backend manages dnsmasq reservations: it owns the `dhcp-hostsfile`
+/// (`include_path`), regenerates it from the unlimited-clients store, validates the
+/// config with `validate_command` (`dnsmasq --test`), then reloads dnsmasq with
+/// `reload_command` (SIGHUP). Replaces the OMAPI/omshell path, which was unreliable
+/// on this host. See `src/dhcp_hosts.rs`.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct DhcpReservations {
-    /// Absolute path to the include file the backend owns and rewrites.
+    /// Absolute path to the dnsmasq `dhcp-hostsfile` the backend owns and rewrites.
+    /// (Historically named `include_path` from the ISC-include era; semantically it
+    /// is now the hostsfile.)
     pub include_path: std::path::PathBuf,
-    /// Command that exits non-zero if the dhcpd config (incl. the include) is
-    /// invalid. Gates every restart so a bad file can't take dhcpd down.
-    #[serde(default = "default_dhcpd_validate_command")]
+    /// Command that exits non-zero if the config (incl. the hostsfile) is invalid,
+    /// e.g. `dnsmasq --test -C /etc/ratzek-dnsmasq.conf`. Gates every reload. Required
+    /// (no default — the exact command is host-specific).
     pub validate_command: String,
-    /// Command that makes dhcpd load the regenerated include.
-    #[serde(default = "default_dhcpd_reload_command")]
+    /// Command that makes the daemon load the regenerated hostsfile, e.g.
+    /// `systemctl reload dnsmasq-ratzek`. Required (host-specific).
     pub reload_command: String,
     /// Optional systemd unit that `apply()` verifies is `is-active` BEFORE running
     /// `reload_command`; if inactive, the reload is skipped
-    /// (`Applied::SkippedInactive`) instead of (re)starting the daemon. Used during
-    /// the ISC→dnsmasq cutover so a stale reconcile under flavor=isc can't revive a
-    /// deliberately-stopped dhcpd (split-brain). Unset (default) → no guard.
+    /// (`Applied::SkippedInactive`) instead of (re)starting the daemon — so a stale
+    /// reconcile can't revive a deliberately-stopped daemon. Unset (default) → no guard.
     #[serde(default)]
     pub active_unit: Option<String>,
     /// Optional post-reload log scrape. dnsmasq applies `dhcp-hostsfile` silently
-    /// (`dnsmasq --test` can NOT catch a bad reservation line), so under dnsmasq the
-    /// only way to detect a rejected reservation is to read its log after the SIGHUP
-    /// reload. A match triggers a full rollback. Unset (default) → no scrape (ISC).
+    /// (`dnsmasq --test` can NOT catch a bad reservation line), so the only way to
+    /// detect a rejected reservation is to read its log after the SIGHUP reload. A
+    /// match triggers a full rollback. Unset (default) → no scrape.
     #[serde(default)]
     pub reload_log: Option<ReloadLog>,
 }
@@ -203,10 +196,6 @@ pub struct Config {
     pub dhcpd_leases: std::path::PathBuf,
     #[serde(default)]
     pub blacklisted_macs: Vec<String>,
-    /// Deprecated: superseded by the unlimited-clients store. Kept only so the
-    /// `migrate-unlimited` command can still read it; not used for classification.
-    #[serde(default)]
-    pub no_shaping_ips: HashSet<String>,
     pub no_shaping_timeout: u64,
     pub shaping_timeout: u64,
     pub speedtest: SpeedTest,
@@ -234,14 +223,9 @@ pub struct Config {
     pub device_metrics: Option<DeviceMetricsConfig>,
     #[serde(default)]
     pub history: Option<HistoryConfig>,
-    /// Which DHCP server backs the lease/reservation integration. `auto` (default)
-    /// detects the active daemon at startup; the inert migration deploy keeps ISC
-    /// behaviour until dnsmasq is the active daemon.
-    #[serde(default)]
-    pub dhcp_flavor: crate::dhcp::FlavorSetting,
     /// Configured DHCP lease length in seconds. Only used to approximate `last_seen`
     /// under dnsmasq (whose lease file lacks a client-last-transaction timestamp).
-    /// Keep in sync with the server's lease time (ISC/dnsmasq default 12h = 43200).
+    /// Keep in sync with the dnsmasq lease time (default 12h = 43200).
     #[serde(default = "default_dhcp_lease_secs")]
     pub dhcp_lease_secs: i64,
 }
@@ -270,8 +254,8 @@ impl Config {
             })?;
 
         if let Some(dr) = &self.dhcp_reservations {
-            // Absolute path: the file is written by a root daemon and referenced
-            // from dhcpd.conf; a relative path would be ambiguous.
+            // Absolute path: the hostsfile is written by a root daemon and read by
+            // dnsmasq (`dhcp-hostsfile=`); a relative path would be ambiguous.
             if !std::path::Path::new(&dr.include_path).is_absolute() {
                 anyhow::bail!(
                     "dhcp_reservations.include_path must be absolute, got {:?}",

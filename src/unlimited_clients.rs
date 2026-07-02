@@ -15,7 +15,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
-/// One unlimited client. Equals a dhcpd `host` reservation 1:1.
+/// One unlimited client. Equals a dnsmasq `dhcp-host` reservation 1:1.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnlimitedClient {
     pub name: String,

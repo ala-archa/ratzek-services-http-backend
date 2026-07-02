@@ -14,14 +14,11 @@ speedtest:
   speedtest_cli_path: /usr/local/bin/speedtest
   crontab: "0 15 */8 * * *"
 
-dhcpd_leases: /var/lib/dhcp/dhcpd.leases
+# dnsmasq lease file (the backend reads this to know who holds which IP).
+dhcpd_leases: /var/lib/misc/dnsmasq.leases
 
-# DHCP server flavor for the lease/reservation integration. `auto` (default) detects
-# the active daemon (dnsmasq vs isc-dhcp-server) at startup; leave unset to auto-detect
-# (stays ISC until dnsmasq becomes the active daemon).
-# dhcp_flavor: auto            # auto | isc | dnsmasq
-# Lease length in seconds — only used to approximate `last_seen` under dnsmasq (whose
-# lease file lacks a client-last-transaction timestamp). Match the server's lease time.
+# Lease length in seconds — used to approximate `last_seen` (dnsmasq's lease file
+# lacks a client-last-transaction timestamp). Match the server's lease time.
 # dhcp_lease_secs: 43200
 
 persistent_state_path: /var/tmp/ala-archa-http-backend.state
@@ -47,31 +44,26 @@ unlimited_subnet: "10.11.5.0/24"
 # rewrites this file; entries are checked in UNION with the static
 # `blacklisted_macs` below. Optional (defaults to this path).
 blacklist_path: /var/lib/ala-archa-http-backend/blacklist.yaml
-# dhcp_reservations: how the backend manages dhcpd `host` reservations for
-# unlimited clients. It owns the include file below (reference it from dhcpd.conf
-# with `include "/etc/dhcp/unlimited-hosts.conf";`), regenerates it from the store
-# on every CRUD change and on startup, validates with `dhcpd -t`, then restarts
-# dhcpd. The backend must run as root. Omit this section to disable reservation
-# management (then admin CRUD POST returns 500).
+# dhcp_reservations: how the backend manages dnsmasq reservations for unlimited
+# clients. It owns the hostsfile below (referenced from dnsmasq.conf via
+# `dhcp-hostsfile=/etc/ratzek-dnsmasq-hosts`), regenerates it from the store on every
+# CRUD change and on startup, validates with `dnsmasq --test`, then reloads dnsmasq
+# (SIGHUP). Backend runs as root. Omit to disable reservation management (admin CRUD
+# POST then returns 500).
 # dhcp_reservations:
-#   include_path: /etc/dhcp/unlimited-hosts.conf      # absolute; backend owns/rewrites it
-#   validate_command: "dhcpd -t"                       # must fail on an invalid config
-#   reload_command: "systemctl restart isc-dhcp-server"
-#   # --- ISC→dnsmasq migration knobs (both optional; unset = current ISC behaviour) ---
-#   # active_unit: if set, apply() verifies this unit is `is-active` BEFORE reload and
-#   # skips the reload when it's down (so a stale reconcile can't revive a stopped
-#   # dhcpd during cutover). Set to isc-dhcp-server while arming the cutover.
-#   # active_unit: isc-dhcp-server
-#   # reload_log: under dnsmasq, `validate` (dnsmasq --test) can NOT catch a bad
-#   # reservation line, so after reload the backend scrapes the daemon log; a match
-#   # rolls the hostsfile fully back. Requires `log-dhcp` + `log-facility=<file>` in
-#   # dnsmasq.conf. Under dnsmasq set include_path->hostsfile, validate_command->
-#   # "dnsmasq --test -C /etc/ratzek-dnsmasq.conf", reload_command->"systemctl reload dnsmasq-ratzek".
-#   # reload_log:
-#   #   file: /var/log/ratzek-dnsmasq.log   # absolute; the dnsmasq log-facility target
+#   include_path: /etc/ratzek-dnsmasq-hosts             # absolute; backend owns/rewrites it
+#   validate_command: "dnsmasq --test -C /etc/ratzek-dnsmasq.conf"
+#   reload_command: "systemctl reload dnsmasq-ratzek"
+#   # reload_log: dnsmasq applies a hostsfile SILENTLY on SIGHUP — `dnsmasq --test`
+#   # can NOT catch a bad reservation line — so after reload the backend scrapes the
+#   # daemon log; a match rolls the hostsfile fully back. Requires `log-dhcp` +
+#   # `log-facility=<file>` in dnsmasq.conf.
+#   reload_log:
+#     file: /var/log/ratzek-dnsmasq.log     # absolute; the dnsmasq log-facility target
 #   #   success_contains: "read"            # marks reload completion (default)
 #   #   error_contains: "at line"           # a hostsfile line with this = rejected (default)
 #   #   timeout_secs: 3                      # bounded scrape poll (default)
+#   # active_unit: <unit>                   # optional: skip reload if this unit is down
 
 # device_metrics: optional per-device metrics (first/last seen, accumulated traffic,
 # IP history) sampled periodically from dhcpd leases + ipset counters into SQLite and
