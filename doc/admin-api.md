@@ -434,7 +434,7 @@ curl -i -b jar "$BASE/api/v1/admin/unlimited-clients?sort=ip&order=asc&page=1&pe
 
 | Эндпоинт | `sort` ∈ | Доменные фильтры |
 |---|---|---|
-| `GET /admin/devices` | `last_seen`(деф.), `first_seen`, `bytes_total`, `bytes_today`, `bytes_7d`, `rate_bps`, `mac`, `last_ip` | `online`, `is_unlimited`, `has_acl`, `has_shaper`, `has_no_shape`, `is_blacklisted` (bool); `seen_within_days=N` (int ≥0) |
+| `GET /admin/devices` | `last_seen`(деф.), `first_seen`, `bytes_total`, `bytes_today`, `bytes_7d`, `rate_bps`, `rate_bps_live`, `mac`, `last_ip` | `online`, `is_unlimited`, `has_acl`, `has_shaper`, `has_no_shape`, `is_blacklisted` (bool); `seen_within_days=N` (int ≥0) |
 | `GET /admin/unlimited-clients` | `name`(деф.), `ip`, `mac`, `comment`, `last_seen`, `bytes_total`, `created_at` | `stale_reservation`, `online` (bool) |
 | `GET /dhcp` | `ip`(деф.), `mac`, `hostname`, `ends`, `last_seen` | `has_mac`, `has_acl`, `has_shaper` (bool); `ip_prefix=<str>` |
 | `GET /admin/blacklist` | `mac`(деф.), `created_at` | `source` ∈ `{store, config}` (иначе `400`) |
@@ -493,7 +493,7 @@ dhcpd) и `tstp` — **оба unix-секунды (i64, UTC)** или `null`, е
 
 ### `GET /api/v1/admin/devices` (требует сессии)
 Единый инвентарь всех известных устройств (по MAC). Пагинация/сортировка/фильтрация — как
-в §10. **`sort`** ∈ `{last_seen, first_seen, bytes_total, mac, last_ip}` (дефолт
+в §10 (полный `sort`-набор — в таблице §10). **`sort`** ∈ `{last_seen, first_seen, bytes_total, bytes_today, bytes_7d, rate_bps, rate_bps_live, mac, last_ip}` (дефолт
 `last_seen desc` имеет смысл — но дефолт-порядок `asc`; передавайте `order=desc`); **`q`** —
 substring по `mac`/`last_ip`/`hostname`/IP из истории. Заголовок `X-Total-Count`.
 ```jsonc
@@ -511,7 +511,10 @@ substring по `mac`/`last_ip`/`hostname`/IP из истории. Заголов
   "has_acl": true,                       // есть доступ в интернет (IP в ipset acl)
   "has_shaper": false,                   // под шейпингом (IP в ipset shaper)
   "has_no_shape": true,                  // безлимит, активен сейчас (IP в ipset no_shape)
-  "is_blacklisted": false                // MAC в чёрном списке (стор ∪ конфиг)
+  "is_blacklisted": false,               // MAC в чёрном списке (стор ∪ конфиг)
+  "rate_bps_live": 940000,               // ТЕКУЩАЯ скорость (байт/сек, up+down вместе), null если нет
+                                         // свежего сэмпла: offline / сэмплер off / сразу после рестарта
+  "bytes_last_min": 48000000             // суммарный трафик за последнюю минуту (байт), null аналогично
 }
 ```
 Если `device_metrics` выключен — эндпоинт отдаёт `200` с пустым массивом.
@@ -521,6 +524,13 @@ substring по `mac`/`last_ip`/`hostname`/IP из истории. Заголов
 > один текущий IP), а не из возможно устаревшего `last_ip`. Offline-устройство (нет аренды) → все флаги
 > `false`. `is_blacklisted` — по MAC. Best-effort: при сбое чтения ipset/аренд флаги `false`, не ошибка.
 > Фильтры — см. §10.
+>
+> **Live-потребление** (`rate_bps_live`/`bytes_last_min`) — отдельный in-memory сэмплер (по умолчанию раз
+> в 15с, секция конфига `live_traffic`) для вопроса «кто грузит канал **сейчас**». В отличие от `rate_bps`
+> (среднее за ~5 мин), это текущая скорость и трафик за последнюю минуту, up+down **суммарно** (ipset не
+> разделяет направление). Данные эфемерны (в памяти, теряются на рестарте → `null` до первого сэмпла).
+> Сортировка «кто больше грузит»: `?sort=rate_bps_live&order=desc`. Мониторинг свежести —
+> `ratzek_live_traffic_age_seconds` на `/metrics`.
 
 > **`online`** = «был ненулевой трафик за последний (свежий) интервал сэмплера (~5 мин)», а НЕ
 > «держит DHCP-аренду». Подключённое, но полностью простаивающее устройство → `online=false`.

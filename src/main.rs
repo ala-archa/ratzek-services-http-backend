@@ -13,6 +13,7 @@ mod error;
 mod history;
 mod http;
 mod ipset;
+mod live_traffic;
 mod mobile_provider;
 mod persistent_state;
 mod session;

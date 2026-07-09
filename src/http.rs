@@ -572,6 +572,25 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
             age as f64,
         );
     }
+    // Live-traffic sampler health. Aggregates only — no per-MAC labels (MAC is
+    // network PII; per-device data is served only under AuthSession at /admin/devices).
+    let (live_last_sample, live_enabled) = {
+        let s = state.lock().await;
+        (s.live_last_sample(), s.live_traffic_enabled())
+    };
+    out += &gauge(
+        "ratzek_live_traffic_enabled",
+        "Whether live-traffic sampling is enabled (1) or off (0)",
+        live_enabled as i64 as f64,
+    );
+    if live_last_sample > 0 {
+        let age = (chrono::Utc::now().timestamp() - live_last_sample).max(0);
+        out += &gauge(
+            "ratzek_live_traffic_age_seconds",
+            "Seconds since the last successful live-traffic sample",
+            age as f64,
+        );
+    }
     Ok(out)
 }
 
@@ -1124,6 +1143,11 @@ struct DeviceView {
     has_shaper: bool,
     has_no_shape: bool,
     is_blacklisted: bool,
+    // Live consumption from the in-memory sampler (null when there's no fresh sample
+    // for this MAC, e.g. offline, sampler disabled, or just after a restart). These
+    // live at the top level of `DeviceView`, NOT inside the flattened `device`.
+    rate_bps_live: Option<i64>,
+    bytes_last_min: Option<i64>,
 }
 
 #[get("/api/v1/admin/devices")]
@@ -1141,6 +1165,7 @@ async fn admin_devices(
             "bytes_today",
             "bytes_7d",
             "rate_bps",
+            "rate_bps_live",
             "mac",
             "last_ip",
         ],
@@ -1162,9 +1187,9 @@ async fn admin_devices(
         ),
     };
 
-    let deps = {
+    let (deps, live) = {
         let s = state.lock().await;
-        ClassifyDeps::snapshot(&s)
+        (ClassifyDeps::snapshot(&s), s.live_traffic().clone())
     };
     // Metrics disabled -> empty inventory (not an error).
     let metrics = match deps.metrics {
@@ -1188,17 +1213,28 @@ async fn admin_devices(
     );
 
     let now = chrono::Utc::now().timestamp();
-    let (rows, membership, lease_ips) = tokio::task::spawn_blocking(move || {
+    // Do all blocking reads off the async runtime. The live snapshot is an in-memory
+    // read but joins the same blocking task so `RwLock::read()` never runs on an
+    // executor thread (absent MAC -> null live fields).
+    let (rows, membership, lease_ips, live_points) = tokio::task::spawn_blocking(move || {
         let rows = metrics.all_devices(now).unwrap_or_else(|e| {
             error!("device-metrics all_devices failed: {e:#}");
             Vec::new()
         });
         let membership = IpsetMembership::read(&acl_name, &shaper_name, &no_shape_name);
         let lease_ips = active_lease_ips_or_empty(&leases_path, dhcp_params);
-        (rows, membership, lease_ips)
+        let live_points = live.snapshot(now);
+        (rows, membership, lease_ips, live_points)
     })
     .await
-    .unwrap_or_else(|_| (Vec::new(), IpsetMembership::empty(), HashMap::new()));
+    .unwrap_or_else(|_| {
+        (
+            Vec::new(),
+            IpsetMembership::empty(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+    });
 
     let no_ips: Vec<String> = Vec::new();
     let mut views: Vec<DeviceView> = rows
@@ -1207,6 +1243,7 @@ async fn admin_devices(
             let is_unlimited = unlimited_macs.contains(&d.mac);
             let is_blacklisted = blacklisted.contains(&d.mac);
             let flags = membership.flags_for(lease_ips.get(&d.mac).unwrap_or(&no_ips));
+            let lp = live_points.get(&d.mac);
             DeviceView {
                 device: d,
                 is_unlimited,
@@ -1214,6 +1251,8 @@ async fn admin_devices(
                 has_shaper: flags.has_shaper,
                 has_no_shape: flags.has_no_shape,
                 is_blacklisted,
+                rate_bps_live: lp.and_then(|p| p.rate_bps_live),
+                bytes_last_min: lp.map(|p| p.bytes_last_min),
             }
         })
         .collect();
@@ -1261,6 +1300,8 @@ async fn admin_devices(
             "bytes_today" => a.device.bytes_today.cmp(&b.device.bytes_today),
             "bytes_7d" => a.device.bytes_7d.cmp(&b.device.bytes_7d),
             "rate_bps" => a.device.rate_bps.cmp(&b.device.rate_bps),
+            // Top-level DeviceView field (not inside the flattened `device`).
+            "rate_bps_live" => a.rate_bps_live.cmp(&b.rate_bps_live),
             "mac" => a.device.mac.cmp(&b.device.mac),
             "last_ip" => cmp_ip(
                 a.device.last_ip.as_deref().unwrap_or(""),
@@ -2596,6 +2637,8 @@ mod tests {
             has_shaper: false,
             has_no_shape: true,
             is_blacklisted: false,
+            rate_bps_live: Some(2048),
+            bytes_last_min: Some(4096),
         };
         let v = serde_json::to_value(&view).unwrap();
         // Flatten must not nest the row under a "device" key.
@@ -2606,6 +2649,9 @@ mod tests {
         assert_eq!(v["online"], true);
         assert_eq!(v["is_unlimited"], false);
         assert_eq!(v["first_seen"], 100);
+        // Live fields serialize at the top level too.
+        assert_eq!(v["rate_bps_live"], 2048);
+        assert_eq!(v["bytes_last_min"], 4096);
     }
 
     #[test]

@@ -155,6 +155,38 @@ pub struct DeviceMetricsConfig {
     pub retention_5min_hours: i64,
 }
 
+fn default_live_traffic_enabled() -> bool {
+    true
+}
+
+fn default_live_traffic_crontab() -> String {
+    // Every 15 seconds (6-field cron). Two `ipset save` calls per tick is modest even
+    // on the Pi; 15s trades a little freshness for less subprocess churn than 10s.
+    "*/15 * * * * *".to_string()
+}
+
+fn default_live_traffic_window_secs() -> i64 {
+    60
+}
+
+/// Optional live per-device bandwidth sampler: an in-memory task reads ipset byte
+/// counters every ~15s and exposes `bytes_last_min` (total bytes over the last
+/// minute) + `rate_bps_live` (current bytes/sec) on `GET /api/v1/admin/devices` —
+/// "who is using the channel right now". Data is ephemeral (lost on restart). Omit
+/// the section to disable; `enabled: false` also disables. See `src/live_traffic.rs`.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct LiveTrafficConfig {
+    /// Enable the sampler (default true when the section is present).
+    #[serde(default = "default_live_traffic_enabled")]
+    pub enabled: bool,
+    /// 6-field cron for the sampler (default every 15s).
+    #[serde(default = "default_live_traffic_crontab")]
+    pub crontab: String,
+    /// Rolling window (seconds) for `bytes_last_min` / rate freshness (default 60).
+    #[serde(default = "default_live_traffic_window_secs")]
+    pub window_secs: i64,
+}
+
 fn default_history_retention_days() -> i64 {
     90
 }
@@ -223,6 +255,8 @@ pub struct Config {
     pub device_metrics: Option<DeviceMetricsConfig>,
     #[serde(default)]
     pub history: Option<HistoryConfig>,
+    #[serde(default)]
+    pub live_traffic: Option<LiveTrafficConfig>,
     /// Configured DHCP lease length in seconds. Only used to approximate `last_seen`
     /// under dnsmasq (whose lease file lacks a client-last-transaction timestamp).
     /// Keep in sync with the dnsmasq lease time (default 12h = 43200).
@@ -320,6 +354,18 @@ impl Config {
             }
             if h.retention_days < 0 {
                 anyhow::bail!("history.retention_days must be >= 0");
+            }
+        }
+
+        if let Some(lt) = &self.live_traffic {
+            if lt.crontab.trim().is_empty() {
+                anyhow::bail!("live_traffic.crontab must be non-empty");
+            }
+            if lt.window_secs <= 0 {
+                anyhow::bail!(
+                    "live_traffic.window_secs must be > 0, got {}",
+                    lt.window_secs
+                );
             }
         }
 

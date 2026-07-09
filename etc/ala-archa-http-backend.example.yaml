@@ -87,6 +87,18 @@ blacklist_path: /var/lib/ala-archa-http-backend/blacklist.yaml
 #   db_path: /var/lib/ala-archa-http-backend/history.sqlite   # absolute
 #   retention_days: 90           # drop WAN readings / events older than this
 
+# live_traffic: optional in-memory live-bandwidth sampler. Reads ipset byte counters
+# every ~15s and adds `bytes_last_min` (total bytes over the last minute) and
+# `rate_bps_live` (current bytes/sec, up+down combined) to each device in
+# GET /api/v1/admin/devices — "who is using the channel right now". Sort with
+# ?sort=rate_bps_live&order=desc. Data is ephemeral (in memory, lost on restart) and
+# never touches disk. Omit the section or set enabled: false to disable (fields then
+# read null). Exposes ratzek_live_traffic_{enabled,age_seconds} on /metrics.
+# live_traffic:
+#   enabled: true                # default true when the section is present
+#   crontab: "*/15 * * * * *"    # 6-field cron; every 15s (default)
+#   window_secs: 60              # rolling window for bytes_last_min / rate (default)
+
 telegram:
   bot_token: "123456:ABC-asdasdasdasd"
   retry_crontab: "30 */5 * * * *"

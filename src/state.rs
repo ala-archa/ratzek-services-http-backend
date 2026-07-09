@@ -1,6 +1,6 @@
 use crate::speedtest::SpeedTest;
 use anyhow::bail;
-use slog_scope::{error, info, warn};
+use slog_scope::{debug, error, info, warn};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -164,6 +164,90 @@ async fn sample_device_metrics(state: Arc<Mutex<State>>) {
     }
 }
 
+/// One live-traffic sampling pass: read active leases (IP→MAC) + ipset counters and
+/// feed them to the in-memory store. Heavy (blocking) work runs in `spawn_blocking`.
+/// Best-effort: any failure is logged and the next tick retries. No SQLite — purely
+/// in-memory, so it never touches the (flaky) SSD.
+async fn sample_live_traffic(state: Arc<Mutex<State>>) {
+    let (live, live_last_sample, leases_path, traffic_sets, params) = {
+        let s = state.lock().await;
+        (
+            s.live_traffic.clone(),
+            s.live_last_sample.clone(),
+            s.config.dhcpd_leases.clone(),
+            // Same counter sets as device-metrics: shaper (rate-limited) + no_shape
+            // (unlimited). A client is in exactly one; acl has no counters.
+            vec![
+                s.config.ipset_shaper_name.clone(),
+                s.config.ipset_no_shape_name.clone(),
+            ],
+            s.dhcp_params(),
+        )
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let result = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<crate::live_traffic::SampleStats> {
+            // IP -> MAC from active leases. Without it no counter can be attributed,
+            // so a leases read failure aborts the whole tick (propagated as Err).
+            let leases = crate::dhcp::Dhcp::read(&leases_path, params)?;
+            let mut ip_to_mac: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for l in leases.all() {
+                if l.binding_state != crate::dhcp::BindingState::Active {
+                    continue;
+                }
+                if let Some(mac) = l
+                    .mac
+                    .as_ref()
+                    .and_then(|m| crate::unlimited_clients::normalize_mac(m))
+                {
+                    ip_to_mac.insert(l.ip.clone(), mac);
+                }
+            }
+
+            // Union counters from all traffic sets, deduped by IP. Best-effort per
+            // set: a failing set is logged and skipped (partial data beats no data).
+            let mut by_ip: std::collections::HashMap<String, crate::device_metrics::IpsetCounter> =
+                std::collections::HashMap::new();
+            for set in &traffic_sets {
+                match crate::ipset::IPSet::new(set).entries() {
+                    Ok(entries) => {
+                        for e in entries {
+                            by_ip.insert(
+                                e.ip.clone(),
+                                crate::device_metrics::IpsetCounter {
+                                    ip: e.ip,
+                                    bytes: e.bytes.unwrap_or(0) as i64,
+                                    packets: e.packets.unwrap_or(0) as i64,
+                                },
+                            );
+                        }
+                    }
+                    Err(err) => warn!("live-traffic: ipset {set} read failed: {err:#}"),
+                }
+            }
+            let counters: Vec<crate::device_metrics::IpsetCounter> = by_ip.into_values().collect();
+
+            Ok(live.ingest(&counters, &ip_to_mac, now))
+        },
+    )
+    .await;
+
+    match result {
+        Ok(Ok(stats)) => {
+            live_last_sample.store(now, Ordering::SeqCst);
+            // Routine → debug (this ticks every ~15s; don't flood the journal).
+            debug!(
+                "live-traffic sample: {} macs, {} series points, {} counters",
+                stats.macs_tracked, stats.series_points, stats.ips_read
+            );
+        }
+        Ok(Err(err)) => error!("live-traffic sample failed: {err:#}"),
+        Err(err) => error!("live-traffic sample task panicked: {err}"),
+    }
+}
+
 pub struct State {
     config: crate::config::Config,
     scheduler: tokio_cron_scheduler::JobScheduler,
@@ -177,6 +261,11 @@ pub struct State {
     blacklist: crate::blacklist::BlacklistStore,
     /// Optional WAN-history + event-log store (None if disabled or DB couldn't open).
     history: Option<Arc<crate::history::HistoryStore>>,
+    /// In-memory live-traffic store (always present, cheap; empty when the sampler
+    /// is disabled). Populated by `sample_live_traffic`, read by `/admin/devices`.
+    live_traffic: Arc<crate::live_traffic::LiveTraffic>,
+    /// Unix epoch of the last successful live-traffic sample (0 = never), for monitoring.
+    live_last_sample: Arc<AtomicI64>,
 }
 
 impl State {
@@ -391,6 +480,37 @@ impl State {
                 .await?;
         }
 
+        if let Some(lt_cfg) = &state_guard.config.live_traffic {
+            if lt_cfg.enabled {
+                let state1 = state.clone();
+                // Ticks are frequent (~15s) and `ipset save` isn't instant, so guard
+                // against overlapping ticks (a hung tick just skips the next ones;
+                // freshness is surfaced via `ratzek_live_traffic_age_seconds`).
+                let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                info!(
+                    "Starting live-traffic sampler (window={}s)",
+                    lt_cfg.window_secs
+                );
+                state_guard
+                    .scheduler
+                    .add(Job::new_async(&lt_cfg.crontab, move |_uuid, _l| {
+                        let state1 = state1.clone();
+                        let running = running.clone();
+                        Box::pin(async move {
+                            if running.swap(true, Ordering::SeqCst) {
+                                warn!("live-traffic: previous sample still running, skipping tick");
+                                return;
+                            }
+                            let _guard = RunningGuard(running.clone());
+                            sample_live_traffic(state1).await;
+                        })
+                    })?)
+                    .await?;
+            } else {
+                info!("live-traffic sampler disabled (enabled=false)");
+            }
+        }
+
         state_guard.scheduler.start().await?;
 
         Ok(())
@@ -475,6 +595,17 @@ impl State {
             config.dhcpd_leases, config.dhcp_lease_secs
         );
 
+        // Live-traffic window from config (default 60s); the store is always present.
+        let live_window_secs = config
+            .live_traffic
+            .as_ref()
+            .map(|c| c.window_secs)
+            .unwrap_or(60)
+            .max(1);
+        let live_traffic = Arc::new(crate::live_traffic::LiveTraffic::new(
+            std::time::Duration::from_secs(live_window_secs as u64),
+        ));
+
         let state = Arc::new(Mutex::new(Self {
             config: config.clone(),
             persistent_state: crate::persistent_state::PersistentStateGuard::load_from_yaml(
@@ -486,6 +617,8 @@ impl State {
             metrics_last_sample: Arc::new(AtomicI64::new(0)),
             blacklist,
             history,
+            live_traffic,
+            live_last_sample: Arc::new(AtomicI64::new(0)),
         }));
 
         Ok(state)
@@ -521,6 +654,25 @@ impl State {
 
     pub fn blacklist(&self) -> &crate::blacklist::BlacklistStore {
         &self.blacklist
+    }
+
+    /// In-memory live-traffic store (per-MAC recent bandwidth).
+    pub fn live_traffic(&self) -> &Arc<crate::live_traffic::LiveTraffic> {
+        &self.live_traffic
+    }
+
+    /// Unix epoch of the last successful live-traffic sample (0 = never).
+    pub fn live_last_sample(&self) -> i64 {
+        self.live_last_sample.load(Ordering::SeqCst)
+    }
+
+    /// Whether the live-traffic sampler is enabled in config.
+    pub fn live_traffic_enabled(&self) -> bool {
+        self.config
+            .live_traffic
+            .as_ref()
+            .map(|c| c.enabled)
+            .unwrap_or(false)
     }
 
     /// Optional WAN-history + event-log store (None if disabled or DB couldn't open).
