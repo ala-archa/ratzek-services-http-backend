@@ -21,7 +21,9 @@
   Канонич. копия — `doc/ratzek-site.rules`. Детали — в разделе ниже.
 - **Каталог алертов Tier 2 — ПРИМЕНЁН (2026-07-10).** +7 правил в тот же файл (LTE-флап,
   sampler-стал, темп Pi, заряд АКБ на морозе, обвал acl, флап линка MikroTik, критич. баланс SIM).
-  Всего 18 правил, `promtool` SUCCESS, все `inactive`. Детали — в разделе ниже.
+- **Каталог алертов Tier 3 — ПРИМЕНЁН (2026-07-10).** +4 правила: **webcam-зависание** (по textfile-
+  метрике возраста снапшота — ловит камеру «под питанием, но мёртва по сети»), разбаланс ячеек АКБ,
+  MikroTik CPU/память. Всего **22 правила**, `promtool` SUCCESS, все `inactive`. Детали — ниже.
 
 **Отложено (тюнинг, отдельный шаг):** пороги/`for:` node-правил (`ansible_managed.rules`:
 InstanceDown 5m, clock 10m) — понаблюдать шум на ребутах; каталог Tier 2 (см. ниже).
@@ -224,5 +226,27 @@ Pi temp max 54 °C → >75; BMS min 7 °C (зимой ниже 0 — заряд 
 при <1200). Пропущены как шумные/дублирующие: rsrp/sinr (хронически слабый LTE, не actionable),
 speedtest (backend уже алертит по тарифу).
 
-Tier 3 (кандидаты): mikrotik free-mem/cpu, BMS cell-imbalance (`cell_voltage_delta`), детект зависания
-webcam-камеры по возрасту снапшота (нужна отдельная метрика).
+## Каталог алертов Tier 3 — ПРИМЕНЁН (2026-07-10)
+
++4 правила (всего **22**, `promtool` SUCCESS, все `inactive`).
+
+| Alert | expr | for | sev |
+|---|---|---|---|
+| RatzekWebcamStale | `time() - ratzek_webcam_last_image_timestamp > 1200` | 5m | warn |
+| RatzekBMSCellImbalance | `daly_bms_cell_voltage_delta_volts > 0.2` | 30m | warn |
+| RatzekMikrotikHighCPU | `mikrotik_system_cpu_load > 90` | 15m | warn |
+| RatzekMikrotikLowMemory | `free_memory / total_memory < 0.08` | 15m | warn |
+
+**RatzekWebcamStale — ловит зависание камеры «под питанием»** (тот июльский инцидент, который
+`poe_current==0` пропускает). Требует textfile-метрику `ratzek_webcam_last_image_timestamp`:
+- скрипт **`doc/webcam-freshness-metric.sh`** → `/usr/local/bin/webcam-freshness-metric.sh` (mtime
+  новейшего **непустого** .jpg в `/var/www/webcam_archive`; webcam-cron пишет файл каждые 5 мин даже
+  при сбое, но битый кадр = 0 байт, поэтому считаем непустые);
+- cron `*/5 * * * * /usr/local/bin/webcam-freshness-metric.sh`;
+- пишет в `/var/lib/node_exporter/webcam.prom` (node_exporter textfile collector уже включён,
+  `--collector.textfile.directory=/var/lib/node_exporter`). **NB: файл 0644** — node_exporter бежит
+  как `node-exp`, иначе `node_textfile_scrape_error=1` (скрипт делает `chmod 0644`).
+
+Калибровка: cell_delta max7д 0.442 (спайк на knee-разряде) → порог 0.2/30m (не транзиент); mikrotik
+CPU max7д 98% → >90; free_mem min7д 0.10 → <0.08. Пропущено: `mikrotik_health_voltage` (=24В-шина,
+дублирует BMS voltage-low).
