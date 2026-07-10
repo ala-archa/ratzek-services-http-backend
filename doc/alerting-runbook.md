@@ -7,9 +7,16 @@
 - **Фаза 2 — ВЫПОЛНЕНА.** Alertmanager `0.27.0` установлен (`/usr/local/bin`), `enabled`+`active`
   на `127.0.0.1:9093` (кластер выключен), конфиг `blackhole` (default) — в Telegram пока ничего
   не идёт; `amtool check-config` SUCCESS.
-- **Фаза 3 — предстоит.** Prometheus (`/usr/local/bin/prometheus`, reload=SIGHUP): правила
-  `ansible_managed.rules` (`Watchdog`, `InstanceDown`, node-fs/clock/conntrack) лежат, но секции
-  `alerting:` нет → никуда не маршрутизируются. После провязки алерты начнут течь.
+- **Фаза 3 — ВЫПОЛНЕНА.** Prometheus связан с AM (`alerting:` → `127.0.0.1:9093`) + scrape-job
+  `alertmanager` (self-monitoring, up). Правила `ansible_managed.rules` не тронуты. В «тихом окне»
+  firing только `Watchdog` (объект здоров).
+- **Фаза 4 — ВЫПОЛНЕНА. Алертинг ЖИВОЙ.** Маршрут AM: default → `backend-webhook`,
+  `Watchdog` → `blackhole`. Доставка AM→backend→Telegram подтверждена (тест-алерт дошёл в чат;
+  Watchdog не доставляется; `errors=0`). Реальные алерты (InstanceDown/clock/fs/conntrack) теперь
+  идут в чат «рацек-телеком».
+
+**Отложено (тюнинг, отдельный шаг):** пороги/`for:` правил (сейчас дефолтные: InstanceDown 5m,
+clock 10m) — понаблюдать шум на ребутах; каталог алертов объекта (см. ниже).
 
 Архитектура (алертер целиком на Pi — осознанное решение; при полной потере питания/LTE он
 падает вместе с хостом и «объект лёг» сам не сообщит):
