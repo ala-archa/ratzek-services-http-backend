@@ -217,6 +217,32 @@ pub struct Admin {
     pub cookie_secure: bool,
 }
 
+fn default_alert_queue_max_size() -> usize {
+    1000
+}
+
+/// Optional Alertmanager→Telegram alerting sink. Alertmanager (on this host) POSTs
+/// its webhook to `POST /alertmanager/webhook`; the handler authenticates with
+/// `webhook_token` (Bearer), formats the alerts, and enqueues them onto the shared
+/// Telegram queue (reuses `telegram.bot_token`) addressed to `telegram_chat_ids`.
+/// Requires the top-level `telegram` section (the queue + bot live there). Omit to
+/// disable (the endpoint then returns 404). See `src/alertmanager.rs`.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Alerting {
+    /// Shared secret the webhook requires in `Authorization: Bearer <token>`.
+    /// Compared in constant time. Minimum 16 chars (validated); prefer a 32+ byte
+    /// random value.
+    pub webhook_token: String,
+    /// Telegram chat id(s) the alerts are sent to (a dedicated alerts group;
+    /// negative id for groups). Kept separate from `mobile_provider.telegram_chat_ids`.
+    pub telegram_chat_ids: Vec<String>,
+    /// Cap on the persisted Telegram queue length: on enqueue from the webhook,
+    /// oldest messages beyond this are dropped (backpressure against an alert storm
+    /// on a resource-constrained host). Default 1000.
+    #[serde(default = "default_alert_queue_max_size")]
+    pub queue_max_size: usize,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub log_level: LogLevel,
@@ -234,6 +260,8 @@ pub struct Config {
     pub ping: Ping,
     #[serde(default)]
     pub telegram: Option<crate::telegram::Telegram>,
+    #[serde(default)]
+    pub alerting: Option<Alerting>,
     #[serde(default)]
     pub mobile_provider: Option<crate::mobile_provider::MobileProvider>,
     pub persistent_state_path: std::path::PathBuf,
@@ -366,6 +394,23 @@ impl Config {
                     "live_traffic.window_secs must be > 0, got {}",
                     lt.window_secs
                 );
+            }
+        }
+
+        if let Some(a) = &self.alerting {
+            // Delivery reuses the Telegram queue + bot, so `telegram` is required.
+            if self.telegram.is_none() {
+                anyhow::bail!("alerting is set but the top-level `telegram` section is missing");
+            }
+            // A blank token would let any local process post alerts; require a real secret.
+            if a.webhook_token.len() < 16 {
+                anyhow::bail!("alerting.webhook_token must be at least 16 chars");
+            }
+            if a.telegram_chat_ids.is_empty() {
+                anyhow::bail!("alerting.telegram_chat_ids must be non-empty");
+            }
+            if a.queue_max_size == 0 {
+                anyhow::bail!("alerting.queue_max_size must be > 0");
             }
         }
 

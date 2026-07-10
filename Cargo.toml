@@ -2,7 +2,7 @@
 authors = ["Evgenii Lepikhin <e.lepikhin@corp.mail.ru>"]
 edition = "2021"
 name = "ala-archa-http-backend"
-version = "0.1.28"
+version = "0.1.29"
 
 [profile.release]
 # Release compile-time optimizations
@@ -49,6 +49,8 @@ chrono = { version = "0.4.38", features = ["serde"] }
 humantime-serde = "1.1.1"
 rand = "0.8"
 argon2 = "0.5"
+# Constant-time byte comparison for the Alertmanager webhook Bearer token.
+subtle = "2.6"
 hex = "0.4"
 ipnet = "2.9"
 # `bundled` compiles SQLite from source (no system libsqlite3 needed; prod has gcc).

@@ -492,6 +492,23 @@ fn gauge(name: &str, help: &str, value: f64) -> String {
         .render()
 }
 
+fn counter(name: &str, help: &str, value: f64) -> String {
+    use prometheus_exporter_base::prelude::*;
+    PrometheusMetric::build()
+        .with_name(name)
+        .with_metric_type(MetricType::Counter)
+        .with_help(help)
+        .build()
+        .render_and_append_instance(&PrometheusInstance::new().with_value(value))
+        .render()
+}
+
+// Process-global counters for the Alertmanager webhook (single-process exporter,
+// so plain statics are sufficient). Atomic ordering is aliased to `AtomicOrdering`
+// at the use sites to disambiguate from `std::cmp::Ordering` (imported at the top).
+static ALERT_WEBHOOK_RECEIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ALERT_WEBHOOK_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[get("/metrics")]
 async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, APIError> {
     info!("Client requested prometheus exporter data");
@@ -591,7 +608,112 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
             age as f64,
         );
     }
+    // Alertmanager→Telegram pipeline self-observability.
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    out += &counter(
+        "ratzek_alert_webhook_received_total",
+        "Alertmanager webhook requests received (authenticated)",
+        ALERT_WEBHOOK_RECEIVED.load(AtomicOrdering::Relaxed) as f64,
+    );
+    out += &counter(
+        "ratzek_alert_webhook_errors_total",
+        "Alertmanager webhook processing errors (bad payload / enqueue failure)",
+        ALERT_WEBHOOK_ERRORS.load(AtomicOrdering::Relaxed) as f64,
+    );
+    let queue_len = state.lock().await.persistent_state().await.telegram_queue.len();
+    out += &gauge(
+        "ratzek_telegram_queue_len",
+        "Pending messages in the persistent Telegram send queue",
+        queue_len as f64,
+    );
     Ok(out)
+}
+
+/// Constant-time check of `Authorization: Bearer <token>` against the configured
+/// secret. Length is not secret; content comparison is constant-time.
+fn webhook_bearer_ok(req: &HttpRequest, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    match req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+    {
+        Some(tok) => tok.as_bytes().ct_eq(expected.as_bytes()).into(),
+        None => false,
+    }
+}
+
+/// Alertmanager webhook receiver. Enabled only when the `alerting` config section
+/// is present (otherwise 404). Contract tuned for Alertmanager's retry behaviour:
+/// bad/missing Bearer → 401; a valid token always yields 200 (even on a malformed
+/// payload or empty recipients), because Alertmanager retries only on 5xx/network
+/// errors — a 5xx or a hang here would trigger a retry storm over the weak uplink.
+/// Delivery is durable: messages go onto the backend's persistent Telegram queue.
+#[post("/alertmanager/webhook")]
+async fn alertmanager_webhook(
+    req: HttpRequest,
+    body: web::Bytes,
+    state: Data<Arc<Mutex<State>>>,
+) -> HttpResponse {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    // Snapshot config under a short lock; 404 when the feature is off.
+    let (alerting, telegram, ps) = {
+        let s = state.lock().await;
+        let cfg = s.config();
+        match (cfg.alerting.clone(), cfg.telegram.clone()) {
+            (Some(a), Some(t)) => (a, t, s.persistent_state_guard()),
+            _ => return HttpResponse::NotFound().finish(),
+        }
+    };
+
+    if !webhook_bearer_ok(&req, &alerting.webhook_token) {
+        warn!("alertmanager webhook: bad or missing bearer token");
+        return HttpResponse::Unauthorized().finish();
+    }
+    ALERT_WEBHOOK_RECEIVED.fetch_add(1, AtomicOrdering::Relaxed);
+
+    // Parse + format. Any application-level problem is logged and counted, but the
+    // response stays 200 so Alertmanager does not retry it.
+    let payload: crate::alertmanager::Webhook = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(err) => {
+            warn!("alertmanager webhook: bad payload: {err}");
+            ALERT_WEBHOOK_ERRORS.fetch_add(1, AtomicOrdering::Relaxed);
+            return HttpResponse::Ok().finish();
+        }
+    };
+    let Some(text) = crate::alertmanager::format_message(&payload) else {
+        return HttpResponse::Ok().finish(); // no alerts → nothing to send
+    };
+    info!("alertmanager webhook: {} alert(s)", payload.alerts.len());
+
+    // Send now (falls back to the persistent queue on failure).
+    telegram
+        .send_message(&ps, &alerting.telegram_chat_ids, &text)
+        .await;
+
+    // Backpressure: if the queue overflowed (Telegram unreachable during a storm),
+    // trim the oldest so the state file can't grow unbounded on this SD-card host.
+    // Read first (cheap) so the common happy path performs no extra disk write.
+    let cap = alerting.queue_max_size;
+    if ps.get().await.telegram_queue.len() > cap {
+        if let Err(err) = ps
+            .update(|st| {
+                let len = st.telegram_queue.len();
+                if len > cap {
+                    st.telegram_queue.drain(0..len - cap);
+                }
+            })
+            .await
+        {
+            warn!("alertmanager webhook: queue cap update failed: {err}");
+            ALERT_WEBHOOK_ERRORS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    HttpResponse::Ok().finish()
 }
 
 #[derive(Deserialize)]
@@ -2333,6 +2455,39 @@ async fn unlimited_patch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn req_with_auth(value: Option<&str>) -> HttpRequest {
+        let mut b = actix_web::test::TestRequest::default();
+        if let Some(v) = value {
+            b = b.insert_header(("Authorization", v));
+        }
+        b.to_http_request()
+    }
+
+    #[test]
+    fn bearer_ok_accepts_matching_token() {
+        let req = req_with_auth(Some("Bearer s3cret-token-value-xyz"));
+        assert!(webhook_bearer_ok(&req, "s3cret-token-value-xyz"));
+    }
+
+    #[test]
+    fn bearer_ok_rejects_wrong_token() {
+        let req = req_with_auth(Some("Bearer wrong-token"));
+        assert!(!webhook_bearer_ok(&req, "s3cret-token-value-xyz"));
+    }
+
+    #[test]
+    fn bearer_ok_rejects_missing_header() {
+        let req = req_with_auth(None);
+        assert!(!webhook_bearer_ok(&req, "s3cret-token-value-xyz"));
+    }
+
+    #[test]
+    fn bearer_ok_rejects_wrong_scheme() {
+        // Right token value but not a Bearer scheme → rejected.
+        let req = req_with_auth(Some("Basic s3cret-token-value-xyz"));
+        assert!(!webhook_bearer_ok(&req, "s3cret-token-value-xyz"));
+    }
 
     #[test]
     fn admin_status_serializes_to_documented_shape() {

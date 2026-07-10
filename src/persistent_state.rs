@@ -86,7 +86,11 @@ impl PersistentStateGuard {
         let mut state = self.state.lock().await;
         let r = f(&mut state);
         let content = serde_yaml::to_string(&*state)?;
-        std::fs::write(&self.persistent_state_path, content)?;
+        // Atomic write: a truncated file from a mid-write hard reboot (frequent on
+        // this host) would fail to parse on boot and drop the entire persisted state
+        // (queue, balance, speedtest). Write to a temp file in the same directory,
+        // then rename over the target — rename is atomic within one filesystem.
+        atomic_write(&self.persistent_state_path, content.as_bytes())?;
         Ok(r)
     }
 
@@ -94,4 +98,29 @@ impl PersistentStateGuard {
         self.reload().await;
         self.state.lock().await.clone()
     }
+}
+
+/// Write `content` to `path` atomically: fill a sibling temp file, fsync it, then
+/// rename it over `path`, then fsync the directory so the rename itself survives a
+/// power loss. A crash mid-write leaves either the old file or the temp file, never
+/// a truncated target. The fixed `.tmp` name is safe: every caller goes through
+/// `update()`, which holds the shared state mutex across this write, serializing all
+/// writers.
+fn atomic_write(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    // fsync the parent directory: on ext4 with frequent power loss (this host) the
+    // rename can otherwise be lost, reverting to stale state. Best-effort.
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
 }

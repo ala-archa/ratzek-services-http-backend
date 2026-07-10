@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use slog::{o, Drain};
 use slog_scope::error;
 
+mod alertmanager;
 mod blacklist;
 mod config;
 mod device_metrics;
@@ -130,6 +131,7 @@ impl Application {
                         .service(http::client_register)
                         .service(http::dhcp_leases)
                         .service(http::prometheus_exporter)
+                        .service(http::alertmanager_webhook)
                         .service(http::admin_login)
                         .service(http::admin_logout)
                         .service(http::admin_me)

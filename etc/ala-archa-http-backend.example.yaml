@@ -104,6 +104,18 @@ telegram:
   retry_crontab: "30 */5 * * * *"
   message_timeout: 24h
 
+# alerting: optional Alertmanager→Telegram sink. Alertmanager (on this host) POSTs its
+# webhook to POST /alertmanager/webhook; the handler checks the Bearer token, formats the
+# alerts, and enqueues them onto the shared Telegram queue (reuses telegram.bot_token above)
+# to a dedicated alerts group. Requires the `telegram` section. Omit to disable (the endpoint
+# then returns 404). Exposes ratzek_alert_webhook_{received,errors}_total and
+# ratzek_telegram_queue_len on /metrics. See src/alertmanager.rs.
+# alerting:
+#   webhook_token: "<long random secret, 16+ chars>"  # Alertmanager sends it as Bearer
+#   telegram_chat_ids:
+#     - "-100XXXXXXXXXX"          # dedicated alerts group (negative id)
+#   queue_max_size: 1000          # drop oldest queued msgs beyond this (storm backpressure)
+
 mobile_provider:
   update_tariff_command: |
     ssh ratzek-services@10.11.1.1 '/interface lte at-chat lte1 wait=yes input="AT+CUSD=1,\"*255#\",15"'

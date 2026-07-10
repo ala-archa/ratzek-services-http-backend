@@ -628,6 +628,11 @@ impl State {
         self.persistent_state.get().await
     }
 
+    /// The persistent-state handle (for enqueuing Telegram messages).
+    pub fn persistent_state_guard(&self) -> crate::persistent_state::PersistentStateGuard {
+        self.persistent_state.clone()
+    }
+
     pub fn config(&self) -> &crate::config::Config {
         &self.config
     }

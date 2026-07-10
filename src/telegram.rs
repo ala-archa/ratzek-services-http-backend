@@ -14,7 +14,13 @@ impl Telegram {
     async fn try_send_message(&self, chat_id: &str, text: &str) -> Result<()> {
         slog_scope::info!("Sending message to telegram chat {}: {}", chat_id, text);
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
-        let client = reqwest::Client::new();
+        // Bounded timeout: the uplink is a weak/lossy LTE link, and this runs inside
+        // the Alertmanager webhook HTTP handler — an unbounded hang would tie up a
+        // worker and stall Alertmanager into a retry. On timeout the message falls
+        // back to the persistent retry queue in `send_message`.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
         let r = client
             .post(&url)
             .json(&serde_json::json!({
