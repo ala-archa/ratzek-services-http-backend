@@ -80,3 +80,53 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "Деградация доставки алертов (очередь/ошибки webhook/AM notif-fail)"
+
+      # --- Tier 2 (added 2026-07-10) ---
+      - alert: RatzekLTEFlapping
+        expr: resets(mikrotik_lte_interface_session_uptime[1h]) > 3
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "LTE часто переподключается: {{ $value | humanize }} реконнектов/час ({{ $labels.name }})"
+
+      - alert: RatzekDeviceMetricsStalled
+        expr: ratzek_device_metrics_age_seconds > 1800
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Сэмплер device-metrics завис: {{ $value | humanize }}с без обновления"
+
+      - alert: RatzekPiTempHigh
+        expr: node_hwmon_temp_celsius > 75
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Температура Pi {{ $value | humanize }}°C — близко к троттлингу"
+
+      - alert: RatzekBMSChargingCold
+        expr: daly_bms_temperature_min_celsius < 1 and on(instance) daly_bms_current_amperes > 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Заряд АКБ при {{ $value | humanize }}°C — заряд LFP на морозе повреждает ячейки"
+
+      - alert: RatzekACLMassDrop
+        expr: delta(ratzek_clients_in_acl[15m]) < -30
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Резкий обвал клиентов в acl: {{ $value | humanize }} за 15м (массовый дисконнект?)"
+
+      - alert: RatzekMikrotikLinkFlapping
+        expr: increase(mikrotik_interface_link_downs[1h]) > 5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Флап линка MikroTik: {{ $value | humanize }} падений/час ({{ $labels.name }} {{ $labels.interface }})"
+
+      - alert: RatzekISPBalanceCritical
+        expr: ratzek_isp_balance < 200
+        for: 15m
+        labels: { severity: critical }
+        annotations:
+          summary: "Баланс SIM критический: {{ $value | humanize }} — скоро отключат"
