@@ -1,0 +1,82 @@
+# Canonical copy of the host-direct Prometheus rules deployed to
+# /etc/prometheus/rules/ratzek-site.rules (ansible is outdated; managed by hand).
+# Thresholds calibrated against 7-day Prometheus history. See doc/alerting-runbook.md.
+groups:
+  - name: ratzek-site
+    rules:
+      - alert: RatzekBatteryDeepDischarge
+        expr: daly_bms_pack_voltage_volts * daly_bms_current_amperes < -150
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Глубокий разряд АКБ: {{ $value | humanize }} Вт"
+
+      - alert: RatzekSolarNotChargingDaytime
+        expr: veml7700_lux > 200 and on() max_over_time(daly_bms_current_amperes[6h]) < 0.5
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Днём заряда АКБ нет уже 6ч (свет есть) — проверить панели/контроллер заряда"
+
+      - alert: RatzekBatterySOCLow
+        expr: daly_bms_soc_percent < 35
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Заряд АКБ низкий: {{ $value | humanize }}%"
+
+      - alert: RatzekBatterySOCCritical
+        expr: daly_bms_soc_percent < 20
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Заряд АКБ КРИТИЧЕСКИЙ: {{ $value | humanize }}% — скоро полное отключение"
+
+      - alert: RatzekBatteryVoltageLow
+        expr: daly_bms_pack_voltage_volts < 22.5
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "Напряжение АКБ {{ $value | humanize }} В — пустая батарея / близко отсечка"
+
+      - alert: RatzekBMSAlarm
+        expr: daly_bms_alarm != 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Сработала защита BMS: {{ $labels.type }}"
+
+      - alert: RatzekBMSCommsLost
+        expr: time() - daly_bms_last_frame_timestamp_seconds > 300
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Нет телеметрии BMS уже {{ $value | humanize }}с — слепы по питанию"
+
+      - alert: RatzekPoEPortDown
+        expr: mikrotik_poe_current == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "PoE-порт без питания: {{ $labels.name }} {{ $labels.interface }}"
+
+      - alert: RatzekMikrotikUnreachable
+        expr: mikrotik_scrape_collector_success == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "MikroTik недоступен для опроса: {{ $labels.name }}"
+
+      - alert: RatzekWANDown
+        expr: ratzek_internet_available == 0
+        for: 10m
+        labels: { severity: critical }
+        annotations:
+          summary: "Нет интернета (WAN down) — аплинк недоступен"
+
+      - alert: RatzekAlertingDegraded
+        expr: rate(alertmanager_notifications_failed_total[10m]) > 0 or rate(ratzek_alert_webhook_errors_total[15m]) > 0 or ratzek_telegram_queue_len > 20
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Деградация доставки алертов (очередь/ошибки webhook/AM notif-fail)"

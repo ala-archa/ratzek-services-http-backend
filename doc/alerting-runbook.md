@@ -15,8 +15,13 @@
   Watchdog не доставляется; `errors=0`). Реальные алерты (InstanceDown/clock/fs/conntrack) теперь
   идут в чат «рацек-телеком».
 
-**Отложено (тюнинг, отдельный шаг):** пороги/`for:` правил (сейчас дефолтные: InstanceDown 5m,
-clock 10m) — понаблюдать шум на ребутах; каталог алертов объекта (см. ниже).
+- **Каталог алертов Tier 1 — ПРИМЕНЁН (2026-07-10).** 11 правил объекта в
+  `/etc/prometheus/rules/ratzek-site.rules` (питание/BMS, PoE, MikroTik-недоступность, WAN,
+  само-здоровье алертинга); пороги калиброваны по 7-дневной истории, end-to-end проверено.
+  Канонич. копия — `doc/ratzek-site.rules`. Детали — в разделе ниже.
+
+**Отложено (тюнинг, отдельный шаг):** пороги/`for:` node-правил (`ansible_managed.rules`:
+InstanceDown 5m, clock 10m) — понаблюдать шум на ребутах; каталог Tier 2 (см. ниже).
 
 Архитектура (алертер целиком на Pi — осознанное решение; при полной потере питания/LTE он
 падает вместе с хостом и «объект лёг» сам не сообщит):
@@ -168,9 +173,34 @@ Alertmanager он не знает. До модернизации ansible всё 
 - Backend: убрать секцию `alerting` из конфига + restart (эндпоинт → 404), либо откат бинаря на
   `/usr/bin/ratzek-services-http-backend.bak-*`.
 
-## Каталог алертов (вне объёма пайплайна — отдельный шаг)
-Кандидаты: питание/BMS (`daly_bms_soc_percent` низко / `daly_bms_current_amperes`<0 разряд —
-упреждение до отключения), LTE (`mikrotik_lte_interface_session_uptime` сброс, rsrp низкий),
-PoE-порт (`mikrotik_poe_current`==0 — webcam-камера 10.11.3.4), `ratzek_internet_available==0`,
-обвал `ratzek_clients_in_acl`, `ratzek_dhcp_leases_free` низко,
-`ratzek_device_metrics_age_seconds` высок, диск, температура.
+## Каталог алертов Tier 1 — ПРИМЕНЁН (2026-07-10)
+
+Файл **`/etc/prometheus/rules/ratzek-site.rules`** (host-direct, `root:prometheus 0640`), группа
+`ratzek-site`, 11 правил, `promtool` SUCCESS, на reload все `inactive` (объект здоров, шторма нет),
+end-to-end проверено реальным правилом (Prometheus→AM→backend→Telegram). Пороги калиброваны по
+7-дневной истории Prometheus. Маршрут — существующий default→`backend-webhook`.
+
+| Alert | expr | for | sev |
+|---|---|---|---|
+| RatzekBatteryDeepDischarge | `pack_V * current < -150` (Вт) | 5m | warn |
+| RatzekSolarNotChargingDaytime | `veml7700_lux>200 and on() max_over_time(current[6h])<0.5` | 15m | warn |
+| RatzekBatterySOCLow | `soc_percent < 35` | 15m | warn |
+| RatzekBatterySOCCritical | `soc_percent < 20` | 5m | crit |
+| RatzekBatteryVoltageLow | `pack_voltage < 22.5` | 10m | crit |
+| RatzekBMSAlarm | `daly_bms_alarm != 0` | 5m | warn |
+| RatzekBMSCommsLost | `time()-last_frame_ts > 300` | 5m | warn |
+| RatzekPoEPortDown | `mikrotik_poe_current == 0` | 5m | warn |
+| RatzekMikrotikUnreachable | `mikrotik_scrape_collector_success == 0` | 5m | warn |
+| RatzekWANDown | `ratzek_internet_available == 0` | 10m | crit |
+| RatzekAlertingDegraded | `rate(am_notif_failed)>0 or rate(webhook_errors)>0 or queue_len>20` | 10m | warn |
+
+Калибровка (7д): DeepDischarge −150 (min V·I −198.8; <−150 = 3/нед; −200 инертен). VoltageLow 22.5
+(pack проседал до 23.6 при SOC≥50% = load-sag; <22.5 = 0 ложных). SOC 35/20 (7д min 50%). Известное:
+SOC warning+critical перекрываются при <20 (два сообщения — принято); PoE==0 ловит потерю питания, а
+НЕ зависание камеры (детект зависания = возраст снапшота `/var/www/webcam_archive`, метрики нет).
+Rollback: `rm /etc/prometheus/rules/ratzek-site.rules && systemctl reload prometheus`.
+
+## Каталог Tier 2 (кандидаты, вне первого батча)
+LTE (`mikrotik_lte_interface_session_uptime` сброс / rsrp/sinr деградация), низкий `ratzek_isp_balance`
+(флор), `ratzek_device_metrics_age_seconds`>1800, темп Pi (`node_hwmon_temp_celsius`>78) и BMS (заряд
+при <0 °C), обвал `ratzek_clients_in_acl`, `mikrotik_interface_link_downs`, mikrotik free-mem/cpu.
