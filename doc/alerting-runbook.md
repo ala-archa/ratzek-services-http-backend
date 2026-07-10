@@ -1,13 +1,15 @@
 # Alerting: Prometheus → Alertmanager → Telegram — runbook
 
 Статус на 2026-07-10:
-- **Backend 0.1.29** — реализован webhook-приёмник `POST /alertmanager/webhook`
-  (`src/alertmanager.rs`, `src/http.rs`), доставка через устойчивую Telegram-очередь backend.
-  Отревьюен, тесты зелёные. **Ещё не задеплоен** (см. Фаза 1).
-- **Alertmanager** — на хост НЕ установлен (порт 9093 свободен). Ставится вручную (Фаза 2).
-- **Prometheus** (`/usr/local/bin/prometheus`, reload=SIGHUP) — правила `ansible_managed.rules`
-  (`Watchdog`, `InstanceDown`, node-fs/clock/conntrack) лежат, но секции `alerting:` нет →
-  никуда не маршрутизируются. Провязка — Фаза 3.
+- **Фаза 1 — ВЫПОЛНЕНА.** Backend `0.1.29` задеплоен (webhook `POST /alertmanager/webhook`),
+  секция `alerting` в `/etc/ala-archa-http-backend.yaml` (доставка в чат «рацек-телеком»
+  `-1002436469006`), smoke-тест прошёл (200 + сообщение в группе).
+- **Фаза 2 — ВЫПОЛНЕНА.** Alertmanager `0.27.0` установлен (`/usr/local/bin`), `enabled`+`active`
+  на `127.0.0.1:9093` (кластер выключен), конфиг `blackhole` (default) — в Telegram пока ничего
+  не идёт; `amtool check-config` SUCCESS.
+- **Фаза 3 — предстоит.** Prometheus (`/usr/local/bin/prometheus`, reload=SIGHUP): правила
+  `ansible_managed.rules` (`Watchdog`, `InstanceDown`, node-fs/clock/conntrack) лежат, но секции
+  `alerting:` нет → никуда не маршрутизируются. После провязки алерты начнут течь.
 
 Архитектура (алертер целиком на Pi — осознанное решение; при полной потере питания/LTE он
 падает вместе с хостом и «объект лёг» сам не сообщит):
@@ -106,7 +108,9 @@ Alertmanager он не знает. До модернизации ansible всё 
    [Service]
    Type=simple
    User=prometheus
-   ExecStart=/usr/local/bin/alertmanager --config.file=/etc/alertmanager/alertmanager.yml --storage.path=/var/lib/alertmanager --web.listen-address=127.0.0.1:9093
+   # --cluster.listen-address= (empty) disables HA clustering: a single on-Pi node
+   # otherwise opens 0.0.0.0:9094, exposing the cluster port to the client subnets.
+   ExecStart=/usr/local/bin/alertmanager --config.file=/etc/alertmanager/alertmanager.yml --storage.path=/var/lib/alertmanager --web.listen-address=127.0.0.1:9093 --cluster.listen-address=
    ExecReload=/bin/kill -HUP $MAINPID
    Restart=on-failure
    RestartSec=5s
