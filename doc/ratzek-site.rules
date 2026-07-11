@@ -12,7 +12,9 @@ groups:
           summary: "Глубокий разряд АКБ: {{ $value | humanize }} Вт"
 
       - alert: RatzekSolarNotChargingDaytime
-        expr: veml7700_lux > 200 and on() max_over_time(daly_bms_current_amperes[6h]) < 0.5
+        # min_over_time(lux[6h])>100: свет был ВЕСЬ 6ч → исключает ложняк на рассвете
+        # (обычный lux>200 срабатывал на восходе, т.к. max_over_time(current[6h]) смотрит в ночь).
+        expr: min_over_time(veml7700_lux[6h]) > 100 and on() max_over_time(daly_bms_current_amperes[6h]) < 0.5
         for: 15m
         labels: { severity: warning }
         annotations:
@@ -118,7 +120,8 @@ groups:
           summary: "Резкий обвал клиентов в acl: {{ $value | humanize }} за 15м (массовый дисконнект?)"
 
       - alert: RatzekMikrotikLinkFlapping
-        expr: increase(mikrotik_interface_link_downs[1h]) > 5
+        # только ether: WiFi (wlan*) флапает по природе (до 17/ч) — не про «линк»; ethernet <~1/ч.
+        expr: increase(mikrotik_interface_link_downs{interface=~"ether.*"}[1h]) > 5
         for: 5m
         labels: { severity: warning }
         annotations:
@@ -136,7 +139,7 @@ groups:
       # produced by doc/webcam-freshness-metric.sh (cron */5, node_exporter textfile collector).
       - alert: RatzekWebcamStale
         expr: time() - ratzek_webcam_last_image_timestamp > 1200
-        for: 5m
+        for: 15m
         labels: { severity: warning }
         annotations:
           summary: "Камера не обновляет снимок уже {{ $value | humanize }}с (зависла / нет непустых кадров)"

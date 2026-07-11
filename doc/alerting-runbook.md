@@ -24,6 +24,13 @@
 - **Каталог алертов Tier 3 — ПРИМЕНЁН (2026-07-10).** +4 правила: **webcam-зависание** (по textfile-
   метрике возраста снапшота — ловит камеру «под питанием, но мёртва по сети»), разбаланс ячеек АКБ,
   MikroTik CPU/память. Всего **22 правила**, `promtool` SUCCESS, все `inactive`. Детали — ниже.
+- **Тюнинг по факту первой ночи (2026-07-11).** По реальным срабатываниям исправлены неадекватные:
+  (1) **SolarNotChargingDaytime** — ложняк на рассвете (`max_over_time(current[6h])` смотрел в ночь) →
+  gate `min_over_time(veml7700_lux[6h])>100` (свет весь 6ч); было 14 firing-точек/сут → 0.
+  (2) **MikrotikLinkFlapping** — шумел на WiFi (`wlan1` до 17/ч) → заскоуплен на `interface=~"ether.*"`
+  (ethernet <1/ч). (3) **WebcamStale** `for` 5m→15m (снять флап на границе). (4)
+  **NodeClockNotSynchronising** (стоковое node-правило) → в `blackhole` в AM (хост без RTC, NTP по
+  слабому LTE — неустранимо; матчер `alertname=~"Watchdog|NodeClockNotSynchronising"`).
 
 **Отложено (тюнинг, отдельный шаг):** пороги/`for:` node-правил (`ansible_managed.rules`:
 InstanceDown 5m, clock 10m) — понаблюдать шум на ребутах; каталог Tier 2 (см. ниже).
