@@ -31,6 +31,16 @@
   (ethernet <1/ч). (3) **WebcamStale** `for` 5m→15m (снять флап на границе). (4)
   **NodeClockNotSynchronising** (стоковое node-правило) → в `blackhole` в AM (хост без RTC, NTP по
   слабому LTE — неустранимо; матчер `alertname=~"Watchdog|NodeClockNotSynchronising"`).
+- **Подписи портов в тексте (2026-07-11).** В порт-алертах (`RatzekMikrotikLinkFlapping`,
+  `RatzekPoEPortDown`) добавлен `{{ $labels.comment }}` — подпись порта из MikroTik (напр. `ether3` =
+  «webcam outside», `ether1` = «RPI»). `link_downs` несёт `comment` нативно (заодно `max without(running,…)`
+  схлопывает волатильный `running`, дробивший счётчик на 2 серии); у `poe_current` подписи нет — тянем
+  через `* on(name,interface) group_left(comment) (max without(...) mikrotik_interface_running)`.
+- **SolarNotChargingDaytime — 2-й ложняк (2026-07-12): полная батарея.** Временный MPPT заряжает
+  лишь до ~85% → на плато ток 0 при свете (норма), а правило читало как «не может заряжаться».
+  Добавлен гейт **«SOC падает >2%/6ч»** (`daly_bms_soc_percent < (… offset 6h) - 2`): на плато SOC
+  ровный → молчит; ловит именно «батарея разряжается при свете». Не зависит от лимита контроллера
+  (в отличие от абсолютного порога SOC). База 7 firing-точек/30ч → 0.
 
 **Отложено (тюнинг, отдельный шаг):** пороги/`for:` node-правил (`ansible_managed.rules`:
 InstanceDown 5m, clock 10m) — понаблюдать шум на ребутах; каталог Tier 2 (см. ниже).

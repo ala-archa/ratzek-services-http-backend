@@ -12,9 +12,11 @@ groups:
           summary: "Глубокий разряд АКБ: {{ $value | humanize }} Вт"
 
       - alert: RatzekSolarNotChargingDaytime
-        # min_over_time(lux[6h])>100: свет был ВЕСЬ 6ч → исключает ложняк на рассвете
-        # (обычный lux>200 срабатывал на восходе, т.к. max_over_time(current[6h]) смотрит в ночь).
-        expr: min_over_time(veml7700_lux[6h]) > 100 and on() max_over_time(daly_bms_current_amperes[6h]) < 0.5
+        # Реальный фолт = днём (min lux[6h]>100 — свет весь 6ч, исключает рассвет), заряда нет
+        # (max current[6h]<0.5) И SOC ПАДАЕТ (>2%/6ч). Условие на падение SOC отсекает «батарея
+        # полна» (на плато SOC ровный → ток 0 нормой; временный MPPT заряжает лишь до ~85%) — не
+        # зависит от лимита контроллера, ловит именно «батарея разряжается при свете».
+        expr: min_over_time(veml7700_lux[6h]) > 100 and on() (max_over_time(daly_bms_current_amperes[6h]) < 0.5 and (daly_bms_soc_percent < (daly_bms_soc_percent offset 6h) - 2))
         for: 15m
         labels: { severity: warning }
         annotations:
@@ -56,11 +58,13 @@ groups:
           summary: "Нет телеметрии BMS уже {{ $value | humanize }}с — слепы по питанию"
 
       - alert: RatzekPoEPortDown
-        expr: mikrotik_poe_current == 0
+        # group_left(comment): poe_current не несёт подпись порта — подтягиваем её из _running
+        # (max without(...) схлопывает волатильный running и лишние лейблы, оставляя comment).
+        expr: (mikrotik_poe_current == 0) * on(name, interface) group_left(comment) (max without(running, disabled, slave, type, address, instance, job) (mikrotik_interface_running))
         for: 5m
         labels: { severity: warning }
         annotations:
-          summary: "PoE-порт без питания: {{ $labels.name }} {{ $labels.interface }}"
+          summary: "PoE-порт без питания: {{ $labels.name }} {{ $labels.interface }} «{{ $labels.comment }}»"
 
       - alert: RatzekMikrotikUnreachable
         expr: mikrotik_scrape_collector_success == 0
@@ -121,11 +125,12 @@ groups:
 
       - alert: RatzekMikrotikLinkFlapping
         # только ether: WiFi (wlan*) флапает по природе (до 17/ч) — не про «линк»; ethernet <~1/ч.
-        expr: increase(mikrotik_interface_link_downs{interface=~"ether.*"}[1h]) > 5
+        # max without(running,...): у порта 2 серии по волатильному running — схлопываем, сохраняя comment.
+        expr: max without(running, disabled, slave, type) (increase(mikrotik_interface_link_downs{interface=~"ether.*"}[1h])) > 5
         for: 5m
         labels: { severity: warning }
         annotations:
-          summary: "Флап линка MikroTik: {{ $value | humanize }} падений/час ({{ $labels.name }} {{ $labels.interface }})"
+          summary: "Флап линка MikroTik: {{ $value | humanize }} падений/час ({{ $labels.name }} {{ $labels.interface }} «{{ $labels.comment }}»)"
 
       - alert: RatzekISPBalanceCritical
         expr: ratzek_isp_balance < 200
