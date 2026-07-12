@@ -23,7 +23,8 @@
   sampler-стал, темп Pi, заряд АКБ на морозе, обвал acl, флап линка MikroTik, критич. баланс SIM).
 - **Каталог алертов Tier 3 — ПРИМЕНЁН (2026-07-10).** +4 правила: **webcam-зависание** (по textfile-
   метрике возраста снапшота — ловит камеру «под питанием, но мёртва по сети»), разбаланс ячеек АКБ,
-  MikroTik CPU/память. Всего **22 правила**, `promtool` SUCCESS, все `inactive`. Детали — ниже.
+  MikroTik CPU/память. **21 правило** (SolarNotChargingDaytime удалён 2026-07-12 — см. ниже),
+  `promtool` SUCCESS, все `inactive`. Детали — ниже.
 - **Тюнинг по факту первой ночи (2026-07-11).** По реальным срабатываниям исправлены неадекватные:
   (1) **SolarNotChargingDaytime** — ложняк на рассвете (`max_over_time(current[6h])` смотрел в ночь) →
   gate `min_over_time(veml7700_lux[6h])>100` (свет весь 6ч); было 14 firing-точек/сут → 0.
@@ -36,11 +37,15 @@
   «webcam outside», `ether1` = «RPI»). `link_downs` несёт `comment` нативно (заодно `max without(running,…)`
   схлопывает волатильный `running`, дробивший счётчик на 2 серии); у `poe_current` подписи нет — тянем
   через `* on(name,interface) group_left(comment) (max without(...) mikrotik_interface_running)`.
-- **SolarNotChargingDaytime — 2-й ложняк (2026-07-12): полная батарея.** Временный MPPT заряжает
-  лишь до ~85% → на плато ток 0 при свете (норма), а правило читало как «не может заряжаться».
-  Добавлен гейт **«SOC падает >2%/6ч»** (`daly_bms_soc_percent < (… offset 6h) - 2`): на плато SOC
-  ровный → молчит; ловит именно «батарея разряжается при свете». Не зависит от лимита контроллера
-  (в отличие от абсолютного порога SOC). База 7 firing-точек/30ч → 0.
+- **SolarNotChargingDaytime — УДАЛЁН (2026-07-12, итог).** После серии ложняков (рассвет →
+  полная-батарея/плато → вечерний разряд) стало ясно: надёжно не реализуется на этом хосте.
+  Против любого порога играют три фактора: **глубокий суточный цикл SOC (±30%/сут)**, **сезонность
+  заряда** (зимой заряд ~2ч, остальное тень/разряд) и **дырявая телеметрия** (25 ребутов/7д +
+  отключения). Проверены и отвергнуты: окна «нет заряда» 6/10/…/36ч (короткие ложат на плато/закате,
+  длинные пробиваются дырами), нетто-разряд SOC за 48ч (−47% бывает в норме), отсутствие роста SOC
+  за 36ч (7 ложных ч/7д от дыр). **Замена — пороги SOC** (`RatzekBatterySOCLow<35` /
+  `RatzekBatterySOCCritical<20`): за 30д 0 ложных (min SOC 50%); при реальном отказе солнца SOC
+  поедет вниз и они сработают. Правило удалено из `ratzek-site.rules` → 21 правило.
 
 **Отложено (тюнинг, отдельный шаг):** пороги/`for:` node-правил (`ansible_managed.rules`:
 InstanceDown 5m, clock 10m) — понаблюдать шум на ребутах; каталог Tier 2 (см. ниже).
@@ -205,7 +210,6 @@ end-to-end проверено реальным правилом (Prometheus→AM
 | Alert | expr | for | sev |
 |---|---|---|---|
 | RatzekBatteryDeepDischarge | `pack_V * current < -150` (Вт) | 5m | warn |
-| RatzekSolarNotChargingDaytime | `veml7700_lux>200 and on() max_over_time(current[6h])<0.5` | 15m | warn |
 | RatzekBatterySOCLow | `soc_percent < 35` | 15m | warn |
 | RatzekBatterySOCCritical | `soc_percent < 20` | 5m | crit |
 | RatzekBatteryVoltageLow | `pack_voltage < 22.5` | 10m | crit |

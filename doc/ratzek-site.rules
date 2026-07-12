@@ -11,16 +11,12 @@ groups:
         annotations:
           summary: "Глубокий разряд АКБ: {{ $value | humanize }} Вт"
 
-      - alert: RatzekSolarNotChargingDaytime
-        # Реальный фолт = днём (min lux[6h]>100 — свет весь 6ч, исключает рассвет), заряда нет
-        # (max current[6h]<0.5) И SOC ПАДАЕТ (>2%/6ч). Условие на падение SOC отсекает «батарея
-        # полна» (на плато SOC ровный → ток 0 нормой; временный MPPT заряжает лишь до ~85%) — не
-        # зависит от лимита контроллера, ловит именно «батарея разряжается при свете».
-        expr: min_over_time(veml7700_lux[6h]) > 100 and on() (max_over_time(daly_bms_current_amperes[6h]) < 0.5 and (daly_bms_soc_percent < (daly_bms_soc_percent offset 6h) - 2))
-        for: 15m
-        labels: { severity: warning }
-        annotations:
-          summary: "Днём заряда АКБ нет уже 6ч (свет есть) — проверить панели/контроллер заряда"
+      # RatzekSolarNotChargingDaytime УДАЛЁН (2026-07-12): надёжно не реализуется на этом хосте —
+      # глубокий суточный цикл SOC (±30%), сезонность заряда (зимой ~2ч) и дырявая телеметрия
+      # (25 ребутов/7д + отключения) ломают любой порог (окна 6–36ч, нетто-разряд SOC, отсутствие
+      # роста SOC — все дают ложняки). Реальный сигнал «солнце/батарея в беде» = пороги SOC ниже
+      # (Low<35 / Critical<20): за 30д 0 ложных, min SOC 50% — если солнце откажет, SOC поедет вниз
+      # и они сработают.
 
       - alert: RatzekBatterySOCLow
         expr: daly_bms_soc_percent < 35
