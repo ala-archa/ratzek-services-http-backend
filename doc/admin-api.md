@@ -364,6 +364,7 @@ curl -b jar -X POST $BASE/api/v1/admin/logout
 | `GET /api/v1/admin/devices/{mac}` | устройство + дневной ряд трафика | да | да |
 | `GET /api/v1/admin/devices/{mac}/traffic` | ряд трафика (day/hour/5m) для графика | да | да |
 | `POST /api/v1/admin/devices/{mac}/disconnect` | мгновенный отзыв доступа (ipset del) | да | да |
+| `POST /api/v1/admin/devices/disconnect-all` | отключить всех НЕ безлимитных (сервисный сброс канала) | да | да |
 | `POST /api/v1/admin/devices/{mac}/reset-shaper-counter` | сброс счётчика shaper клиента | да | да |
 | `GET /api/v1/admin/wan/speedtest` | история speedtest (timeseries) | да | да |
 | `GET /api/v1/admin/wan/balance` | история баланса ISP (timeseries) | да | да |
@@ -592,6 +593,26 @@ substring по `mac`/`last_ip`/`hostname`/IP из истории. Заголов
 > Устройство сможет вернуться, заново пройдя портал (если не в blacklist) — по обычному
 > `POST /api/v1/client`.
 
+### `POST /api/v1/admin/devices/disconnect-all` (требует сессии)
+Массовое отключение **всех НЕ безлимитных** клиентов одним вызовом — освободить канал для сервисного
+обслуживания. Читает членов `acl`, вычитает исключаемых (**объединение** членов `no_shape` и IP из
+unlimited-store) и удаляет остаток из `acl` (+чистка `shaper`). Отключение мгновенное: stateless
+FORWARD-DROP для не-`acl` источников рвёт и установленные соединения. Безлимитные щадятся; приватная
+сеть 10.11.4.x под `acl` не гейтится и не затрагивается. Тело не нужно.
+- `200` — JSON-сводка (см. ниже). Идемпотентно; повтор безопасен.
+- `500` — не удалось прочитать `acl`/`no_shape` (состояние неизвестно — ничего не считаем отключённым).
+```jsonc
+// POST /api/v1/admin/devices/disconnect-all
+{
+  "disconnected": 37,  // IP убрано из acl (реально отключено)
+  "skipped": 11,       // исключаемых (безлимитных) IP найдено в acl и оставлено
+  "errors": 0          // не-фатальные сбои ipset del (в осн. чистка shaper); acl-удаление уже применилось
+}
+```
+> **Разовый режим:** повторные регистрации НЕ блокируются — отключённые клиенты смогут снова зайти через
+> портал (`POST /api/v1/client`). Для длительных работ вызов повторяют. Событие пишется в `/admin/events`
+> как `disconnect_all` (`detail` содержит логин админа и счётчики).
+
 ### `POST /api/v1/admin/devices/{mac}/reset-shaper-counter` (требует сессии)
 Сбрасывает счётчик трафика клиента в сете `shaper`, удаляя его текущие IP из этого сета (счётчик живёт на
 записи ipset, поэтому удаление записи его обнуляет — `client_get` далее покажет `bytes_sent`=0). Доступ **не
@@ -630,9 +651,9 @@ substring по `mac`/`last_ip`/`hostname`/IP из истории. Заголов
 ```
 Значения `kind`: `internet_up`, `internet_down` (переходы доступности WAN); `low_balance` (баланс пересёк порог
 вниз; `detail`=баланс); `new_device` (впервые увиденный MAC — требует включённого `device_metrics`;
-`mac`/`detail`=ip); `blacklist_add` / `blacklist_remove` / `disconnect` / `shaper_reset` (админ-действия;
-`mac` + `detail`=IP админа или затронутые IP). `mac`/`detail` опускаются, если не заданы. При выключенном
-`history` → `404`.
+`mac`/`detail`=ip); `blacklist_add` / `blacklist_remove` / `disconnect` / `disconnect_all` / `shaper_reset`
+(админ-действия; `mac` + `detail`=IP админа или затронутые IP; у `disconnect_all` `mac` пуст, `detail`=логин
++ счётчики). `mac`/`detail` опускаются, если не заданы. При выключенном `history` → `404`.
 > Журнал хранится столько же, сколько WAN-ряды — `history.retention_days` (деф. 90), включая
 > аудит-события (`blacklist_*`/`disconnect`/`shaper_reset`). Нужен более долгий аудит — увеличь `retention_days`.
 

@@ -37,6 +37,8 @@ pub mod kind {
     pub const BLACKLIST_ADD: &str = "blacklist_add";
     pub const BLACKLIST_REMOVE: &str = "blacklist_remove";
     pub const DISCONNECT: &str = "disconnect";
+    /// Bulk disconnect of all non-unlimited clients (service maintenance).
+    pub const DISCONNECT_ALL: &str = "disconnect_all";
     pub const SHAPER_RESET: &str = "shaper_reset";
 
     /// All known kinds, for validating the `/admin/events?kind=` filter.
@@ -48,6 +50,7 @@ pub mod kind {
         BLACKLIST_ADD,
         BLACKLIST_REMOVE,
         DISCONNECT,
+        DISCONNECT_ALL,
         SHAPER_RESET,
     ];
 

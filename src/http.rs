@@ -1649,6 +1649,128 @@ async fn admin_device_traffic(
     }))
 }
 
+/// IPs to disconnect = members of `acl` that are NOT exempt (unlimited). Pure set
+/// difference, factored out so the selection logic is unit-testable without ipset.
+fn ips_to_disconnect(acl: &HashSet<String>, exempt: &HashSet<String>) -> Vec<String> {
+    acl.iter()
+        .filter(|ip| !exempt.contains(*ip))
+        .cloned()
+        .collect()
+}
+
+#[derive(Serialize)]
+struct DisconnectAllResponse {
+    /// IPs removed from `acl` (the enforcement gate) — the count actually disconnected.
+    disconnected: usize,
+    /// Exempt (unlimited) IPs found in `acl` and deliberately left in place.
+    skipped: usize,
+    /// Non-fatal `ipset del` failures (mostly `shaper` cleanup); the `acl` removal that
+    /// already succeeded still took effect, so these don't fail the request.
+    errors: usize,
+}
+
+/// Bulk-disconnect every NON-unlimited client in one call, to free the uplink for
+/// service maintenance. Removes each non-exempt `acl` member from `acl` (+`shaper`
+/// cleanup); the stateless FORWARD DROP for non-acl sources takes effect immediately,
+/// including established flows. Unlimited clients (the `no_shape` ipset ∪ the unlimited
+/// store) are spared. One-shot: disconnected clients may re-register via the portal.
+#[post("/api/v1/admin/devices/disconnect-all")]
+async fn admin_devices_disconnect_all(
+    auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    req: HttpRequest,
+) -> Result<HttpResponse, APIError> {
+    let admin_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
+    let (acl_name, shaper_name, no_shape_name, history, unlimited) = {
+        let s = state.lock().await;
+        let c = s.config();
+        (
+            c.ipset_acl_name.clone(),
+            c.ipset_shaper_name.clone(),
+            c.ipset_no_shape_name.clone(),
+            s.history().cloned(),
+            s.unlimited_clients().clone(),
+        )
+    };
+
+    // Unlimited-store IPs (source of truth) captured on the async path; unioned with the
+    // live `no_shape` members below so a client is spared even if one source is stale.
+    let store_ips: HashSet<String> = unlimited.list().await.into_iter().map(|c| c.ip).collect();
+
+    let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, usize, usize)> {
+        // Read `acl` FIRST, then `no_shape`, so the exempt set is as fresh as possible (an
+        // IP that becomes unlimited between the reads is still spared). Both reads are
+        // fail-fast (`entries()` errors on non-zero exit) so a transient ipset failure
+        // surfaces as 500 — never a silent "disconnected: 0" that leaves the channel busy.
+        let acl_ips: HashSet<String> = crate::ipset::IPSet::new(&acl_name)
+            .entries()?
+            .into_iter()
+            .map(|e| e.ip)
+            .collect();
+        let mut exempt: HashSet<String> = crate::ipset::IPSet::new(&no_shape_name)
+            .entries()?
+            .into_iter()
+            .map(|e| e.ip)
+            .collect();
+        exempt.extend(store_ips);
+
+        let targets = ips_to_disconnect(&acl_ips, &exempt);
+        let skipped = acl_ips.len() - targets.len();
+
+        let acl = crate::ipset::IPSet::new(&acl_name);
+        let shaper = crate::ipset::IPSet::new(&shaper_name);
+        let mut disconnected = 0usize;
+        let mut errors = 0usize;
+        for ip in &targets {
+            // Removal from `acl` IS the disconnect — count it as the success metric.
+            match acl.del(ip) {
+                Ok(()) => disconnected += 1,
+                Err(e) => {
+                    error!("disconnect-all: ipset del {acl_name} {ip} failed: {e:#}");
+                    errors += 1;
+                }
+            }
+            // `shaper` removal is secondary cleanup; a failure here does not keep the
+            // client online (the acl DROP already applies), so it's a warning, not fatal.
+            if let Err(e) = shaper.del(ip) {
+                warn!("disconnect-all: ipset del {shaper_name} {ip} failed: {e:#}");
+                errors += 1;
+            }
+        }
+        Ok((disconnected, skipped, errors))
+    })
+    .await
+    .map_err(|err| {
+        error!("disconnect-all task panicked: {err}");
+        APIError::InternalError
+    })?
+    .map_err(|err| {
+        // Couldn't read acl/no_shape → we don't know the true state; fail loudly.
+        error!("disconnect-all: ipset read failed: {err:#}");
+        APIError::InternalError
+    })?;
+
+    let (disconnected, skipped, errors) = outcome;
+    info!(
+        "Admin disconnect-all from {admin_ip} (login={:?}): {disconnected} disconnected, {skipped} spared, {errors} errors",
+        auth.login
+    );
+    crate::history::record_event_best_effort(
+        history.as_deref(),
+        crate::history::kind::DISCONNECT_ALL,
+        None,
+        Some(&format!(
+            "login={} disconnected={disconnected} spared={skipped} errors={errors}",
+            auth.login
+        )),
+    );
+    Ok(HttpResponse::Ok().json(DisconnectAllResponse {
+        disconnected,
+        skipped,
+        errors,
+    }))
+}
+
 /// Immediately revoke a device's internet access: remove every active-lease IP of
 /// the MAC from the acl/shaper/no_shape ipsets. Complements the blacklist (which
 /// only blocks future registration). Resolves IPs from LIVE dhcpd leases (not the
@@ -2848,6 +2970,43 @@ mod tests {
             rate_bps_live: Some(0),
         };
         assert!(!online_now(false, Some(&idle)));
+    }
+
+    #[test]
+    fn ips_to_disconnect_excludes_exempt() {
+        let acl: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let exempt: HashSet<String> = ["b"].iter().map(|s| s.to_string()).collect();
+        let mut got = ips_to_disconnect(&acl, &exempt);
+        got.sort();
+        assert_eq!(got, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn ips_to_disconnect_empty_acl_is_empty() {
+        let acl: HashSet<String> = HashSet::new();
+        let exempt: HashSet<String> = ["b"].iter().map(|s| s.to_string()).collect();
+        assert!(ips_to_disconnect(&acl, &exempt).is_empty());
+    }
+
+    #[test]
+    fn ips_to_disconnect_all_exempt_is_empty() {
+        // Every acl member is unlimited -> nothing to disconnect.
+        let acl: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let exempt: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert!(ips_to_disconnect(&acl, &exempt).is_empty());
+    }
+
+    #[test]
+    fn disconnect_all_response_serializes() {
+        let v = serde_json::to_value(DisconnectAllResponse {
+            disconnected: 5,
+            skipped: 2,
+            errors: 1,
+        })
+        .unwrap();
+        assert_eq!(v["disconnected"], 5);
+        assert_eq!(v["skipped"], 2);
+        assert_eq!(v["errors"], 1);
     }
 
     #[test]
