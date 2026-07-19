@@ -1254,6 +1254,15 @@ impl ClassifyDeps {
     }
 }
 
+/// A device is "online now" if the persistent 5-min metrics sampler flagged it OR
+/// the 15s live sampler saw real traffic in its window. The two samplers run on
+/// different cadences, so without this reconciliation a device that becomes active
+/// between metrics ticks reports `rate_bps_live > 0` while `online` stays false for
+/// up to ~5 min ("traffic now but shows offline").
+fn online_now(metrics_online: bool, lp: Option<&crate::live_traffic::LivePoint>) -> bool {
+    metrics_online || lp.is_some_and(|p| p.bytes_last_min > 0)
+}
+
 #[derive(Serialize)]
 struct DeviceView {
     // `device` carries `online` (traffic-derived) which flattens to the top level.
@@ -1361,11 +1370,14 @@ async fn admin_devices(
     let no_ips: Vec<String> = Vec::new();
     let mut views: Vec<DeviceView> = rows
         .into_iter()
-        .map(|d| {
+        .map(|mut d| {
             let is_unlimited = unlimited_macs.contains(&d.mac);
             let is_blacklisted = blacklisted.contains(&d.mac);
             let flags = membership.flags_for(lease_ips.get(&d.mac).unwrap_or(&no_ips));
             let lp = live_points.get(&d.mac);
+            // Reconcile the slow 5-min `online` flag with live traffic (see `online_now`)
+            // so a freshly-active device isn't shown offline while its rate is nonzero.
+            d.online = online_now(d.online, lp);
             DeviceView {
                 device: d,
                 is_unlimited,
@@ -1473,9 +1485,9 @@ async fn admin_device_detail(
         .transpose()?
         .unwrap_or(DEVICE_DETAIL_DEFAULT_DAYS)
         .clamp(1, DEVICE_DETAIL_MAX_DAYS);
-    let deps = {
+    let (deps, live) = {
         let s = state.lock().await;
-        ClassifyDeps::snapshot(&s)
+        (ClassifyDeps::snapshot(&s), s.live_traffic().clone())
     };
     let metrics = match deps.metrics {
         Some(m) => m,
@@ -1500,11 +1512,15 @@ async fn admin_device_detail(
 
     let now = chrono::Utc::now().timestamp();
     let mac_q = mac.clone();
-    let (detail_res, membership, lease_ips) = tokio::task::spawn_blocking(move || {
+    let (detail_res, membership, lease_ips, live_lp) = tokio::task::spawn_blocking(move || {
+        // In-memory live snapshot read stays off the executor thread (same as the
+        // listing handler); `LivePoint` is `Copy` so we keep just this MAC's point.
+        let live_lp = live.snapshot(now).get(&mac_q).copied();
         (
             metrics.device_detail(&mac_q, now, days),
             IpsetMembership::read(&acl_name, &shaper_name, &no_shape_name),
             active_lease_ips_or_empty(&leases_path, dhcp_params),
+            live_lp,
         )
     })
     .await
@@ -1513,7 +1529,7 @@ async fn admin_device_detail(
         APIError::InternalError
     })?;
 
-    let detail = match detail_res {
+    let mut detail = match detail_res {
         Ok(Some(d)) => d,
         Ok(None) => return Err(APIError::NotFound),
         Err(err) => {
@@ -1521,6 +1537,8 @@ async fn admin_device_detail(
             return Err(APIError::InternalError);
         }
     };
+    // Reconcile `online` with live traffic (see `online_now`), consistent with the listing.
+    detail.device.online = online_now(detail.device.online, live_lp.as_ref());
     let flags = membership.flags_for(lease_ips.get(&mac).map(Vec::as_slice).unwrap_or(&[]));
     // `online` (traffic-derived) is carried by `detail.device` and flattens out.
     Ok(HttpResponse::Ok().json(DeviceDetailView {
@@ -2807,6 +2825,29 @@ mod tests {
         // Live fields serialize at the top level too.
         assert_eq!(v["rate_bps_live"], 2048);
         assert_eq!(v["bytes_last_min"], 4096);
+    }
+
+    #[test]
+    fn online_now_reconciles_metrics_with_live_traffic() {
+        use crate::live_traffic::LivePoint;
+        // Already online per the 5-min sampler: stays online regardless of live data.
+        assert!(online_now(true, None));
+        // Offline and no live point: offline.
+        assert!(!online_now(false, None));
+        // Offline in metrics but real live traffic in the window: online now (the fix
+        // for "traffic right now but shows offline").
+        let active = LivePoint {
+            bytes_last_min: 4096,
+            rate_bps_live: Some(1024),
+        };
+        assert!(online_now(false, Some(&active)));
+        // Present in the live series but zero bytes (active-idle) must NOT flip online,
+        // matching the metrics semantic of "online == had traffic".
+        let idle = LivePoint {
+            bytes_last_min: 0,
+            rate_bps_live: Some(0),
+        };
+        assert!(!online_now(false, Some(&idle)));
     }
 
     #[test]
