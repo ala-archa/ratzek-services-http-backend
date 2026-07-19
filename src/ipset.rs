@@ -112,15 +112,21 @@ impl IPSet {
     }
 
     /// Remove an entry. Removing an absent entry is treated as success so the
-    /// operation is idempotent (safe to retry / use during reconcile).
+    /// operation is idempotent (safe to retry / use during reconcile). `-exist`
+    /// makes ipset itself ignore a missing element (version-independent); the
+    /// stderr check is a fallback for wording drift across ipset versions — e.g.
+    /// v7.10 says "Element cannot be deleted from the set: it's not added", while
+    /// older builds say "not in set" / "element is missing".
     pub fn del(&self, entry: &str) -> Result<()> {
         let r = std::process::Command::new("ipset")
-            .args(["del", &self.name, entry])
+            .args(["del", "-exist", &self.name, entry])
             .output()?;
 
         if !r.status.success() {
             let stderr = String::from_utf8_lossy(&r.stderr);
-            if stderr.contains("not in set") || stderr.contains("element is missing") {
+            let s = stderr.to_ascii_lowercase();
+            if s.contains("not added") || s.contains("not in set") || s.contains("element is missing")
+            {
                 return Ok(());
             }
             bail!("ipset del failed: {}", stderr.trim())
