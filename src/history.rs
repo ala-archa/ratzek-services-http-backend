@@ -40,6 +40,8 @@ pub mod kind {
     /// Bulk disconnect of all non-unlimited clients (service maintenance).
     pub const DISCONNECT_ALL: &str = "disconnect_all";
     pub const SHAPER_RESET: &str = "shaper_reset";
+    /// Global aggregate channel shaping toggled (enabled with a limit, or disabled).
+    pub const SHAPING_GLOBAL: &str = "shaping_global";
 
     /// All known kinds, for validating the `/admin/events?kind=` filter.
     pub const ALL: &[&str] = &[
@@ -52,6 +54,7 @@ pub mod kind {
         DISCONNECT,
         DISCONNECT_ALL,
         SHAPER_RESET,
+        SHAPING_GLOBAL,
     ];
 
     /// Whether `k` is a known event kind (used to reject `?kind=` junk with 400).

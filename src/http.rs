@@ -4,7 +4,7 @@ use std::{future::Future, sync::Arc};
 
 use actix_web::{
     cookie::{Cookie, SameSite},
-    delete, get, patch, post,
+    delete, get, patch, post, put,
     web::{self, Data},
     HttpRequest, HttpResponse,
 };
@@ -1940,6 +1940,116 @@ async fn admin_device_reset_shaper_counter(
     Ok(HttpResponse::NoContent().finish())
 }
 
+// --- Global aggregate channel shaping (one shared cap for all non-unlimited clients) ---
+
+#[derive(Deserialize)]
+struct SetGlobalShaping {
+    /// Aggregate cap for ALL non-unlimited clients combined, in bits/sec (must be > 0).
+    limit_bps: u64,
+}
+
+#[derive(Serialize)]
+struct GlobalShapingStatus {
+    enabled: bool,
+    limit_bps: Option<u64>,
+}
+
+fn global_shaping_status(limit: Option<u64>) -> GlobalShapingStatus {
+    GlobalShapingStatus {
+        enabled: limit.is_some(),
+        limit_bps: limit,
+    }
+}
+
+/// Enable (or adjust) the global aggregate shaping cap shared by all non-unlimited
+/// clients. Applies the tc class ceil now AND persists it so it survives a reboot.
+#[put("/api/v1/admin/shaping/global")]
+async fn admin_shaping_global_set(
+    auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    req: HttpRequest,
+    body: web::Json<SetGlobalShaping>,
+) -> Result<HttpResponse, APIError> {
+    let admin_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
+    let limit = body.limit_bps;
+    if limit == 0 {
+        return Err(APIError::BadRequest);
+    }
+    // Apply the tc ceil first (one fast subprocess under the lock); don't persist a
+    // state we couldn't enact.
+    let (guard, history) = {
+        let s = state.lock().await;
+        s.apply_global_shaping(Some(limit)).map_err(|e| {
+            error!("global shaping: apply {limit} bps failed: {e:#}");
+            APIError::InternalError
+        })?;
+        (s.persistent_state_guard(), s.history().cloned())
+    };
+    if let Err(err) = guard
+        .update(|ps| ps.global_shaping_limit_bps = Some(limit))
+        .await
+    {
+        error!("global shaping: persist failed: {err:#}");
+        return Err(APIError::InternalError);
+    }
+    info!("Admin enabled global shaping limit_bps={limit} from {admin_ip} (login={:?})", auth.login);
+    crate::history::record_event_best_effort(
+        history.as_deref(),
+        crate::history::kind::SHAPING_GLOBAL,
+        None,
+        Some(&format!("login={} enabled limit_bps={limit}", auth.login)),
+    );
+    Ok(HttpResponse::Ok().json(global_shaping_status(Some(limit))))
+}
+
+/// Disable the global shaping cap (guests return to unshaped).
+#[delete("/api/v1/admin/shaping/global")]
+async fn admin_shaping_global_clear(
+    auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+    req: HttpRequest,
+) -> Result<HttpResponse, APIError> {
+    let admin_ip = client_ip(&req).unwrap_or_else(|| "unknown".to_string());
+    let (guard, history) = {
+        let s = state.lock().await;
+        s.apply_global_shaping(None).map_err(|e| {
+            error!("global shaping: disable failed: {e:#}");
+            APIError::InternalError
+        })?;
+        (s.persistent_state_guard(), s.history().cloned())
+    };
+    if let Err(err) = guard
+        .update(|ps| ps.global_shaping_limit_bps = None)
+        .await
+    {
+        error!("global shaping: persist failed: {err:#}");
+        return Err(APIError::InternalError);
+    }
+    info!("Admin disabled global shaping from {admin_ip} (login={:?})", auth.login);
+    crate::history::record_event_best_effort(
+        history.as_deref(),
+        crate::history::kind::SHAPING_GLOBAL,
+        None,
+        Some(&format!("login={} disabled", auth.login)),
+    );
+    Ok(HttpResponse::Ok().json(global_shaping_status(None)))
+}
+
+/// Current global-shaping status (for the admin UI).
+#[get("/api/v1/admin/shaping/global")]
+async fn admin_shaping_global_status(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+) -> Result<HttpResponse, APIError> {
+    let limit = state
+        .lock()
+        .await
+        .persistent_state()
+        .await
+        .global_shaping_limit_bps;
+    Ok(HttpResponse::Ok().json(global_shaping_status(limit)))
+}
+
 // --- WAN history + event log (require the optional `history` store) ---
 
 /// Default look-back window for the WAN series when `from` is omitted. Independent
@@ -3007,6 +3117,16 @@ mod tests {
         assert_eq!(v["disconnected"], 5);
         assert_eq!(v["skipped"], 2);
         assert_eq!(v["errors"], 1);
+    }
+
+    #[test]
+    fn global_shaping_status_serializes() {
+        let on = serde_json::to_value(global_shaping_status(Some(2_000_000))).unwrap();
+        assert_eq!(on["enabled"], true);
+        assert_eq!(on["limit_bps"], 2_000_000);
+        let off = serde_json::to_value(global_shaping_status(None)).unwrap();
+        assert_eq!(off["enabled"], false);
+        assert!(off["limit_bps"].is_null());
     }
 
     #[test]

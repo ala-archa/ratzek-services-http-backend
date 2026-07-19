@@ -19,6 +19,11 @@ pub struct PersistentState {
     pub balance: Option<f64>,
     #[serde(default)]
     pub telegram_queue: Vec<TelegramMessage>,
+    /// Global aggregate shaping cap for all non-unlimited clients, in bits/sec.
+    /// `Some(x)` = enabled at `x` bps; `None` = disabled. Persisted so the cap is
+    /// re-applied after a restart/reboot (see `State::reconcile_global_shaping`).
+    #[serde(default)]
+    pub global_shaping_limit_bps: Option<u64>,
 }
 
 impl PersistentState {

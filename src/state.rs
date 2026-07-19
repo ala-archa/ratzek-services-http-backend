@@ -761,4 +761,28 @@ impl State {
 
         Ok(())
     }
+
+    /// Apply the global aggregate shaping cap: set the tc class ceil to `limit`
+    /// (bits/sec) when `Some`, or the configured `disabled_ceil` when `None`.
+    /// Synchronous (one `tc` subprocess), mirroring how reconcile runs ipset.
+    pub fn apply_global_shaping(&self, limit: Option<u64>) -> anyhow::Result<()> {
+        let sh = &self.config.shaping;
+        let ceil = match limit {
+            Some(bps) => crate::tc::bps_to_tc(bps),
+            None => sh.disabled_ceil.clone(),
+        };
+        crate::tc::Tc::new(&sh.interface).set_class_limit(&sh.classid, &ceil)
+    }
+
+    /// Re-apply the persisted global-shaping state on boot: a reboot resets the tc
+    /// class ceil to the boot-script default (disabled), so if a cap was enabled we
+    /// restore it here. Best-effort; run under a timeout by the caller.
+    pub async fn reconcile_global_shaping(&self) -> anyhow::Result<()> {
+        let limit = self.persistent_state.get().await.global_shaping_limit_bps;
+        match limit {
+            Some(bps) => info!("Reconciling global shaping: enabled at {bps} bps"),
+            None => info!("Reconciling global shaping: disabled"),
+        }
+        self.apply_global_shaping(limit)
+    }
 }

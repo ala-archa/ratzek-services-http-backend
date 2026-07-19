@@ -290,10 +290,50 @@ pub struct Config {
     /// Keep in sync with the dnsmasq lease time (default 12h = 43200).
     #[serde(default = "default_dhcp_lease_secs")]
     pub dhcp_lease_secs: i64,
+    /// Global aggregate shaping knobs (the tc class the boot script creates). Defaults
+    /// work out of the box; override only if the interface/class differ.
+    #[serde(default)]
+    pub shaping: GlobalShaping,
 }
 
 fn default_dhcp_lease_secs() -> i64 {
     43_200
+}
+
+/// Config for the runtime-toggled global (aggregate) channel shaping. The tc class,
+/// leaf qdisc and fw filter are created statically by `access-point-tc-restore`; the
+/// backend only changes this class's ceil. See `State::apply_global_shaping`.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GlobalShaping {
+    /// Egress interface carrying all guest traffic (hairpin: up + down). Default `eth0`.
+    #[serde(default = "default_shaping_interface")]
+    pub interface: String,
+    /// HTB classid fed by fwmark 300. Default `1:3`.
+    #[serde(default = "default_shaping_classid")]
+    pub classid: String,
+    /// Ceil applied when shaping is OFF — far above the uplink so it's transparent.
+    #[serde(default = "default_shaping_disabled_ceil")]
+    pub disabled_ceil: String,
+}
+
+fn default_shaping_interface() -> String {
+    "eth0".to_string()
+}
+fn default_shaping_classid() -> String {
+    "1:3".to_string()
+}
+fn default_shaping_disabled_ceil() -> String {
+    "10000mbit".to_string()
+}
+
+impl Default for GlobalShaping {
+    fn default() -> Self {
+        Self {
+            interface: default_shaping_interface(),
+            classid: default_shaping_classid(),
+            disabled_ceil: default_shaping_disabled_ceil(),
+        }
+    }
 }
 
 impl Config {

@@ -366,6 +366,7 @@ curl -b jar -X POST $BASE/api/v1/admin/logout
 | `POST /api/v1/admin/devices/{mac}/disconnect` | мгновенный отзыв доступа (ipset del) | да | да |
 | `POST /api/v1/admin/devices/disconnect-all` | отключить всех НЕ безлимитных (сервисный сброс канала) | да | да |
 | `POST /api/v1/admin/devices/{mac}/reset-shaper-counter` | сброс счётчика shaper клиента | да | да |
+| `PUT/DELETE/GET /api/v1/admin/shaping/global` | общий (агрегатный) лимит канала для не-безлимитных | да | да |
 | `GET /api/v1/admin/wan/speedtest` | история speedtest (timeseries) | да | да |
 | `GET /api/v1/admin/wan/balance` | история баланса ISP (timeseries) | да | да |
 | `GET /api/v1/admin/events` | журнал событий (activity-feed / аудит) | да | да |
@@ -623,6 +624,21 @@ FORWARD-DROP для не-`acl` источников рвёт и установл
 > **Не меняет класс шейпинга / скорость** — счётчик байт в бэкенде наблюдательный (квоты по байтам нет;
 > шейпинг — по членству в ipset). Сброс влияет только на индикатор `bytes_sent` и метрики.
 
+### `PUT · DELETE · GET /api/v1/admin/shaping/global` (требует сессии)
+**Общий (агрегатный) лимит канала** для ВСЕХ не-безлимитных клиентов вместе: один общий потолок, который
+все гости делят (не на каждого). Суммарно (отдача+загрузка вместе), реализовано HTB-классом на egress `eth0`.
+Безлимитные (`no_shape`/unlimited-store) и приватная сеть 10.11.4.x НЕ ограничиваются. Состояние переживает
+рестарт/ребут (persistent_state + reconcile на старте).
+- **`PUT`** `{ "limit_bps": 5000000 }` — включить/изменить лимит. `limit_bps` — **биты/с**, `>0`. Ответ `200`:
+  ```jsonc
+  { "enabled": true, "limit_bps": 5000000 }
+  ```
+  `400` — `limit_bps` = 0 или тело невалидно; `500` — не удалось применить `tc`/сохранить состояние.
+- **`DELETE`** — выключить лимит (гости снова без ограничения). Ответ `200 { "enabled": false, "limit_bps": null }`.
+- **`GET`** — текущий статус (для UI): `200 { "enabled": bool, "limit_bps": <биты/с>|null }`.
+> Событие включения/выключения пишется в `/admin/events` как `shaping_global` (`detail` = логин + лимит/выкл).
+> Тяжёлые клиенты (>1 ГиБ) продолжают отдельно троттлиться до 300 кбит (штрафной класс) — вне общего пула.
+
 ### `GET /api/v1/admin/wan/speedtest` · `GET /api/v1/admin/wan/balance` (требует сессии)
 История WAN: периодические замеры speedtest и баланса ISP (копятся cron'ами в SQLite). Параметры
 `from`/`to` (unix sec UTC, опц.; деф. `to=now`, `from=to−90 дней`). Точки — newest-first.
@@ -653,7 +669,8 @@ FORWARD-DROP для не-`acl` источников рвёт и установл
 вниз; `detail`=баланс); `new_device` (впервые увиденный MAC — требует включённого `device_metrics`;
 `mac`/`detail`=ip); `blacklist_add` / `blacklist_remove` / `disconnect` / `disconnect_all` / `shaper_reset`
 (админ-действия; `mac` + `detail`=IP админа или затронутые IP; у `disconnect_all` `mac` пуст, `detail`=логин
-+ счётчики). `mac`/`detail` опускаются, если не заданы. При выключенном `history` → `404`.
++ счётчики); `shaping_global` (вкл/выкл общего лимита канала; `detail`=логин + лимит/выкл). `mac`/`detail`
+опускаются, если не заданы. При выключенном `history` → `404`.
 > Журнал хранится столько же, сколько WAN-ряды — `history.retention_days` (деф. 90), включая
 > аудит-события (`blacklist_*`/`disconnect`/`shaper_reset`). Нужен более долгий аудит — увеличь `retention_days`.
 

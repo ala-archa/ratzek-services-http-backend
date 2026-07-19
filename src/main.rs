@@ -20,6 +20,7 @@ mod persistent_state;
 mod session;
 mod speedtest;
 mod state;
+mod tc;
 mod telegram;
 mod unlimited_clients;
 
@@ -123,6 +124,19 @@ impl Application {
                     Err(_) => error!("Unlimited reconcile timed out; will heal on next start"),
                 }
 
+                // Re-apply the persisted global-shaping cap (a reboot resets the tc
+                // class ceil to the boot-script default = disabled). Bounded + non-fatal.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(90),
+                    async { state.lock().await.reconcile_global_shaping().await },
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => error!("Global-shaping reconcile failed: {:#}", err),
+                    Err(_) => error!("Global-shaping reconcile timed out; will heal on next start"),
+                }
+
                 actix_web::HttpServer::new(move || {
                     actix_web::App::new()
                         .app_data(web::Data::new(state.clone()))
@@ -147,6 +161,9 @@ impl Application {
                         .service(http::admin_devices_disconnect_all)
                         .service(http::admin_device_disconnect)
                         .service(http::admin_device_reset_shaper_counter)
+                        .service(http::admin_shaping_global_set)
+                        .service(http::admin_shaping_global_clear)
+                        .service(http::admin_shaping_global_status)
                         .service(http::admin_wan_speedtest)
                         .service(http::admin_wan_balance)
                         .service(http::admin_events)
