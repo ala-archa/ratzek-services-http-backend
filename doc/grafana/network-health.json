@@ -1,0 +1,144 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "tags": ["ratzek", "network"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "allValue": ".+",
+        "current": { "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "includeAll": true,
+        "label": "Device",
+        "multi": true,
+        "name": "device",
+        "query": { "query": "label_values(ratzek_infra_ping_up, device)", "refId": "A" },
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "1m",
+  "timezone": "",
+  "title": "Ratzek — сеть (ping/интерфейсы/LTE)",
+  "uid": "ratzek-network-health",
+  "schemaVersion": 39,
+  "version": 1,
+  "panels": [
+    { "type": "row", "id": 100, "title": "Пинг инфра-устройств", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "panels": [] },
+    {
+      "type": "timeseries", "id": 1, "title": "Потери пакетов",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "ratzek_infra_ping_loss_ratio{device=~\"$device\"}", "legendFormat": "{{device}}", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries", "id": 2, "title": "RTT",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "ms", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "ratzek_infra_ping_rtt_ms{device=~\"$device\"}", "legendFormat": "{{device}}", "refId": "A" } ]
+    },
+    {
+      "type": "state-timeline", "id": 3, "title": "Доступность (up)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] }, "mappings": [ { "type": "value", "options": { "0": { "text": "down" }, "1": { "text": "up" } } } ] }, "overrides": [] },
+      "options": { "mergeValues": true, "showValue": "never", "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "ratzek_infra_ping_up{device=~\"$device\"}", "legendFormat": "{{device}}", "refId": "A" } ]
+    },
+    {
+      "type": "stat", "id": 4, "title": "Свежесть сбора (с)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": { "defaults": { "unit": "s", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 120 }, { "color": "red", "value": 300 } ] } }, "overrides": [] },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value" },
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "time() - ratzek_infra_ping_last_check_timestamp", "legendFormat": "возраст", "refId": "A" } ]
+    },
+    { "type": "row", "id": 101, "title": "MikroTik интерфейсы (drops/errors)", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 }, "panels": [] },
+    {
+      "type": "timeseries", "id": 5, "title": "Drops (пакетов/с)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "pps", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(mikrotik_interface_rx_drop[5m])", "legendFormat": "{{name}} {{interface}} rx", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(mikrotik_interface_tx_drop[5m])", "legendFormat": "{{name}} {{interface}} tx", "refId": "B" }
+      ]
+    },
+    {
+      "type": "timeseries", "id": 6, "title": "Errors (пакетов/с)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "pps", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(mikrotik_interface_rx_error[5m])", "legendFormat": "{{name}} {{interface}} rx", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "rate(mikrotik_interface_tx_error[5m])", "legendFormat": "{{name}} {{interface}} tx", "refId": "B" }
+      ]
+    },
+    {
+      "type": "timeseries", "id": 7, "title": "Флапы линка (за 1ч)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 40, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "increase(mikrotik_interface_link_downs[1h])", "legendFormat": "{{name}} {{interface}}", "refId": "A" } ]
+    },
+    { "type": "row", "id": 102, "title": "LTE-сигнал (тарелка 10.11.1.1)", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 }, "panels": [] },
+    {
+      "type": "timeseries", "id": 8, "title": "RSRP / RSRQ",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 5, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "min"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "mikrotik_lte_interface_rsrp", "legendFormat": "RSRP (dBm)", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "mikrotik_lte_interface_rsrq", "legendFormat": "RSRQ (dB)", "refId": "B" }
+      ]
+    },
+    {
+      "type": "timeseries", "id": 9, "title": "SINR / CQI",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
+      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 5, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "min"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "mikrotik_lte_interface_sinr", "legendFormat": "SINR (dB)", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "mikrotik_lte_interface_cqi", "legendFormat": "CQI", "refId": "B" }
+      ]
+    },
+    {
+      "type": "stat", "id": 10, "title": "LTE сейчас",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 39 },
+      "fieldConfig": { "defaults": { "unit": "none", "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "value_and_name" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "mikrotik_lte_interface_rsrp", "legendFormat": "RSRP", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "mikrotik_lte_interface_rsrq", "legendFormat": "RSRQ", "refId": "B" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "mikrotik_lte_interface_sinr", "legendFormat": "SINR", "refId": "C" },
+        { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "mikrotik_lte_interface_cqi", "legendFormat": "CQI", "refId": "D" }
+      ]
+    }
+  ]
+}

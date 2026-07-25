@@ -271,3 +271,54 @@ speedtest (backend уже алертит по тарифу).
 Калибровка: cell_delta max7д 0.442 (спайк на knee-разряде) → порог 0.2/30m (не транзиент); mikrotik
 CPU max7д 98% → >90; free_mem min7д 0.10 → <0.08. Пропущено: `mikrotik_health_voltage` (=24В-шина,
 дублирует BMS voltage-low).
+
+## Инфра-мониторинг потери пакетов (ICMP) — ПРИМЕНЁН (2026-07-19)
+
+Активный ICMP-мониторинг loss/RTT/доступности инфра-устройств (аналог smokeping без нового
+экспортёра): пинг С Pi по каждому узлу, метрики через node_exporter textfile-collector. +4 правила
+(всего **25**, `promtool` SUCCESS; RTT-алерт добавлен 2026-07-25).
+
+**Скрипт `doc/infra-ping-metric.sh`** → `/usr/local/bin/infra-ping-metric.sh`, cron
+`*/1 * * * * flock -n /run/infra-ping.lock /usr/local/bin/infra-ping-metric.sh` (root — нужен для
+raw-socket ping; `flock` от наложения). Цели (`name=ip` наверху скрипта, имена = как в
+mikrotik-exporter): 10.11.1.1 (LTE-тарелка), 10.11.2.1/3.1 (радиомост), 10.11.5.2/3/4 (свитч+2 AP),
+10.11.3.4 (веб-камера). Пишет в `/var/lib/node_exporter/infra_ping.prom` (0644):
+`ratzek_infra_ping_loss_ratio{device,ip}` (0..1), `_rtt_ms`, `_up` (0 при 100% потерь),
+`ratzek_infra_ping_last_check_timestamp` (свежесть).
+- **Корректность (важно):** весь файл собирается в tmp той же ФС → атомарный `mv` (не `>>`, иначе
+  смерть в середине уронит серии части устройств = тихий ложно-негатив). Каждый `ping` и парсинг —
+  под `|| true`, т.к. `ping` возвращает ≠0 при потерях, а `set -euo pipefail` иначе оборвёт сбор на
+  первом лежащем устройстве. Проверено тестом с заведомо мёртвым IP: скрипт доходит до конца, пишет
+  `up=0`.
+
+| Alert | expr | for | sev |
+|---|---|---|---|
+| RatzekInfraPacketLoss | `ratzek_infra_ping_loss_ratio{device!="zvonilka-Mikrotik-LHG"} > 0.2` | 10m | warn |
+| RatzekInfraPacketLossUplink | `ratzek_infra_ping_loss_ratio{device="zvonilka-Mikrotik-LHG"} > 0.5` | 15m | warn |
+| RatzekInfraPingStale | `time() - ratzek_infra_ping_last_check_timestamp > 300` | 5m | warn |
+| RatzekInfraLatencyHigh | `ratzek_infra_ping_rtt_ms > 50` | 10m | warn |
+
+**Локализация «где теряется»:** пинг каждого хопа отдельно (3.1→2.1→1.1) — потери к 1.1 при чистом 2.1
+⇒ плохой участок 2.1↔1.1. LTE-тарелка вынесена в отдельное послабленное правило (путь шумный по
+природе). `up==0`-алерта нет намеренно: 100% потерь → `loss=1` → сработает PacketLoss, а полное падение
+микротика уже ловит `RatzekMikrotikUnreachable` (не плодим тройное срабатывание). RTT-алерт ловит
+деградацию линка без потерь (baseline всех узлов ~1мс → порог 50мс; провизорный, калибровать).
+
+### Дашборд Grafana «сеть» — ПРИМЕНЁН (2026-07-25)
+
+Grafana 11.2 (`127.0.0.1:3000`, за nginx), дашборды — **file-provisioning**: единственный активный
+провайдер `daly-bms-org2` (orgId **2**, path `/var/lib/grafana/dashboards`, reload ≤30с;
+`sample.yaml`/org-1 закомментирован). Datasource `prometheus` — ссылки через templating-переменную
+`${DS_PROMETHEUS}` (file-provisioning не резолвит `__inputs`; без этой переменной панели пустые).
+
+**`doc/grafana/network-health.json`** (uid `ratzek-network-health`) → `/var/lib/grafana/dashboards/`
+(лёг в org 2, рядом с BMS). 3 ряда: **Пинг** (loss/RTT/up + свежесть сбора), **MikroTik интерфейсы**
+(`rate()` rx/tx drops+errors — метрики counter; link-flaps), **LTE-сигнал** (rsrp/rsrq/sinr/cqi;
+`rssi` не отдаётся). Фильтр-переменная `device`. Деплой: `python -m json.tool` (валидность) → scp →
+провайдер подхватит за ≤30с (проверять `journalctl -u grafana-server | grep -i provision`).
+Rollback: `rm .../network-health.json` (провайдер снимет за 30с). Grafana-native alerting НЕ
+используем — алерты остаются в Prometheus→Alertmanager→Telegram.
+
+**Пороги провизорные — калибровать по baseline** (2–3 дня; метрики уже в Prometheus). При старте всё
+`inactive`, ложняков нет (все узлы up, loss 0). Деплой host-direct (ansible устарел), как webcam-скрипт.
+Rollback: убрать cron-строку + скрипт + `infra_ping.prom` + 3 правила → `systemctl reload prometheus`.

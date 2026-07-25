@@ -165,3 +165,39 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "MikroTik мало памяти: {{ $value | humanizePercentage }} свободно ({{ $labels.name }})"
+
+      # --- Infra ICMP loss/RTT (added 2026-07-19) ---
+      # Textfile metrics from doc/infra-ping-metric.sh (cron */1, node_exporter textfile
+      # collector). Loss to the LTE dish is noisy by nature → separate relaxed rule below.
+      # A device fully down shows loss=1 → PacketLoss fires (no separate up==0 alert; full
+      # MikroTik outages are already caught by RatzekMikrotikUnreachable). Thresholds are
+      # provisional — tune against a few days of baseline.
+      - alert: RatzekInfraPacketLoss
+        expr: ratzek_infra_ping_loss_ratio{device!="zvonilka-Mikrotik-LHG"} > 0.2
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Потери пакетов к {{ $labels.device }} ({{ $labels.ip }}): {{ $value | humanizePercentage }}"
+
+      - alert: RatzekInfraPacketLossUplink
+        expr: ratzek_infra_ping_loss_ratio{device="zvonilka-Mikrotik-LHG"} > 0.5
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Высокие потери на LTE-аплинке {{ $labels.ip }}: {{ $value | humanizePercentage }}"
+
+      - alert: RatzekInfraPingStale
+        expr: time() - ratzek_infra_ping_last_check_timestamp > 300
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Инфра-пинг-метрики не обновляются {{ $value | humanize }}с (скрипт завис/упал)"
+
+      # RTT-деградация линка без потерь пакетов. Baseline всех 7 узлов ~0.3–1 мс (локальные
+      # хопы) → 50 мс = явная деградация. Порог провизорный, откалибровать по baseline.
+      - alert: RatzekInfraLatencyHigh
+        expr: ratzek_infra_ping_rtt_ms > 50
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Высокий RTT к {{ $labels.device }} ({{ $labels.ip }}): {{ $value | humanize }}мс"
