@@ -18,6 +18,7 @@ mod live_traffic;
 mod mobile_provider;
 mod persistent_state;
 mod session;
+mod shaper_quota;
 mod speedtest;
 mod state;
 mod tc;

@@ -99,6 +99,22 @@ blacklist_path: /var/lib/ala-archa-http-backend/blacklist.yaml
 #   crontab: "*/15 * * * * *"    # 6-field cron; every 15s (default)
 #   window_secs: 60              # rolling window for bytes_last_min / rate (default)
 
+# shaper_quota_reset: optional per-client byte-quota reset. On the host the "speed
+# limit" is an iptables byte quota (`--bytes-gt` -> MARK -> tc); the shaper ipset entry
+# is refreshed by every packet, so its counter only resets after ~3h of ZERO traffic —
+# a device with background traffic never resets and stays throttled forever. This job
+# gives each client a rolling window: `period_secs` after it is first seen in the set
+# (and every period after), its counter is reset via `ipset del` (re-created from zero
+# by the next packet — no disconnect, throttle clears). Windows are in-memory/ephemeral
+# (never on disk); iptables is NOT modified. Omit or set enabled: false to disable.
+# Exposes ratzek_shaper_quota_{enabled,age_seconds,resets_total,errors_total} and
+# ratzek_shaper_clients_over_quota on /metrics.
+# shaper_quota_reset:
+#   enabled: true                # default true when the section is present
+#   crontab: "0 * * * * *"       # 6-field cron; every 60s (default)
+#   period_secs: 10800           # per-client window; match the ipset timeout (3h, default)
+#   quota_bytes: 1073741824      # mirror of the iptables --bytes-gt threshold (1 GiB, default)
+
 telegram:
   bot_token: "123456:ABC-asdasdasdasd"
   retry_crontab: "30 */5 * * * *"

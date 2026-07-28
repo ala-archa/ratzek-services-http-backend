@@ -608,6 +608,42 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
             age as f64,
         );
     }
+    // Shaper-quota reset job health. A silently-stalled job means clients get
+    // throttled forever again, so the age gauge is the key alerting signal (mirrors
+    // ratzek_device_metrics_age_seconds). No per-IP labels (network PII).
+    let (sq_enabled, sq_last_run, sq_resets, sq_errors, sq_over_quota) = {
+        let s = state.lock().await;
+        let (last_run, resets, errors, over_quota) = s.shaper_quota_stats();
+        (s.shaper_quota_enabled(), last_run, resets, errors, over_quota)
+    };
+    out += &gauge(
+        "ratzek_shaper_quota_enabled",
+        "Whether the shaper byte-quota reset job is enabled (1) or off (0)",
+        sq_enabled as i64 as f64,
+    );
+    if sq_last_run > 0 {
+        let age = (chrono::Utc::now().timestamp() - sq_last_run).max(0);
+        out += &gauge(
+            "ratzek_shaper_quota_age_seconds",
+            "Seconds since the last successful shaper-quota reset pass",
+            age as f64,
+        );
+    }
+    out += &counter(
+        "ratzek_shaper_quota_resets_total",
+        "Shaper byte-counter resets performed (successful ipset del)",
+        sq_resets as f64,
+    );
+    out += &counter(
+        "ratzek_shaper_quota_errors_total",
+        "Shaper-quota per-IP ipset del failures",
+        sq_errors as f64,
+    );
+    out += &gauge(
+        "ratzek_shaper_clients_over_quota",
+        "Clients whose shaper byte counter is past the quota (throttled) at the last pass",
+        sq_over_quota as f64,
+    );
     // Alertmanager→Telegram pipeline self-observability.
     use std::sync::atomic::Ordering as AtomicOrdering;
     out += &counter(
@@ -1851,9 +1887,11 @@ async fn admin_device_disconnect(
 /// Reset a client's shaper byte counter by removing its active-lease IP(s) from the
 /// `shaper` ipset. The counter lives on the ipset entry, so dropping the entry zeroes
 /// it (`client_get` then reports `bytes_sent` 0). The client keeps internet access
-/// (stays in `acl`) and is re-added to `shaper` with a fresh counter on its next
-/// registration. Does NOT change the shaping class — the byte counter is observational
-/// in this backend (no byte quota); resetting it only affects the indicator/metrics.
+/// (stays in `acl`) and the entry is re-created from zero by its next packet (the
+/// FORWARD `SET --add-set shaper` rule). NB: on the host this counter IS load-bearing
+/// — the iptables `--bytes-gt` rule throttles clients past the quota, so this reset
+/// lifts that throttle. The scheduled `shaper_quota` job automates the same `ipset del`
+/// on a per-client 3h window; this endpoint is the manual, on-demand equivalent.
 #[post("/api/v1/admin/devices/{mac}/reset-shaper-counter")]
 async fn admin_device_reset_shaper_counter(
     _auth: AuthSession,
