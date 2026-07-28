@@ -201,3 +201,16 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "Высокий RTT к {{ $labels.device }} ({{ $labels.ip }}): {{ $value | humanize }}мс"
+
+      # --- Shaper byte-quota reset job (added 2026-07-28) ---
+      # Per-client shaper quota reset (src/shaper_quota.rs) runs every ~60s and exposes
+      # ratzek_shaper_quota_age_seconds. A silently-stalled job means clients that
+      # crossed the 1 GiB --bytes-gt throttle stay rate-limited forever (the exact
+      # incident this feature fixes), so alert if the pass goes stale. Only fires when
+      # the job is enabled and has run at least once (age gauge absent otherwise).
+      - alert: RatzekShaperQuotaStalled
+        expr: ratzek_shaper_quota_age_seconds > 600
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Джоб сброса квоты shaper завис: {{ $value | humanize }}с без прохода (клиенты висят throttled)"

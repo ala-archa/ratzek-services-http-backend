@@ -266,6 +266,10 @@ pub struct State {
     live_traffic: Arc<crate::live_traffic::LiveTraffic>,
     /// Unix epoch of the last successful live-traffic sample (0 = never), for monitoring.
     live_last_sample: Arc<AtomicI64>,
+    /// In-memory per-client shaper byte-quota window tracker (always present, cheap;
+    /// the job is gated by config at scheduling time). Owns its own monitoring
+    /// counters (last-run / resets / errors / over-quota). See `crate::shaper_quota`.
+    shaper_quota: Arc<crate::shaper_quota::ShaperQuota>,
 }
 
 impl State {
@@ -511,6 +515,48 @@ impl State {
             }
         }
 
+        if let Some(sq_cfg) = &state_guard.config.shaper_quota_reset {
+            if sq_cfg.enabled {
+                let state1 = state.clone();
+                // Overlap guard. NB: the guard is handed to the BLOCKING task (not the
+                // async closure), so it clears only when the real `ipset` work finishes.
+                // If `ipset` ever wedges, the flag stays set and later ticks skip —
+                // no thread/subprocess pile-up — and staleness surfaces via
+                // `ratzek_shaper_quota_age_seconds` (there is no async timeout that would
+                // otherwise release the flag while the orphan thread keeps running).
+                let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                info!(
+                    "Starting shaper-quota reset job (period={}s, quota={}B)",
+                    sq_cfg.period_secs, sq_cfg.quota_bytes
+                );
+                state_guard
+                    .scheduler
+                    .add(Job::new_async(&sq_cfg.crontab, move |_uuid, _l| {
+                        let state1 = state1.clone();
+                        let running = running.clone();
+                        Box::pin(async move {
+                            if running.swap(true, Ordering::SeqCst) {
+                                warn!("shaper-quota: previous pass still running, skipping tick");
+                                return;
+                            }
+                            let quota = state1.lock().await.shaper_quota();
+                            let now = chrono::Utc::now().timestamp();
+                            let join = tokio::task::spawn_blocking(move || {
+                                // Guard released only when the blocking pass truly ends.
+                                let _guard = RunningGuard(running);
+                                quota.run_and_record(now);
+                            });
+                            if let Err(err) = join.await {
+                                error!("shaper-quota pass task panicked: {err}");
+                            }
+                        })
+                    })?)
+                    .await?;
+            } else {
+                info!("shaper-quota reset job disabled (enabled=false)");
+            }
+        }
+
         state_guard.scheduler.start().await?;
 
         Ok(())
@@ -606,6 +652,21 @@ impl State {
             std::time::Duration::from_secs(live_window_secs as u64),
         ));
 
+        // Shaper-quota window tracker. Period/quota fall back to the SAME config
+        // `#[serde(default)]` fns when the section is absent (single source of truth,
+        // no drift); the job itself is only scheduled when the section is present and
+        // enabled.
+        let shaper_quota = {
+            let sq = config.shaper_quota_reset.as_ref();
+            Arc::new(crate::shaper_quota::ShaperQuota::new(
+                config.ipset_shaper_name.clone(),
+                sq.map(|c| c.period_secs)
+                    .unwrap_or_else(crate::config::default_shaper_quota_period_secs),
+                sq.map(|c| c.quota_bytes)
+                    .unwrap_or_else(crate::config::default_shaper_quota_bytes),
+            ))
+        };
+
         let state = Arc::new(Mutex::new(Self {
             config: config.clone(),
             persistent_state: crate::persistent_state::PersistentStateGuard::load_from_yaml(
@@ -619,6 +680,7 @@ impl State {
             history,
             live_traffic,
             live_last_sample: Arc::new(AtomicI64::new(0)),
+            shaper_quota,
         }));
 
         Ok(state)
@@ -678,6 +740,26 @@ impl State {
             .as_ref()
             .map(|c| c.enabled)
             .unwrap_or(false)
+    }
+
+    /// Whether the shaper-quota reset job is enabled in config.
+    pub fn shaper_quota_enabled(&self) -> bool {
+        self.config
+            .shaper_quota_reset
+            .as_ref()
+            .map(|c| c.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Shared handle to the shaper-quota tracker (for the scheduled job).
+    pub fn shaper_quota(&self) -> Arc<crate::shaper_quota::ShaperQuota> {
+        self.shaper_quota.clone()
+    }
+
+    /// Shaper-quota monitoring snapshot: (last-run epoch, resets total, errors total,
+    /// members-over-quota). `last_run == 0` means the job never ran / is disabled.
+    pub fn shaper_quota_stats(&self) -> (i64, i64, i64, i64) {
+        self.shaper_quota.stats()
     }
 
     /// Optional WAN-history + event-log store (None if disabled or DB couldn't open).

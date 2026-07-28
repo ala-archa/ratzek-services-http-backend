@@ -187,6 +187,54 @@ pub struct LiveTrafficConfig {
     pub window_secs: i64,
 }
 
+fn default_shaper_quota_enabled() -> bool {
+    true
+}
+
+fn default_shaper_quota_crontab() -> String {
+    // Every 60 seconds (6-field cron). One `ipset save` + a few `ipset del` per tick
+    // is trivial; the ±60s slack against a 3h window is 0.6%, irrelevant.
+    "0 * * * * *".to_string()
+}
+
+// pub(crate) so `State::new` can reuse the same fallback defaults when the section is
+// absent, instead of duplicating the literals (single source of truth).
+pub(crate) fn default_shaper_quota_period_secs() -> i64 {
+    // 3h, matching the ipset `timeout 10800` on the shaper set.
+    10_800
+}
+
+pub(crate) fn default_shaper_quota_bytes() -> u64 {
+    // 1 GiB, matching the iptables `--bytes-gt 1073741824` throttle threshold.
+    1_073_741_824
+}
+
+/// Optional per-client shaper byte-quota reset. A scheduled in-memory job gives each
+/// client a rolling window: ~`period_secs` after a client is first seen in the shaper
+/// set (and every `period_secs` after), its byte counter is reset with `ipset del`
+/// so it drops back below the iptables `--bytes-gt` throttle threshold. Fixes clients
+/// staying throttled forever because background traffic keeps refreshing the ipset
+/// timeout. Omit the section to disable; `enabled: false` also disables. iptables is
+/// NOT modified. See `src/shaper_quota.rs`.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ShaperQuotaReset {
+    /// Enable the job (default true when the section is present).
+    #[serde(default = "default_shaper_quota_enabled")]
+    pub enabled: bool,
+    /// 6-field cron for the job (default every 60s).
+    #[serde(default = "default_shaper_quota_crontab")]
+    pub crontab: String,
+    /// Per-client window length in seconds; the counter resets this long after the
+    /// client is first seen in the set (default 10800 = 3h).
+    #[serde(default = "default_shaper_quota_period_secs")]
+    pub period_secs: i64,
+    /// Throttle threshold (bytes) mirrored from the iptables `--bytes-gt` rule. Used
+    /// only to report `ratzek_shaper_clients_over_quota`; the real threshold lives in
+    /// iptables (default 1073741824 = 1 GiB).
+    #[serde(default = "default_shaper_quota_bytes")]
+    pub quota_bytes: u64,
+}
+
 fn default_history_retention_days() -> i64 {
     90
 }
@@ -285,6 +333,8 @@ pub struct Config {
     pub history: Option<HistoryConfig>,
     #[serde(default)]
     pub live_traffic: Option<LiveTrafficConfig>,
+    #[serde(default)]
+    pub shaper_quota_reset: Option<ShaperQuotaReset>,
     /// Configured DHCP lease length in seconds. Only used to approximate `last_seen`
     /// under dnsmasq (whose lease file lacks a client-last-transaction timestamp).
     /// Keep in sync with the dnsmasq lease time (default 12h = 43200).
@@ -433,6 +483,18 @@ impl Config {
                 anyhow::bail!(
                     "live_traffic.window_secs must be > 0, got {}",
                     lt.window_secs
+                );
+            }
+        }
+
+        if let Some(sq) = &self.shaper_quota_reset {
+            if sq.crontab.trim().is_empty() {
+                anyhow::bail!("shaper_quota_reset.crontab must be non-empty");
+            }
+            if sq.period_secs <= 0 {
+                anyhow::bail!(
+                    "shaper_quota_reset.period_secs must be > 0, got {}",
+                    sq.period_secs
                 );
             }
         }
