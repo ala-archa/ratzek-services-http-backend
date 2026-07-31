@@ -47,7 +47,7 @@ groups:
           summary: "Сработала защита BMS: {{ $labels.type }}"
 
       - alert: RatzekBMSCommsLost
-        expr: time() - daly_bms_last_frame_timestamp_seconds > 300
+        expr: time() - daly_bms_last_frame_timestamp_seconds > 3600
         for: 5m
         labels: { severity: warning }
         annotations:
