@@ -11,29 +11,36 @@
 //! for 3h, so its counter stays above the quota and it is throttled indefinitely.
 //! There was no periodic quota reset anywhere in the system.
 //!
-//! **The fix.** This module runs a scheduled job that gives each client a personal
-//! rolling window: ~3h after a client is first seen in the set (and every ~3h after),
-//! its counter is reset with `ipset del shaper <ip>`. The entry is re-created from
-//! zero by the client's next packet (the `SET --add-set` rule precedes the accept /
-//! `--bytes-gt` rules in FORWARD), so there is no disconnect and the throttle mark
-//! clears immediately. This is the exact `IPSet::del` the manual
-//! `admin_device_reset_shaper_counter` endpoint already uses in production.
+//! **The fix — two reset triggers.**
+//! 1. *Periodic (this job):* purely time-based — ~`period` after a client is first seen
+//!    in the set (and every `period` after) its counter is reset with
+//!    `ipset del shaper <ip>` (the entry is re-created from zero by the next packet, so
+//!    no disconnect and the throttle mark clears at once). It does NOT read DHCP leases
+//!    (a leases-read failure must not false-reset everyone), so it is MAC-agnostic.
+//! 2. *At registration (`note_registration`, from `client_register`):* resets the
+//!    counter when the IP changes hands — the tracked MAC differs from the one the
+//!    client authenticated with. That MAC is read server-side from the dhcpd lease by
+//!    source IP (not from the request body), so it can't be spoofed via the API, and a
+//!    re-registration by the same client (same lease MAC) does NOT reset (prevents a
+//!    trivial quota bypass on the open `POST /api/v1/client`). This fixes a new tenant
+//!    inheriting the previous tenant's byte counter on a reused IP.
 //!
 //! **Design notes.**
 //! - **In-memory, ephemeral.** Windows live only in memory (like `live_traffic`),
-//!   never on the flaky USB-SSD. On restart windows re-seed; the worst case is a
-//!   reset deferred by ≤ one window, and any *reboot* wipes the kernel ipset (all
-//!   counters → 0) anyway, so persistence would buy almost nothing.
-//! - **Time-only.** The reset decision is purely time-based. It deliberately does
-//!   NOT key off the DHCP MAC (spoofable on a captive portal → quota bypass; a leases
-//!   read failure would false-reset everyone). Counter inheritance on IP reassignment
-//!   is bounded by the 3h window regardless.
+//!   never on the flaky USB-SSD. On restart windows re-seed; any *reboot* wipes the
+//!   kernel ipset (counters → 0) anyway, so persistence would buy almost nothing.
+//! - **Reset only on a KNOWN-different MAC.** An unknown previous MAC (`None`:
+//!   job-seeded, or after a process restart while the kernel ipset survived) adopts the
+//!   MAC without resetting — so registration never zeroes a counter without positive
+//!   evidence of a hand-over (no bypass). That residual inheritance self-heals within
+//!   one period via trigger #1.
+//! - **`window_start` moves only on an actual reset**, so a same-MAC re-registration
+//!   never pushes the window forward (no "throttled forever" regression).
 //! - **Clock-safe.** The host has no reliable RTC. A backward wall-clock jump
 //!   (`now < window_start`) is treated as "expired → reset now" — the safe
-//!   (un-throttle) direction — never a permanent non-reset.
-//! - **Anti-herd.** A new member's window is seeded at `now - rand(0..period)`, so
-//!   the members present at startup expire staggered across the first window instead
-//!   of all resetting in one tick.
+//!   (un-throttle) direction. The registration reset is MAC-only, time-independent.
+//! - **Anti-herd.** A new member's window is seeded at `now - rand(0..period)`, so the
+//!   members present at startup expire staggered across the first window.
 
 use crate::ipset::IPSet;
 use rand::Rng;
@@ -41,6 +48,14 @@ use slog_scope::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::RwLock;
+
+/// Per-IP quota window: when the counter was last zeroed, and the last MAC known to
+/// hold the IP (`None` = unknown: job-seeded or not yet learned via registration).
+#[derive(Debug, Clone, PartialEq)]
+struct Window {
+    window_start: i64,
+    mac: Option<String>,
+}
 
 /// Pure classification of the current shaper members against the tracked windows.
 /// No I/O and no RNG, so it is unit-tested directly.
@@ -55,11 +70,10 @@ struct Decision {
     stale: Vec<String>,
 }
 
-/// Classify `members` (IPs currently in the shaper set) against `windows`
-/// (ip → window_start, unix secs). Pure.
+/// Classify `members` (IPs currently in the shaper set) against `windows`. Pure.
 fn plan_resets(
     members: &HashSet<&str>,
-    windows: &HashMap<String, i64>,
+    windows: &HashMap<String, Window>,
     now: i64,
     period: i64,
 ) -> Decision {
@@ -69,7 +83,9 @@ fn plan_resets(
             None => d.new.push(ip.to_string()),
             // `now < start`: RTC-less host jumped backward → treat as expired (reset),
             // the un-throttle direction. `>=`: the window fully elapsed.
-            Some(&start) if now < start || now - start >= period => d.expired.push(ip.to_string()),
+            Some(w) if now < w.window_start || now - w.window_start >= period => {
+                d.expired.push(ip.to_string())
+            }
             Some(_) => {}
         }
     }
@@ -79,6 +95,45 @@ fn plan_resets(
         }
     }
     d
+}
+
+/// Phase 1 of a pass (runs under the write lock): seed new members (`mac: None` — the
+/// job never reads leases), prune stale IPs, and return the expired IPs to reset. Does
+/// NO ipset I/O — the blocking `ipset del` for the returned IPs runs OUTSIDE the lock
+/// (see `run_pass`), so a concurrent registration never stalls behind a whole pass.
+fn plan_and_prepare(
+    windows: &mut HashMap<String, Window>,
+    members: &HashSet<&str>,
+    now: i64,
+    period: i64,
+    mut seed: impl FnMut() -> i64,
+) -> Vec<String> {
+    let d = plan_resets(members, windows, now, period);
+    for ip in d.new {
+        windows.insert(
+            ip,
+            Window {
+                window_start: seed(),
+                mac: None,
+            },
+        );
+    }
+    for ip in &d.stale {
+        windows.remove(ip);
+    }
+    d.expired
+}
+
+/// Phase 3 of a pass (runs under the write lock): advance the window of each IP whose
+/// counter was actually reset, **preserving** its learned `mac`. IPs whose `ipset del`
+/// failed are simply not passed here, so their window is left unchanged (retried next
+/// tick).
+fn advance_windows(windows: &mut HashMap<String, Window>, ips: &[String], now: i64) {
+    for ip in ips {
+        if let Some(w) = windows.get_mut(ip) {
+            w.window_start = now;
+        }
+    }
 }
 
 /// Outcome of one reset pass, for logging + metrics.
@@ -94,58 +149,26 @@ struct PassStats {
     over_quota: usize,
 }
 
-/// Apply one pass to `windows`, deleting expired entries via the `del` closure.
-/// Split out (RNG + del injected) so it is fully unit-testable without real ipset.
-///
-/// `seed` yields the initial `window_start` for a new member (prod: `now - jitter`).
-/// `del(ip)` returns `true` on a successful counter reset. A member's window is
-/// advanced to `now` ONLY on success, so a failed `del` is retried next tick.
-fn apply_pass(
-    windows: &mut HashMap<String, i64>,
-    members: &HashSet<&str>,
-    now: i64,
-    period: i64,
-    mut seed: impl FnMut() -> i64,
-    mut del: impl FnMut(&str) -> bool,
-) -> (u64, u64) {
-    let d = plan_resets(members, windows, now, period);
-    for ip in d.new {
-        windows.insert(ip, seed());
-    }
-    for ip in &d.stale {
-        windows.remove(ip);
-    }
-    let (mut resets, mut errors) = (0u64, 0u64);
-    for ip in d.expired {
-        if del(&ip) {
-            windows.insert(ip, now);
-            resets += 1;
-        } else {
-            // Leave window_start unchanged → next ~60s tick retries this IP.
-            errors += 1;
-        }
-    }
-    (resets, errors)
-}
-
 /// In-memory per-IP quota-window tracker + reset driver, plus its own monitoring
 /// counters. Cheap; always constructed (the job is gated by config at scheduling
 /// time, not here). Held as an `Arc` in `State`; `run_and_record` runs inside a
 /// `spawn_blocking` and folds its outcome straight into the atomics below, so
 /// `State` needs no separate metric fields.
 pub struct ShaperQuota {
-    windows: RwLock<HashMap<String, i64>>,
+    windows: RwLock<HashMap<String, Window>>,
     shaper_set: String,
     period_secs: i64,
     quota_bytes: u64,
     /// Unix epoch of the last successful pass (0 = never), for the staleness gauge.
     last_run: AtomicI64,
-    /// Monotonic count of counter resets performed (successful `ipset del`).
+    /// Monotonic count of counter resets performed by the periodic job.
     resets_total: AtomicI64,
-    /// Monotonic count of per-IP `ipset del` failures.
+    /// Monotonic count of per-IP `ipset del` failures in the periodic job.
     errors_total: AtomicI64,
     /// Members past the byte quota at the last pass (gauge).
     over_quota: AtomicI64,
+    /// Monotonic count of counter resets performed at registration (MAC change on IP).
+    register_resets: AtomicI64,
 }
 
 impl ShaperQuota {
@@ -163,6 +186,46 @@ impl ShaperQuota {
             resets_total: AtomicI64::new(0),
             errors_total: AtomicI64::new(0),
             over_quota: AtomicI64::new(0),
+            register_resets: AtomicI64::new(0),
+        }
+    }
+
+    /// Record a captive-portal registration for `ip` by `mac` (the dhcpd-lease MAC, not
+    /// a request field). Returns `Some(old_mac)` when this is a KNOWN change of tenant
+    /// on the IP — the caller must then `ipset del <ip>` (outside this lock) to zero the
+    /// inherited counter — else `None` (fresh IP, unknown-previous, or same MAC: no
+    /// reset). `window_start` is advanced only on an actual reset. In-memory only; the
+    /// critical section is tiny and does no I/O.
+    pub fn note_registration(&self, ip: &str, mac: &str, now: i64) -> Option<String> {
+        let mut windows = self.windows.write().unwrap_or_else(|e| e.into_inner());
+        match windows.get_mut(ip) {
+            Some(w) => match &w.mac {
+                // Same client re-registering: no reset, leave the window untouched.
+                Some(cur) if cur == mac => None,
+                // Known different MAC → IP changed hands → reset the inherited counter.
+                Some(_) => {
+                    let old = w.mac.replace(mac.to_string());
+                    w.window_start = now;
+                    self.register_resets.fetch_add(1, Ordering::Relaxed);
+                    old
+                }
+                // Unknown previous MAC (job-seeded / post-restart): learn it, no reset.
+                None => {
+                    w.mac = Some(mac.to_string());
+                    None
+                }
+            },
+            // Brand-new IP: learn it, no reset (counter is presumed the client's own).
+            None => {
+                windows.insert(
+                    ip.to_string(),
+                    Window {
+                        window_start: now,
+                        mac: Some(mac.to_string()),
+                    },
+                );
+                None
+            }
         }
     }
 
@@ -210,8 +273,15 @@ impl ShaperQuota {
         )
     }
 
-    /// One reset pass. Reads the shaper set, seeds/advances/prunes windows, and
-    /// `ipset del`s expired members. Blocking (shells out to `ipset`).
+    /// Total counter resets performed at registration (MAC change on an IP).
+    pub fn register_resets(&self) -> i64 {
+        self.register_resets.load(Ordering::Relaxed)
+    }
+
+    /// One reset pass. Reads the shaper set, seeds/prunes windows, and `ipset del`s
+    /// expired members. The blocking `ipset del`s run OUTSIDE the `windows` lock (the
+    /// lock is only held for the tiny seed/prune and advance phases) so a concurrent
+    /// registration never stalls behind the whole pass. Blocking (shells out to `ipset`).
     ///
     /// # Errors
     /// Returns `Err` only if the whole `ipset save` read failed (nothing was touched;
@@ -228,29 +298,39 @@ impl ShaperQuota {
         let members: HashSet<&str> = member_ips.iter().map(String::as_str).collect();
         let period = self.period_secs;
 
-        // Recover a poisoned lock rather than propagate the panic (a partial prior
-        // pass is self-corrected by this and later ticks).
-        let mut windows = self.windows.write().unwrap_or_else(|e| e.into_inner());
-        let (resets, errors) = apply_pass(
-            &mut windows,
-            &members,
-            now,
-            period,
-            || now - jitter(period),
-            |ip| match set.del(ip) {
-                Ok(()) => true,
+        // Phase 1 (short lock): seed new / prune stale / collect expired. No ipset I/O.
+        // Recover a poisoned lock rather than propagate the panic (a partial prior pass
+        // is self-corrected by this and later ticks) — MUST match `note_registration`.
+        let expired = {
+            let mut windows = self.windows.write().unwrap_or_else(|e| e.into_inner());
+            plan_and_prepare(&mut windows, &members, now, period, || now - jitter(period))
+        };
+
+        // Phase 2 (NO lock): reset each expired counter via a blocking `ipset del`.
+        let mut succeeded: Vec<String> = Vec::new();
+        let mut errors = 0u64;
+        for ip in expired {
+            match set.del(&ip) {
+                Ok(()) => succeeded.push(ip),
                 Err(err) => {
                     // Expected/tolerable per-IP failure → warn (not error): a transient
                     // ipset hiccup shouldn't page; whole-pass failure surfaces via the
                     // staleness gauge instead.
                     warn!("shaper-quota: ipset del {} failed: {:#}", ip, err);
-                    false
+                    errors += 1;
                 }
-            },
-        );
+            }
+        }
+
+        // Phase 3 (short lock): advance the windows we actually reset (preserve mac).
+        {
+            let mut windows = self.windows.write().unwrap_or_else(|e| e.into_inner());
+            advance_windows(&mut windows, &succeeded, now);
+        }
+
         Ok(PassStats {
             members: member_ips.len(),
-            resets,
+            resets: succeeded.len() as u64,
             errors,
             over_quota,
         })
@@ -279,78 +359,138 @@ mod tests {
         v
     }
 
+    fn win(start: i64, mac: Option<&str>) -> Window {
+        Window {
+            window_start: start,
+            mac: mac.map(str::to_string),
+        }
+    }
+
+    fn store(set_name: &str) -> ShaperQuota {
+        ShaperQuota::new(set_name.to_string(), 10800, 1_073_741_824)
+    }
+
+    // ---- plan_resets (time-window classification) ----
+
     #[test]
     fn new_member_is_classified_new() {
-        let members = set(&["10.0.0.1"]);
-        let windows = HashMap::new();
-        let d = plan_resets(&members, &windows, 1000, 10800);
+        let d = plan_resets(&set(&["10.0.0.1"]), &HashMap::new(), 1000, 10800);
         assert_eq!(d.new, vec!["10.0.0.1"]);
         assert!(d.expired.is_empty() && d.stale.is_empty());
     }
 
     #[test]
     fn not_expired_before_period_and_at_boundary_uses_ge() {
-        let members = set(&["a", "b"]);
         let mut windows = HashMap::new();
-        windows.insert("a".to_string(), 1000); // exactly period old at now
-        windows.insert("b".to_string(), 1001); // one second short
-        // now == start + period → expired (>=). now == start+period-1 → not yet.
-        let d = plan_resets(&members, &windows, 1000 + 10800, 10800);
+        windows.insert("a".to_string(), win(1000, Some("aa"))); // exactly period old at now
+        windows.insert("b".to_string(), win(1001, Some("bb"))); // one second short
+        let d = plan_resets(&set(&["a", "b"]), &windows, 1000 + 10800, 10800);
         assert_eq!(sorted(d.expired), vec!["a"]);
     }
 
     #[test]
     fn backward_clock_jump_expires() {
-        let members = set(&["a"]);
         let mut windows = HashMap::new();
-        windows.insert("a".to_string(), 5000);
+        windows.insert("a".to_string(), win(5000, Some("aa")));
         // now < window_start (clock jumped back) → expired (safe un-throttle).
-        let d = plan_resets(&members, &windows, 4000, 10800);
+        let d = plan_resets(&set(&["a"]), &windows, 4000, 10800);
         assert_eq!(d.expired, vec!["a"]);
     }
 
     #[test]
     fn absent_member_is_stale() {
-        let members = set(&["a"]);
         let mut windows = HashMap::new();
-        windows.insert("a".to_string(), 1000);
-        windows.insert("gone".to_string(), 1000);
-        let d = plan_resets(&members, &windows, 1100, 10800);
+        windows.insert("a".to_string(), win(1000, None));
+        windows.insert("gone".to_string(), win(1000, Some("gg")));
+        let d = plan_resets(&set(&["a"]), &windows, 1100, 10800);
         assert_eq!(d.stale, vec!["gone"]);
         assert!(d.expired.is_empty());
     }
 
+    // ---- plan_and_prepare / advance_windows (job phases) ----
+
     #[test]
-    fn apply_seeds_new_and_prunes_stale() {
+    fn prepare_seeds_new_with_none_mac_and_prunes_stale() {
         let mut windows = HashMap::new();
-        windows.insert("gone".to_string(), 500);
-        let members = set(&["fresh"]);
-        let (resets, errors) = apply_pass(&mut windows, &members, 1000, 10800, || 777, |_| true);
-        assert_eq!((resets, errors), (0, 0));
-        assert_eq!(windows.get("fresh"), Some(&777)); // seeded
+        windows.insert("gone".to_string(), win(500, Some("gg")));
+        let expired = plan_and_prepare(&mut windows, &set(&["fresh"]), 1000, 10800, || 777);
+        assert!(expired.is_empty());
+        assert_eq!(windows.get("fresh"), Some(&win(777, None))); // seeded, mac unknown
         assert!(!windows.contains_key("gone")); // pruned
     }
 
     #[test]
-    fn apply_advances_window_only_on_successful_del() {
-        // Expired member, del succeeds → window advances to now, counted as reset.
+    fn prepare_returns_expired_without_touching_them() {
         let mut windows = HashMap::new();
-        windows.insert("a".to_string(), 0);
-        let members = set(&["a"]);
-        let (resets, errors) = apply_pass(&mut windows, &members, 20000, 10800, || 0, |_| true);
-        assert_eq!((resets, errors), (1, 0));
-        assert_eq!(windows.get("a"), Some(&20000));
+        windows.insert("a".to_string(), win(0, Some("aa")));
+        let expired = plan_and_prepare(&mut windows, &set(&["a"]), 20000, 10800, || 0);
+        assert_eq!(expired, vec!["a"]);
+        // Not advanced yet — that happens only after a successful del (phase 3).
+        assert_eq!(windows.get("a"), Some(&win(0, Some("aa"))));
     }
 
     #[test]
-    fn apply_leaves_window_on_del_failure() {
-        // Expired member, del fails → window unchanged (retried next tick), error counted.
+    fn advance_preserves_mac_only_for_given_ips() {
         let mut windows = HashMap::new();
-        windows.insert("a".to_string(), 0);
-        let members = set(&["a"]);
-        let (resets, errors) = apply_pass(&mut windows, &members, 20000, 10800, || 0, |_| false);
-        assert_eq!((resets, errors), (0, 1));
-        assert_eq!(windows.get("a"), Some(&0)); // NOT advanced
+        windows.insert("ok".to_string(), win(0, Some("aa")));
+        windows.insert("failed".to_string(), win(0, Some("bb")));
+        // Simulate: del succeeded for "ok", failed for "failed" (not passed in).
+        advance_windows(&mut windows, &["ok".to_string()], 20000);
+        assert_eq!(windows.get("ok"), Some(&win(20000, Some("aa")))); // advanced, mac kept
+        assert_eq!(windows.get("failed"), Some(&win(0, Some("bb")))); // untouched
+    }
+
+    // ---- note_registration (registration-time MAC-change reset) ----
+
+    #[test]
+    fn register_brand_new_ip_learns_without_reset() {
+        let q = store("s");
+        assert_eq!(q.note_registration("10.0.0.1", "aa", 100), None);
+        assert_eq!(q.register_resets(), 0);
+    }
+
+    #[test]
+    fn register_same_mac_does_not_reset_and_keeps_window() {
+        let q = store("s");
+        q.note_registration("10.0.0.1", "aa", 100);
+        // Re-register far later with the SAME mac → no reset, window NOT pushed forward.
+        assert_eq!(q.note_registration("10.0.0.1", "aa", 99999), None);
+        assert_eq!(q.register_resets(), 0);
+        assert_eq!(
+            q.windows.read().unwrap().get("10.0.0.1"),
+            Some(&win(100, Some("aa")))
+        );
+    }
+
+    #[test]
+    fn register_known_different_mac_resets_and_reanchors() {
+        let q = store("s");
+        q.note_registration("10.0.0.1", "aa", 100);
+        // New tenant on the same IP → reset, returns the old mac, window re-anchored.
+        assert_eq!(q.note_registration("10.0.0.1", "bb", 5000), Some("aa".to_string()));
+        assert_eq!(q.register_resets(), 1);
+        assert_eq!(
+            q.windows.read().unwrap().get("10.0.0.1"),
+            Some(&win(5000, Some("bb")))
+        );
+    }
+
+    #[test]
+    fn register_unknown_previous_mac_learns_without_reset() {
+        let q = store("s");
+        // Job seeded the IP with mac:None (never reads leases).
+        q.windows
+            .write()
+            .unwrap()
+            .insert("10.0.0.1".to_string(), win(50, None));
+        // First registration must NOT reset — no positive evidence of a hand-over.
+        assert_eq!(q.note_registration("10.0.0.1", "aa", 100), None);
+        assert_eq!(q.register_resets(), 0);
+        // MAC learned; window_start preserved (still the job-seeded value).
+        assert_eq!(
+            q.windows.read().unwrap().get("10.0.0.1"),
+            Some(&win(50, Some("aa")))
+        );
     }
 
     #[test]
