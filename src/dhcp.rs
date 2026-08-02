@@ -94,6 +94,32 @@ impl Dhcp {
     }
 }
 
+/// Active-lease IP→MAC map (normalized MACs; `BindingState::Active` only). Shared by
+/// the live-traffic sampler and the shaper-quota job. Blocking file read — call from a
+/// blocking context.
+///
+/// # Errors
+/// Returns an error if the leases file cannot be read (see [`Dhcp::read`]).
+pub(crate) fn active_ip_to_mac(
+    leases_path: &Path,
+    params: DhcpParams,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut map = std::collections::HashMap::new();
+    for l in Dhcp::read(leases_path, params)?.all() {
+        if l.binding_state != BindingState::Active {
+            continue;
+        }
+        if let Some(mac) = l
+            .mac
+            .as_ref()
+            .and_then(|m| crate::unlimited_clients::normalize_mac(m))
+        {
+            map.insert(l.ip.clone(), mac);
+        }
+    }
+    Ok(map)
+}
+
 /// dnsmasq lease-file parser. Each lease is a line:
 /// `<expiry_epoch> <mac> <ip> <hostname|*> <clientid|*>`. IPv6/DUID lines (which
 /// carry `duid` on their own line or a non-dotted address) are skipped silently;

@@ -214,3 +214,23 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "Джоб сброса квоты shaper завис: {{ $value | humanize }}с без прохода (клиенты висят throttled)"
+
+      # MAC-change (inheritance) resets: genuine IP hand-overs are rare (a few/hour over
+      # ≤206 IPs). A sustained spike more likely means a corrupt/half-read dnsmasq leases
+      # file → mass false-reset (everyone un-throttled) than real churn. Threshold is
+      # provisional (baseline ~0, calibrate). Resets are un-throttle direction → warning.
+      - alert: RatzekShaperQuotaMacResetSpike
+        expr: rate(ratzek_shaper_quota_mac_change_resets_total[10m]) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Всплеск mac-change сбросов shaper: {{ $value | humanize }}/с (битые lease-файлы? churn?)"
+
+      # The opposite failure: a chronically unreadable leases file silently disables the
+      # MAC-change trigger (mac resets fall to ~0 → invisible to the spike alert above).
+      - alert: RatzekShaperQuotaLeasesUnreadable
+        expr: rate(ratzek_shaper_quota_leases_read_failures_total[10m]) > 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "shaper-quota не может прочитать dnsmasq leases {{ $value | humanize }}/с — mac-детект отключён"

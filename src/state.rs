@@ -190,21 +190,7 @@ async fn sample_live_traffic(state: Arc<Mutex<State>>) {
         move || -> anyhow::Result<crate::live_traffic::SampleStats> {
             // IP -> MAC from active leases. Without it no counter can be attributed,
             // so a leases read failure aborts the whole tick (propagated as Err).
-            let leases = crate::dhcp::Dhcp::read(&leases_path, params)?;
-            let mut ip_to_mac: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            for l in leases.all() {
-                if l.binding_state != crate::dhcp::BindingState::Active {
-                    continue;
-                }
-                if let Some(mac) = l
-                    .mac
-                    .as_ref()
-                    .and_then(|m| crate::unlimited_clients::normalize_mac(m))
-                {
-                    ip_to_mac.insert(l.ip.clone(), mac);
-                }
-            }
+            let ip_to_mac = crate::dhcp::active_ip_to_mac(&leases_path, params)?;
 
             // Union counters from all traffic sets, deduped by IP. Best-effort per
             // set: a failing set is logged and skipped (partial data beats no data).
@@ -664,6 +650,10 @@ impl State {
                     .unwrap_or_else(crate::config::default_shaper_quota_period_secs),
                 sq.map(|c| c.quota_bytes)
                     .unwrap_or_else(crate::config::default_shaper_quota_bytes),
+                config.dhcpd_leases.clone(),
+                crate::dhcp::DhcpParams {
+                    lease_secs: config.dhcp_lease_secs,
+                },
             ))
         };
 

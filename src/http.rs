@@ -226,26 +226,11 @@ async fn client_register(
                         error!("Blacklisted client attempted to register");
                         return Err(APIError::InternalError);
                     }
+                    // Inherited-counter reset on IP hand-over is done by the shaper-quota
+                    // job (MAC-change trigger in src/shaper_quota.rs), not here — doing it
+                    // at registration proved dead (0 resets / 60 registrations). Registration
+                    // just (re)adds the client to acl+shaper.
                     let ipset_shaper = crate::ipset::IPSet::new(&state.config().ipset_shaper_name);
-                    // Reset a byte counter inherited from a previous tenant of this IP:
-                    // if the dhcp-lease MAC for `client_ip` changed, zero the shaper
-                    // counter so the new client isn't throttled by the old one's usage.
-                    // Gated by the feature flag (kill switch) and by an ACTUAL MAC change
-                    // (the open POST must not let a client reset its own quota; the MAC is
-                    // the lease MAC resolved server-side, not a request field). Best-effort:
-                    // the reset `del` NEVER aborts registration — the `add` below recreates
-                    // the entry from zero.
-                    if state.shaper_quota_enabled() {
-                        let now = chrono::Utc::now().timestamp();
-                        if let Some(old) =
-                            state.shaper_quota().note_registration(&client_ip, &mac, now)
-                        {
-                            info!("shaper counter reset on new tenant: {client_ip} MAC {old} -> {mac}");
-                            if let Err(err) = ipset_shaper.del(&client_ip) {
-                                warn!("shaper counter reset del for {client_ip} failed: {err:#}");
-                            }
-                        }
-                    }
                     (ipset_shaper, "shaper", Some(state.config().shaping_timeout))
                 }
             };
@@ -630,16 +615,26 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
     // Shaper-quota reset job health. A silently-stalled job means clients get
     // throttled forever again, so the age gauge is the key alerting signal (mirrors
     // ratzek_device_metrics_age_seconds). No per-IP labels (network PII).
-    let (sq_enabled, sq_last_run, sq_resets, sq_errors, sq_over_quota, sq_register_resets) = {
+    let (
+        sq_enabled,
+        sq_last_run,
+        sq_resets,
+        sq_errors,
+        sq_over_quota,
+        sq_mac_change_resets,
+        sq_leases_fail,
+    ) = {
         let s = state.lock().await;
         let (last_run, resets, errors, over_quota) = s.shaper_quota_stats();
+        let sq = s.shaper_quota();
         (
             s.shaper_quota_enabled(),
             last_run,
             resets,
             errors,
             over_quota,
-            s.shaper_quota().register_resets(),
+            sq.mac_change_resets(),
+            sq.leases_read_failures(),
         )
     };
     out += &gauge(
@@ -671,9 +666,14 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
         sq_over_quota as f64,
     );
     out += &counter(
-        "ratzek_shaper_quota_register_resets_total",
-        "Shaper byte-counter resets performed at registration (MAC change on the IP)",
-        sq_register_resets as f64,
+        "ratzek_shaper_quota_mac_change_resets_total",
+        "Shaper byte-counter resets on IP hand-over (DHCP lease MAC changed for the IP)",
+        sq_mac_change_resets as f64,
+    );
+    out += &counter(
+        "ratzek_shaper_quota_leases_read_failures_total",
+        "Ticks where the dnsmasq leases file couldn't be read (MAC-change trigger skipped)",
+        sq_leases_fail as f64,
     );
     // Alertmanager→Telegram pipeline self-observability.
     use std::sync::atomic::Ordering as AtomicOrdering;
