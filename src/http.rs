@@ -670,10 +670,16 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
         sq_over_quota,
         sq_mac_change_resets,
         sq_leases_fail,
+        sq_persist_enabled,
+        sq_persist_failures,
+        sq_persist_last_success,
+        sq_owners_persisted,
     ) = {
         let s = state.lock().await;
         let (last_run, resets, errors, over_quota) = s.shaper_quota_stats();
         let sq = s.shaper_quota();
+        let (persist_enabled, persist_failures, persist_last_success, owners_persisted) =
+            sq.persist_stats();
         (
             s.shaper_quota_enabled(),
             last_run,
@@ -682,6 +688,10 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
             over_quota,
             sq.mac_change_resets(),
             sq.leases_read_failures(),
+            persist_enabled,
+            persist_failures,
+            persist_last_success,
+            owners_persisted,
         )
     };
     out += &gauge(
@@ -722,6 +732,27 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
         "Ticks where the dnsmasq leases file couldn't be read (MAC-change trigger skipped)",
         sq_leases_fail as f64,
     );
+    // Owner-MAC persistence (durable inheritance fix). The age gauge is emitted ONLY when
+    // persistence is enabled AND has completed a healthy pass — its absence keeps
+    // RatzekShaperQuotaOwnerPersistStalled from firing on a disabled / never-run instance.
+    out += &counter(
+        "ratzek_shaper_quota_owner_persist_failures_total",
+        "Owner-MAC file write failures (fail-fast; a wedged writer shows as a stale age gauge)",
+        sq_persist_failures as f64,
+    );
+    out += &gauge(
+        "ratzek_shaper_quota_owners_persisted",
+        "Number of per-IP owning-MACs currently persisted",
+        sq_owners_persisted as f64,
+    );
+    if sq_persist_enabled && sq_persist_last_success > 0 {
+        let age = (chrono::Utc::now().timestamp() - sq_persist_last_success).max(0);
+        out += &gauge(
+            "ratzek_shaper_quota_owner_persist_age_seconds",
+            "Seconds since the last healthy owner-MAC persist pass (write or no-op)",
+            age as f64,
+        );
+    }
     // Alertmanager→Telegram pipeline self-observability.
     use std::sync::atomic::Ordering as AtomicOrdering;
     out += &counter(
@@ -2054,6 +2085,29 @@ async fn admin_device_reset_shaper_counter(
         return Err(APIError::InternalError);
     }
     Ok(HttpResponse::NoContent().finish())
+}
+
+/// Diagnostics snapshot of the shaper-quota tracker: aggregate counters + per-IP window /
+/// owning-MAC / byte counter, for debugging inheritance incidents (e.g. "own << IP
+/// counter" without shelling into the box). Reads `ipset save` — done in `spawn_blocking`.
+#[get("/api/v1/admin/shaper-quota")]
+async fn admin_shaper_quota(
+    _auth: AuthSession,
+    state: Data<Arc<Mutex<State>>>,
+) -> Result<HttpResponse, APIError> {
+    let quota = state.lock().await.shaper_quota();
+    let now = chrono::Utc::now().timestamp();
+    let dump = tokio::task::spawn_blocking(move || quota.dump(now))
+        .await
+        .map_err(|err| {
+            error!("admin shaper-quota dump task panicked: {err}");
+            APIError::InternalError
+        })?
+        .map_err(|err| {
+            error!("admin shaper-quota dump failed: {err:#}");
+            APIError::InternalError
+        })?;
+    Ok(HttpResponse::Ok().json(dump))
 }
 
 // --- Global aggregate channel shaping (one shared cap for all non-unlimited clients) ---

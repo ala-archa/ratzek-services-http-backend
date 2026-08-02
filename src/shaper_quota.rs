@@ -26,10 +26,16 @@
 //!    trigger #1.
 //!
 //! **Design notes.**
-//! - **In-memory, ephemeral.** Windows live only in memory (like `live_traffic`),
-//!   never on the flaky USB-SSD. Any *reboot* wipes the kernel ipset (counters → 0),
-//!   so there is nothing to inherit after a reboot; on a bare process restart the store
-//!   re-seeds from current leases (see residual cases below).
+//! - **`window_start` in-memory; owning-MAC durable.** The per-IP `window_start` lives
+//!   only in memory (re-seeded `now - rand(period)` on restart — a clock-agnostic,
+//!   un-throttle-safe reset of the time-window). The per-IP *owning-MAC* is persisted by
+//!   a separate best-effort job (`persist_once`) to `owner_state_path`, so the
+//!   inheritance (MAC-change) trigger survives a bare process restart (which otherwise
+//!   re-seeds the store from the NEW lease and never sees the hand-over). Persistence is
+//!   the ONLY disk touch and is fully decoupled from the reset pass (see below); an empty
+//!   path disables it (pure in-memory, pre-0.1.38 behavior). A *reboot* wipes the kernel
+//!   ipset (counters → 0), so a MAC recorded for an IP no longer in the set is naturally
+//!   dropped — nothing to inherit.
 //! - **Leases-read failure is safe.** If the leases file can't be read this tick, the
 //!   MAC logic is skipped entirely (NO resets from it) and only the time-window trigger
 //!   runs. A missing/absent lease for an in-set IP is treated as "unknown" — never a
@@ -42,19 +48,28 @@
 //!   is treated as time-expired → reset (the un-throttle direction). MAC-change is a
 //!   string compare, time-independent.
 //! - **Anti-herd.** A new member's window is seeded at `now - rand(0..period)`.
-//! - **Residual (accepted, self-heals ≤ one `period` via the time-window):** a handover
-//!   straddling a bare process restart (ipset survives, store re-seeds from the NEW
-//!   lease) or a handover while the old tenant's lease had dropped from the file
-//!   (`None`→learn) is not caught as a MAC change; the time-window clears it. All
+//! - **Persist is decoupled from the reset pass.** A separate scheduled job runs
+//!   `persist_once` (its own overlap-guard) — the reset pass (`run_pass`) never touches
+//!   the disk. So a wedged `fsync` on the flaky USB-SSD can stall only the persist job
+//!   (durability degrades to the in-memory/time-window backstop), never the resets.
+//! - **Residual (accepted, self-heals ≤ one `period` via the time-window):** only the
+//!   FIRST hand-over of an IP after a fresh deploy (its owning-MAC not yet persisted) is
+//!   missed as a MAC change; the time-window clears it. Once the store is populated and
+//!   persisted, later hand-overs are caught in ≤2 ticks even across restarts. All
 //!   residual misses fail in the un-throttle (availability-safe) direction.
 
 use crate::ipset::IPSet;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use slog_scope::{debug, error, info, warn};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
+
+/// Schema version of the persisted owner file. Bump on any breaking layout change; a
+/// file with a higher version is treated as unreadable (empty store) — availability-safe.
+const OWNER_SCHEMA_VERSION: u32 = 1;
 
 /// Per-IP quota window: when the counter was last zeroed, and the last MAC known to
 /// hold the IP (`None` = unknown: not yet learned from a lease).
@@ -62,6 +77,28 @@ use std::sync::RwLock;
 struct Window {
     window_start: i64,
     mac: Option<String>,
+}
+
+/// One persisted `ip → owning-mac` pair. A flat list (not a map) keeps the on-disk YAML
+/// consistent with the other stores (`Vec<UnlimitedClient>` / `Vec<BlacklistEntry>`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct OwnerEntry {
+    ip: String,
+    mac: String,
+}
+
+/// Versioned on-disk form of the owning-MAC store. Only IPs with a known MAC are written;
+/// `window_start` is deliberately NOT persisted (clock-agnostic re-seed on restart).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OwnerFile {
+    #[serde(default = "default_owner_schema_version")]
+    version: u32,
+    #[serde(default)]
+    owners: Vec<OwnerEntry>,
+}
+
+fn default_owner_schema_version() -> u32 {
+    OWNER_SCHEMA_VERSION
 }
 
 /// A detected IP hand-over: the tracked MAC (`old`) differs from the current dnsmasq
@@ -163,6 +200,91 @@ fn advance_mac(windows: &mut HashMap<String, Window>, changes: &[(String, String
     }
 }
 
+/// Pure projection of the tracked windows to the durable `ip → owning-mac` map. Only IPs
+/// with a known MAC are included (a `None` window has nothing to inherit). `BTreeMap` for
+/// a deterministic file (stable diff) and an order-independent dedup vs `last_persisted`.
+fn project_owners(windows: &HashMap<String, Window>) -> BTreeMap<String, String> {
+    windows
+        .iter()
+        .filter_map(|(ip, w)| w.mac.as_ref().map(|m| (ip.clone(), m.clone())))
+        .collect()
+}
+
+/// Parse the owner file's bytes into a validated `ip → mac` map. A higher schema version,
+/// malformed YAML, or a non-normalizable MAC yields an empty/filtered result rather than
+/// an error — a corrupt file must degrade to the in-memory backstop, never abort startup.
+fn parse_owner_bytes(bytes: &[u8]) -> BTreeMap<String, String> {
+    let parsed: OwnerFile = match serde_yaml::from_slice(bytes) {
+        Ok(f) => f,
+        Err(err) => {
+            warn!("shaper-quota: owner file unparsable, ignoring: {}", err);
+            return BTreeMap::new();
+        }
+    };
+    if parsed.version > OWNER_SCHEMA_VERSION {
+        warn!(
+            "shaper-quota: owner file version {} > {}, ignoring",
+            parsed.version, OWNER_SCHEMA_VERSION
+        );
+        return BTreeMap::new();
+    }
+    parsed
+        .owners
+        .into_iter()
+        .filter_map(|e| crate::unlimited_clients::normalize_mac(&e.mac).map(|m| (e.ip, m)))
+        .collect()
+}
+
+/// Serialize an `ip → mac` map to the versioned on-disk YAML form.
+fn serialize_owners(owners: &BTreeMap<String, String>) -> anyhow::Result<String> {
+    let file = OwnerFile {
+        version: OWNER_SCHEMA_VERSION,
+        owners: owners
+            .iter()
+            .map(|(ip, mac)| OwnerEntry {
+                ip: ip.clone(),
+                mac: mac.clone(),
+            })
+            .collect(),
+    };
+    Ok(serde_yaml::to_string(&file)?)
+}
+
+/// One shaper member in the admin diagnostics snapshot. `mac`/`window_start`/`age_secs`
+/// are null for an IP present in the set but not yet classified into a window.
+#[derive(Debug, Clone, Serialize)]
+pub struct QuotaClient {
+    pub ip: String,
+    pub mac: Option<String>,
+    pub window_start: Option<i64>,
+    pub age_secs: Option<i64>,
+    pub bytes: Option<u64>,
+    pub over_quota: bool,
+}
+
+/// Admin diagnostics snapshot of the shaper-quota tracker (see [`ShaperQuota::dump`]).
+/// A dedicated DTO so the private `Window` type never leaks into the public API.
+#[derive(Debug, Clone, Serialize)]
+pub struct QuotaDump {
+    pub period_secs: i64,
+    pub quota_bytes: u64,
+    pub last_run: i64,
+    pub resets_total: i64,
+    pub mac_change_resets_total: i64,
+    pub errors_total: i64,
+    /// Count of members past the byte quota at the last pass (mirrors the
+    /// `ratzek_shaper_clients_over_quota` gauge) — distinct from `QuotaClient.over_quota`.
+    pub clients_over_quota: i64,
+    pub leases_read_failures: i64,
+    pub leases_healthy: bool,
+    pub persist_enabled: bool,
+    pub owner_path: Option<String>,
+    pub owner_persist_failures: i64,
+    pub owner_persist_last_success: i64,
+    pub owners_persisted: i64,
+    pub clients: Vec<QuotaClient>,
+}
+
 /// Outcome of one reset pass, for logging + metrics.
 #[derive(Debug, Default, PartialEq)]
 struct PassStats {
@@ -202,6 +324,23 @@ pub struct ShaperQuota {
     /// Whether the last leases read succeeded — to log only on ok↔fail transitions
     /// (a chronically unreadable file must not warn every tick).
     leases_healthy: AtomicBool,
+    /// Durable owning-MAC store: file the separate persist-job writes (`None` disables
+    /// persistence → pure in-memory, pre-0.1.38 behavior).
+    owner_path: Option<PathBuf>,
+    /// Last projection written to `owner_path` — only the persist-job touches it, so a
+    /// plain `Mutex` (with poison-recovery) suffices. Used to skip a no-op write.
+    last_persisted: Mutex<BTreeMap<String, String>>,
+    /// Whether the last owner-file write succeeded — for ok↔fail transition logging.
+    persist_healthy: AtomicBool,
+    /// Monotonic count of owner-file write failures (fail-fast errors; a D-state hang
+    /// never returns and is instead surfaced by a stale `owner_persist_last_success`).
+    owner_persist_failures: AtomicI64,
+    /// Unix epoch of the last HEALTHY persist pass — a successful write OR a no-op skip
+    /// (nothing changed). 0 = never. A wedged writer never reaches this → the age gauge
+    /// grows → `RatzekShaperQuotaOwnerPersistStalled` fires.
+    owner_persist_last_success: AtomicI64,
+    /// Number of owning-MACs currently persisted (gauge).
+    owners_persisted: AtomicI64,
 }
 
 impl ShaperQuota {
@@ -210,17 +349,58 @@ impl ShaperQuota {
     /// in iptables). `leases_path`/`dhcp_params` feed the per-tick ip→mac map for the
     /// MAC-change trigger. `period_secs` is floored to `>= 1` (config `validate()`
     /// already rejects `<= 0`).
+    ///
+    /// `owner_path` (`Some` = persistence enabled) is read best-effort here: each stored
+    /// `ip → mac` pre-seeds a window (`mac = persisted`, fresh `window_start`) so a
+    /// hand-over that happened during downtime is detected on the first pass. A missing /
+    /// unreadable / higher-version file yields an empty store (pre-0.1.38 behavior).
     pub fn new(
         shaper_set: String,
         period_secs: i64,
         quota_bytes: u64,
         leases_path: PathBuf,
         dhcp_params: crate::dhcp::DhcpParams,
+        owner_path: Option<PathBuf>,
     ) -> Self {
+        let period = period_secs.max(1);
+        // Best-effort load: a read error (absent file) or a corrupt one both degrade to
+        // an empty store — never block startup.
+        let persisted = owner_path
+            .as_ref()
+            .and_then(|p| match std::fs::read(p) {
+                Ok(bytes) => Some(parse_owner_bytes(&bytes)),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    warn!("shaper-quota: owner file read failed, ignoring: {:#}", err);
+                    None
+                }
+            })
+            .unwrap_or_default();
+        if !persisted.is_empty() {
+            info!(
+                "shaper-quota: loaded {} persisted IP owner(s)",
+                persisted.len()
+            );
+        }
+        // Pre-seed windows from the persisted owners with a fresh (clock-agnostic) window.
+        let now = chrono::Utc::now().timestamp();
+        let windows: HashMap<String, Window> = persisted
+            .iter()
+            .map(|(ip, mac)| {
+                (
+                    ip.clone(),
+                    Window {
+                        window_start: now - jitter(period),
+                        mac: Some(mac.clone()),
+                    },
+                )
+            })
+            .collect();
+        let owners_persisted = persisted.len() as i64;
         Self {
-            windows: RwLock::new(HashMap::new()),
+            windows: RwLock::new(windows),
             shaper_set,
-            period_secs: period_secs.max(1),
+            period_secs: period,
             quota_bytes,
             leases_path,
             dhcp_params,
@@ -231,6 +411,12 @@ impl ShaperQuota {
             over_quota: AtomicI64::new(0),
             leases_read_failures: AtomicI64::new(0),
             leases_healthy: AtomicBool::new(true),
+            owner_path,
+            last_persisted: Mutex::new(persisted),
+            persist_healthy: AtomicBool::new(true),
+            owner_persist_failures: AtomicI64::new(0),
+            owner_persist_last_success: AtomicI64::new(0),
+            owners_persisted: AtomicI64::new(owners_persisted),
         }
     }
 
@@ -283,6 +469,141 @@ impl ShaperQuota {
     /// Total leases-read failures (each disabled the MAC trigger for that tick).
     pub fn leases_read_failures(&self) -> i64 {
         self.leases_read_failures.load(Ordering::Relaxed)
+    }
+
+    /// Owner-persist monitoring: `(enabled, failures_total, last_success_epoch, owners_persisted)`.
+    /// `enabled` is `false` when persistence is off (`owner_path` is `None`) — the exporter
+    /// then omits the age gauge so the staleness alert can't fire on a disabled instance.
+    pub fn persist_stats(&self) -> (bool, i64, i64, i64) {
+        (
+            self.owner_path.is_some(),
+            self.owner_persist_failures.load(Ordering::Relaxed),
+            self.owner_persist_last_success.load(Ordering::Relaxed),
+            self.owners_persisted.load(Ordering::Relaxed),
+        )
+    }
+
+    /// One persist pass: durably write the current `ip → owning-mac` projection to
+    /// `owner_path` if it changed since the last write. Best-effort and fully decoupled
+    /// from the reset pass — a wedged `fsync` stalls only this job (durability degrades to
+    /// the in-memory/time-window backstop), never the resets. No-op when persistence is
+    /// disabled. Blocking (fs I/O) — the caller runs it inside `spawn_blocking`.
+    pub fn persist_once(&self) {
+        let Some(path) = self.owner_path.as_ref() else {
+            return;
+        };
+        // Short read-lock: clone the projection, then release before any fs I/O.
+        let projection = {
+            let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
+            project_owners(&windows)
+        };
+
+        let mut last = self.last_persisted.lock().unwrap_or_else(|e| e.into_inner());
+        let now = chrono::Utc::now().timestamp();
+        // Skip the write only when nothing changed AND the file is actually on disk — so an
+        // externally deleted file (the runbook suggests deleting it) is recreated promptly
+        // instead of staying gone until the next projection change.
+        if *last == projection && path.exists() {
+            // No-op: nothing changed. The writer is alive and in sync → this counts as a
+            // HEALTHY pass, so advance `last_success` (else the staleness alert would fire
+            // on a quiet network where the projection legitimately doesn't change).
+            self.mark_persist_healthy(now);
+            return;
+        }
+
+        let content = match serialize_owners(&projection) {
+            Ok(c) => c,
+            Err(err) => {
+                // Serialization can't realistically fail for a String map, but treat it as
+                // a persist failure rather than panicking.
+                self.record_persist_failure(&format!("serialize owner file: {err:#}"));
+                return;
+            }
+        };
+        // 0o600: the file carries mac↔ip (PII) on a shared disk.
+        match crate::persistent_state::atomic_write(path, content.as_bytes(), 0o600) {
+            Ok(()) => {
+                *last = projection;
+                self.owners_persisted
+                    .store(last.len() as i64, Ordering::Relaxed);
+                self.mark_persist_healthy(now);
+            }
+            Err(err) => {
+                // Leave `last_persisted` unchanged → retried next tick.
+                self.record_persist_failure(&format!("write {}: {:#}", path.display(), err));
+            }
+        }
+    }
+
+    /// Mark a healthy persist pass (write or no-op): advance the liveness timestamp and
+    /// log recovery on a fail→ok transition.
+    fn mark_persist_healthy(&self, now: i64) {
+        self.owner_persist_last_success.store(now, Ordering::Relaxed);
+        if !self.persist_healthy.swap(true, Ordering::Relaxed) {
+            info!("shaper-quota: owner persist recovered");
+        }
+    }
+
+    /// Count a persist failure and warn only on the ok→fail transition (a chronically
+    /// unwritable disk must not warn every tick; repeats drop to debug).
+    fn record_persist_failure(&self, msg: &str) {
+        self.owner_persist_failures.fetch_add(1, Ordering::Relaxed);
+        if self.persist_healthy.swap(false, Ordering::Relaxed) {
+            warn!("shaper-quota: owner persist failed: {} (repeats at debug)", msg);
+        } else {
+            debug!("shaper-quota: owner persist still failing: {}", msg);
+        }
+    }
+
+    /// Snapshot the tracker for the admin diagnostics endpoint: current shaper members
+    /// (from `ipset save`) joined with the tracked window/MAC. An IP in the set but not
+    /// yet classified into a window appears with `mac`/`window_start` null. Blocking
+    /// (`ipset save`) — the caller runs it inside `spawn_blocking`.
+    ///
+    /// # Errors
+    /// Returns `Err` if the `ipset save` read fails (missing set / no permission); the
+    /// HTTP caller maps it to a 500.
+    pub fn dump(&self, now: i64) -> anyhow::Result<QuotaDump> {
+        let entries = IPSet::new(&self.shaper_set).entries()?;
+        // Clone the windows under a short read-lock, then release before building the DTO.
+        let windows = {
+            let w = self.windows.read().unwrap_or_else(|e| e.into_inner());
+            w.clone()
+        };
+        let mut clients: Vec<QuotaClient> = entries
+            .into_iter()
+            .map(|e| {
+                let w = windows.get(&e.ip);
+                QuotaClient {
+                    ip: e.ip,
+                    mac: w.and_then(|w| w.mac.clone()),
+                    window_start: w.map(|w| w.window_start),
+                    age_secs: w.map(|w| now - w.window_start),
+                    bytes: e.bytes.map(|b| b as u64),
+                    over_quota: e.bytes.is_some_and(|b| b as u64 > self.quota_bytes),
+                }
+            })
+            .collect();
+        clients.sort_by(|a, b| a.ip.cmp(&b.ip));
+        let (persist_enabled, persist_failures, last_success, owners_persisted) =
+            self.persist_stats();
+        Ok(QuotaDump {
+            period_secs: self.period_secs,
+            quota_bytes: self.quota_bytes,
+            last_run: self.last_run.load(Ordering::Relaxed),
+            resets_total: self.resets_total.load(Ordering::Relaxed),
+            mac_change_resets_total: self.mac_change_resets.load(Ordering::Relaxed),
+            errors_total: self.errors_total.load(Ordering::Relaxed),
+            clients_over_quota: self.over_quota.load(Ordering::Relaxed),
+            leases_read_failures: self.leases_read_failures.load(Ordering::Relaxed),
+            leases_healthy: self.leases_healthy.load(Ordering::Relaxed),
+            persist_enabled,
+            owner_path: self.owner_path.as_ref().map(|p| p.display().to_string()),
+            owner_persist_failures: persist_failures,
+            owner_persist_last_success: last_success,
+            owners_persisted,
+            clients,
+        })
     }
 
     /// One reset pass. Reads the shaper set + dnsmasq leases, seeds/learns/prunes windows,
@@ -556,5 +877,253 @@ mod tests {
         for _ in 0..1000 {
             assert!((0..10800).contains(&jitter(10800)));
         }
+    }
+
+    // --- Durable owning-MAC persistence ---
+
+    fn tmp_owner_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "shaper-quota-owners-{}-{}.yaml",
+            tag,
+            std::process::id()
+        ))
+    }
+
+    /// A tracker that never touches ipset/leases in these tests (only `new`/`persist_once`
+    /// exercise the owner file). The shaper-set name is intentionally unused here.
+    fn quota(owner: Option<PathBuf>) -> ShaperQuota {
+        ShaperQuota::new(
+            "test-shaper-set".to_string(),
+            10800,
+            1 << 30,
+            PathBuf::from("/nonexistent/leases"),
+            crate::dhcp::DhcpParams { lease_secs: 43200 },
+            owner,
+        )
+    }
+
+    #[test]
+    fn project_owners_skips_none_and_is_ordered() {
+        let w = HashMap::from([
+            ("10.0.0.2".to_string(), win(1, Some("bb:bb:bb:bb:bb:bb"))),
+            ("10.0.0.1".to_string(), win(1, Some("aa:aa:aa:aa:aa:aa"))),
+            ("10.0.0.3".to_string(), win(1, None)), // no mac → nothing to inherit → skipped
+        ]);
+        let p = project_owners(&w);
+        assert_eq!(p.len(), 2);
+        assert!(!p.contains_key("10.0.0.3"));
+        // BTreeMap → deterministic key order (stable file + order-independent dedup).
+        assert_eq!(p.keys().collect::<Vec<_>>(), vec!["10.0.0.1", "10.0.0.2"]);
+    }
+
+    #[test]
+    fn parse_owner_bytes_edge_cases() {
+        assert!(parse_owner_bytes(b"").is_empty()); // empty file
+        assert!(parse_owner_bytes(b"}{ not yaml").is_empty()); // malformed
+        // Higher schema version → treated as unreadable.
+        let hi = format!(
+            "version: {}\nowners:\n- ip: 1.2.3.4\n  mac: aa:bb:cc:dd:ee:ff\n",
+            OWNER_SCHEMA_VERSION + 1
+        );
+        assert!(parse_owner_bytes(hi.as_bytes()).is_empty());
+        // Unknown keys tolerated; a non-normalizable MAC is filtered out.
+        let ok = "version: 1\nextra: 9\nowners:\n- ip: 1.2.3.4\n  mac: AA:BB:CC:DD:EE:FF\n- ip: 9.9.9.9\n  mac: not-a-mac\n";
+        let m = parse_owner_bytes(ok.as_bytes());
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get("1.2.3.4").map(String::as_str), Some("aa:bb:cc:dd:ee:ff"));
+    }
+
+    #[test]
+    fn missing_owner_file_yields_empty_store() {
+        let path = tmp_owner_path("missing");
+        let _ = std::fs::remove_file(&path);
+        let sq = quota(Some(path));
+        assert!(sq.windows.read().unwrap().is_empty());
+        let (enabled, failures, last_success, owners) = sq.persist_stats();
+        assert!(enabled && failures == 0 && last_success == 0 && owners == 0);
+    }
+
+    #[test]
+    fn persisted_owner_loads_and_detects_handover() {
+        let path = tmp_owner_path("load");
+        let _ = std::fs::remove_file(&path);
+        let file = serialize_owners(&BTreeMap::from([(
+            "10.0.0.5".to_string(),
+            "aa:bb:cc:dd:ee:ff".to_string(),
+        )]))
+        .unwrap();
+        std::fs::write(&path, file).unwrap();
+
+        let sq = quota(Some(path.clone()));
+        // Loaded into a window with the persisted MAC.
+        assert_eq!(
+            sq.windows.read().unwrap()["10.0.0.5"].mac.as_deref(),
+            Some("aa:bb:cc:dd:ee:ff")
+        );
+        // A DIFFERENT current lease MAC for the same IP → detected as a hand-over even
+        // though the store started empty in memory (the durable-MAC invariant).
+        let mut w = sq.windows.read().unwrap().clone();
+        let l = leases(&[("10.0.0.5", "11:22:33:44:55:66")]);
+        let (time, mac) = prep(&mut w, &set(&["10.0.0.5"]), Some(&l), 999_999, 10800);
+        assert!(time.is_empty());
+        assert_eq!(
+            mac,
+            vec![MacChange {
+                ip: "10.0.0.5".to_string(),
+                old: "aa:bb:cc:dd:ee:ff".to_string(),
+                new: "11:22:33:44:55:66".to_string(),
+            }]
+        );
+        // Same MAC across restart → no reset (legitimate counter preserved).
+        let ws = sq.windows.read().unwrap()["10.0.0.5"].window_start;
+        let mut w2 = sq.windows.read().unwrap().clone();
+        let same = leases(&[("10.0.0.5", "aa:bb:cc:dd:ee:ff")]);
+        let (t2, m2) = prep(&mut w2, &set(&["10.0.0.5"]), Some(&same), ws + 100, 10800);
+        assert!(t2.is_empty() && m2.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_once_round_trips_through_new() {
+        let path = tmp_owner_path("roundtrip");
+        let _ = std::fs::remove_file(&path);
+        let sq = quota(Some(path.clone()));
+        {
+            let mut w = sq.windows.write().unwrap();
+            w.insert("10.0.0.7".to_string(), win(100, Some("aa:bb:cc:dd:ee:01")));
+            w.insert("10.0.0.8".to_string(), win(100, Some("aa:bb:cc:dd:ee:02")));
+            w.insert("10.0.0.9".to_string(), win(100, None)); // no mac → not persisted
+        }
+        sq.persist_once();
+        let (enabled, failures, last_success, owners) = sq.persist_stats();
+        assert!(enabled && failures == 0 && last_success > 0 && owners == 2);
+
+        // Fresh instance loads exactly what was written (closes writer→reader).
+        let sq2 = quota(Some(path.clone()));
+        let loaded = project_owners(&sq2.windows.read().unwrap());
+        assert_eq!(
+            loaded,
+            BTreeMap::from([
+                ("10.0.0.7".to_string(), "aa:bb:cc:dd:ee:01".to_string()),
+                ("10.0.0.8".to_string(), "aa:bb:cc:dd:ee:02".to_string()),
+            ])
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_once_noop_skips_write_but_stays_healthy() {
+        let path = tmp_owner_path("noop");
+        let _ = std::fs::remove_file(&path);
+        let sq = quota(Some(path.clone()));
+        {
+            let mut w = sq.windows.write().unwrap();
+            w.insert("10.0.0.7".to_string(), win(100, Some("aa:bb:cc:dd:ee:01")));
+        }
+        sq.persist_once(); // first write
+        assert!(path.exists());
+        let (_, _, ls1, _) = sq.persist_stats();
+
+        // Tamper the file with a sentinel; an unchanged projection with the file still on
+        // disk must be a no-op (dedup skip) → the sentinel survives (file NOT rewritten),
+        // yet the pass still counts as healthy (last_success advances).
+        std::fs::write(&path, b"SENTINEL").unwrap();
+        sq.persist_once();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"SENTINEL",
+            "no-op must not rewrite the file"
+        );
+        let (_, failures, ls2, _) = sq.persist_stats();
+        assert_eq!(failures, 0);
+        assert!(ls2 >= ls1, "no-op still advances last_success (liveness)");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_once_recreates_externally_deleted_file() {
+        let path = tmp_owner_path("recreate");
+        let _ = std::fs::remove_file(&path);
+        let sq = quota(Some(path.clone()));
+        {
+            let mut w = sq.windows.write().unwrap();
+            w.insert("10.0.0.7".to_string(), win(100, Some("aa:bb:cc:dd:ee:01")));
+        }
+        sq.persist_once();
+        assert!(path.exists());
+        // Projection unchanged, but the file is deleted out from under us → the next pass
+        // must recreate it (durability isn't silently lost until the owner set changes).
+        std::fs::remove_file(&path).unwrap();
+        sq.persist_once();
+        assert!(path.exists(), "deleted owner file must be recreated");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persistence_disabled_is_inert() {
+        let sq = quota(None);
+        {
+            let mut w = sq.windows.write().unwrap();
+            w.insert("10.0.0.7".to_string(), win(100, Some("aa:bb:cc:dd:ee:01")));
+        }
+        sq.persist_once(); // no path → no file, no panic
+        let (enabled, failures, last_success, owners) = sq.persist_stats();
+        assert!(!enabled && failures == 0 && last_success == 0 && owners == 0);
+    }
+
+    #[test]
+    fn persist_once_write_error_counts_and_does_not_advance_success() {
+        // Owner path whose PARENT is an existing regular file → create_dir_all fails →
+        // atomic_write returns Err → the failure counter increments, last_success stays 0,
+        // and last_persisted is not advanced (so the next tick retries).
+        let file = tmp_owner_path("errpath");
+        let _ = std::fs::remove_file(&file);
+        std::fs::write(&file, b"x").unwrap();
+        let bad = file.join("owners.yaml"); // parent (`file`) is a file, not a dir
+        let sq = quota(Some(bad));
+        {
+            let mut w = sq.windows.write().unwrap();
+            w.insert("10.0.0.7".to_string(), win(100, Some("aa:bb:cc:dd:ee:01")));
+        }
+        sq.persist_once();
+        let (_, failures, last_success, owners) = sq.persist_stats();
+        assert_eq!(failures, 1, "write error must be counted");
+        assert_eq!(last_success, 0, "a failed write must not mark healthy");
+        assert_eq!(owners, 0, "owners_persisted only updates on a successful write");
+        // last_persisted untouched → the next tick still sees a diff and retries.
+        sq.persist_once();
+        assert_eq!(sq.persist_stats().1, 2, "unchanged projection retries the write");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn quota_dump_dto_serializes_with_nulls() {
+        let dump = QuotaDump {
+            period_secs: 10800,
+            quota_bytes: 1 << 30,
+            last_run: 0,
+            resets_total: 0,
+            mac_change_resets_total: 0,
+            errors_total: 0,
+            clients_over_quota: 0,
+            leases_read_failures: 0,
+            leases_healthy: true,
+            persist_enabled: false,
+            owner_path: None,
+            owner_persist_failures: 0,
+            owner_persist_last_success: 0,
+            owners_persisted: 0,
+            clients: vec![QuotaClient {
+                ip: "10.0.0.1".to_string(),
+                mac: None,
+                window_start: None,
+                age_secs: None,
+                bytes: None,
+                over_quota: false,
+            }],
+        };
+        let j = serde_json::to_string(&dump).unwrap();
+        assert!(j.contains("\"mac\":null"));
+        assert!(j.contains("\"owner_path\":null"));
     }
 }

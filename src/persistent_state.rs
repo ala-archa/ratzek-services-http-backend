@@ -95,7 +95,9 @@ impl PersistentStateGuard {
         // this host) would fail to parse on boot and drop the entire persisted state
         // (queue, balance, speedtest). Write to a temp file in the same directory,
         // then rename over the target — rename is atomic within one filesystem.
-        atomic_write(&self.persistent_state_path, content.as_bytes())?;
+        // 0o644: `atomic_write` sets the mode explicitly (umask-independent), so pass the
+        // effective historical mode directly — NOT 0o666, which would be world-writable.
+        atomic_write(&self.persistent_state_path, content.as_bytes(), 0o644)?;
         Ok(r)
     }
 
@@ -105,17 +107,41 @@ impl PersistentStateGuard {
     }
 }
 
-/// Write `content` to `path` atomically: fill a sibling temp file, fsync it, then
+/// Write `content` to `path` atomically with the given unix `mode`: create the parent
+/// dir if needed, fill a sibling temp file (opened with `mode`, so the final file's
+/// permissions are set at creation — no world-readable window for PII), fsync it, then
 /// rename it over `path`, then fsync the directory so the rename itself survives a
-/// power loss. A crash mid-write leaves either the old file or the temp file, never
-/// a truncated target. The fixed `.tmp` name is safe: every caller goes through
-/// `update()`, which holds the shared state mutex across this write, serializing all
-/// writers.
-fn atomic_write(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+/// power loss. A crash mid-write leaves either the old file or the temp file, never a
+/// truncated target.
+///
+/// The fixed `.tmp` name (`path.with_extension("tmp")`) requires **one writer per
+/// path**: each writer must own a distinct target path (its `.tmp` is a sibling of that
+/// path). `PersistentStateGuard::update` serializes its own writes via the state mutex;
+/// the shaper-quota persist-job owns a different path (config `validate()` enforces it
+/// is distinct from the other state files). Two writers sharing one path would race the
+/// same `.tmp` and tear.
+pub(crate) fn atomic_write(
+    path: &std::path::Path,
+    content: &[u8],
+    mode: u32,
+) -> std::io::Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let tmp = path.with_extension("tmp");
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&tmp)?;
+        // `.mode()` only applies when the temp is newly created; a leftover temp from a
+        // prior crash would keep its old perms. Set them explicitly so the PII mode
+        // holds before any content is written.
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
         f.write_all(content)?;
         f.sync_all()?;
     }

@@ -366,6 +366,7 @@ curl -b jar -X POST $BASE/api/v1/admin/logout
 | `POST /api/v1/admin/devices/{mac}/disconnect` | мгновенный отзыв доступа (ipset del) | да | да |
 | `POST /api/v1/admin/devices/disconnect-all` | отключить всех НЕ безлимитных (сервисный сброс канала) | да | да |
 | `POST /api/v1/admin/devices/{mac}/reset-shaper-counter` | сброс счётчика shaper клиента | да | да |
+| `GET /api/v1/admin/shaper-quota` | снимок shaper-quota трекера (окна/owning-MAC/байты + persist-статы, диагностика наследования; отдаёт mac↔ip) | да | да |
 | `PUT/DELETE/GET /api/v1/admin/shaping/global` | общий (агрегатный) лимит канала для не-безлимитных | да | да |
 | `GET /api/v1/admin/wan/speedtest` | история speedtest (timeseries) | да | да |
 | `GET /api/v1/admin/wan/balance` | история баланса ISP (timeseries) | да | да |

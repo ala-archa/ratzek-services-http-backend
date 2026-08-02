@@ -105,15 +105,24 @@ blacklist_path: /var/lib/ala-archa-http-backend/blacklist.yaml
 # a device with background traffic never resets and stays throttled forever. This job
 # gives each client a rolling window: `period_secs` after it is first seen in the set
 # (and every period after), its counter is reset via `ipset del` (re-created from zero
-# by the next packet — no disconnect, throttle clears). Windows are in-memory/ephemeral
-# (never on disk); iptables is NOT modified. Omit or set enabled: false to disable.
-# Exposes ratzek_shaper_quota_{enabled,age_seconds,resets_total,errors_total} and
-# ratzek_shaper_clients_over_quota on /metrics.
+# by the next packet — no disconnect, throttle clears). The per-IP `window_start` is
+# in-memory; the per-IP OWNING-MAC is persisted by a separate job to `owner_state_path`
+# so the inheritance (IP hand-over) reset survives process restarts. iptables is NOT
+# modified. Omit or set enabled: false to disable.
+# Exposes ratzek_shaper_quota_{enabled,age_seconds,resets_total,errors_total,
+# mac_change_resets_total,leases_read_failures_total,owner_persist_failures_total,
+# owners_persisted,owner_persist_age_seconds} and ratzek_shaper_clients_over_quota.
 # shaper_quota_reset:
 #   enabled: true                # default true when the section is present
 #   crontab: "0 * * * * *"       # 6-field cron; every 60s (default)
 #   period_secs: 10800           # per-client window; match the ipset timeout (3h, default)
 #   quota_bytes: 1073741824      # mirror of the iptables --bytes-gt threshold (1 GiB, default)
+#   # Durable per-IP owning-MAC store (default below). A separate job writes it every ~2min
+#   # so the MAC-change/inheritance reset survives restarts. Set to "" to DISABLE persistence
+#   # (tracker stays purely in-memory — the kill-switch for a wedged USB-SSD). When set, must
+#   # be absolute and distinct from every other backend-owned state file (persistent_state,
+#   # unlimited-clients, blacklist, history.db, device-metrics.db).
+#   owner_state_path: /var/lib/ala-archa-http-backend/shaper-quota-owners.yaml
 
 # captive_portal: RFC 8908 Captive Portal API. GET /api/v1/captive-portal returns the
 # client's captivity state (captive = source-IP not in acl) + this portal URL. Point DHCP

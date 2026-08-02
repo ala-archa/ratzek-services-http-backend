@@ -234,3 +234,27 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "shaper-quota не может прочитать dnsmasq leases {{ $value | humanize }}/с — mac-детект отключён"
+
+      # --- Owner-MAC persistence (durable inheritance fix, added 2026-08-02) ---
+      # A SEPARATE job persists the per-IP owning-MAC to disk (owner_state_path) every
+      # ~2min so the MAC-change/inheritance reset survives process restarts. If that write
+      # keeps failing, durability silently degrades to the in-memory backstop → the very
+      # inheritance bug this fixes creeps back after the next restart. Fires only when
+      # persistence is enabled (fail-fast errors return and increment this counter).
+      - alert: RatzekShaperQuotaOwnerPersistFailing
+        expr: rate(ratzek_shaper_quota_owner_persist_failures_total[10m]) > 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "shaper-quota не может записать owner-MAC файл {{ $value | humanize }}/с — durability деградирует"
+
+      # The other failure mode: a wedged fsync on the flaky USB-SSD never RETURNS an error
+      # (D-state), so the counter above stays flat. The persist job stamps a liveness age
+      # on every HEALTHY pass (write OR no-op), so a growing age = a hung writer. The gauge
+      # is absent when persistence is disabled / never ran → no false page.
+      - alert: RatzekShaperQuotaOwnerPersistStalled
+        expr: ratzek_shaper_quota_owner_persist_age_seconds > 600
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "shaper-quota owner-persist завис: {{ $value | humanize }}с без здорового прохода (SSD wedge?)"
