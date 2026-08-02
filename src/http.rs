@@ -58,6 +58,53 @@ fn client_ip(req: &HttpRequest) -> Option<String> {
         .or_else(|| req.peer_addr().map(|v| v.ip().to_string()))
 }
 
+/// RFC 8908 Captive Portal API response. `captive` is the only required field;
+/// `user-portal-url` tells the OS where to open the login page.
+#[derive(Serialize)]
+struct CaptivePortalStatus {
+    captive: bool,
+    #[serde(rename = "user-portal-url")]
+    user_portal_url: String,
+}
+
+/// RFC 8908 Captive Portal API. **Public** (no auth) — clients reach it via the URL
+/// handed out in DHCP option 114 (RFC 8910). Returns `captive: true` until the client's
+/// IP is authorized (present in `acl`), then `false`; iOS 14+/Android 11+ open the portal
+/// on `true` and auto-dismiss it when it flips to `false`. Client identity = source IP
+/// (X-Real-IP from the trusted nginx proxy, else peer). Fails safe to `captive: true`.
+#[get("/api/v1/captive-portal")]
+async fn captive_portal_api(
+    state: Data<Arc<Mutex<State>>>,
+    req: HttpRequest,
+) -> HttpResponse {
+    let (acl_name, user_portal_url) = {
+        let s = state.lock().await;
+        (
+            s.config().ipset_acl_name.clone(),
+            s.config().captive_portal.user_portal_url.clone(),
+        )
+    };
+    // Unknown IP or an ipset error → assume NOT authorized (captive: true) — the safe,
+    // show-the-portal direction.
+    let in_acl = match client_ip(&req) {
+        Some(ip) => crate::ipset::IPSet::new(&acl_name)
+            .test(&ip)
+            .unwrap_or_else(|err| {
+                warn!("captive-portal: ipset test acl {ip} failed: {err:#}");
+                false
+            }),
+        None => false,
+    };
+    let body = serde_json::ser::to_string(&CaptivePortalStatus {
+        captive: !in_acl,
+        user_portal_url,
+    })
+    .unwrap();
+    HttpResponse::Ok()
+        .content_type("application/captive+json")
+        .body(body)
+}
+
 async fn with_client<CB, Fut>(
     state: Data<Arc<Mutex<State>>>,
     req: &HttpRequest,
@@ -2787,6 +2834,21 @@ mod tests {
     fn bearer_ok_accepts_matching_token() {
         let req = req_with_auth(Some("Bearer s3cret-token-value-xyz"));
         assert!(webhook_bearer_ok(&req, "s3cret-token-value-xyz"));
+    }
+
+    #[test]
+    fn captive_portal_status_serializes_rfc8908_shape() {
+        // RFC 8908: `captive` bool + hyphenated `user-portal-url`.
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&CaptivePortalStatus {
+                captive: true,
+                user_portal_url: "http://www.ratzek/".to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["captive"], true);
+        assert_eq!(v["user-portal-url"], "http://www.ratzek/");
     }
 
     #[test]

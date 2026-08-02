@@ -144,6 +144,7 @@ impl Application {
                         .app_data(session_store.clone())
                         .service(http::client_get)
                         .service(http::client_register)
+                        .service(http::captive_portal_api)
                         .service(http::dhcp_leases)
                         .service(http::prometheus_exporter)
                         .service(http::alertmanager_webhook)

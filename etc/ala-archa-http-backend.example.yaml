@@ -115,6 +115,13 @@ blacklist_path: /var/lib/ala-archa-http-backend/blacklist.yaml
 #   period_secs: 10800           # per-client window; match the ipset timeout (3h, default)
 #   quota_bytes: 1073741824      # mirror of the iptables --bytes-gt threshold (1 GiB, default)
 
+# captive_portal: RFC 8908 Captive Portal API. GET /api/v1/captive-portal returns the
+# client's captivity state (captive = source-IP not in acl) + this portal URL. Point DHCP
+# option 114 (RFC 8910, in dnsmasq) at that endpoint so iOS 14+/Android 11+ open — and
+# auto-dismiss — the portal. Defaults work out of the box; override only to change the URL.
+# captive_portal:
+#   user_portal_url: "http://www.ratzek/"
+
 telegram:
   bot_token: "123456:ABC-asdasdasdasd"
   retry_crontab: "30 */5 * * * *"

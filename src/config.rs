@@ -235,6 +235,28 @@ pub struct ShaperQuotaReset {
     pub quota_bytes: u64,
 }
 
+fn default_captive_portal_url() -> String {
+    "http://www.ratzek/".to_string()
+}
+
+/// Captive-portal (RFC 8908 API) knobs. The backend answers `GET /api/v1/captive-portal`
+/// (the URL handed to clients via DHCP option 114 / RFC 8910) with the client's captivity
+/// state and this `user-portal-url`. Defaults work out of the box.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CaptivePortal {
+    /// Portal URL returned in the RFC 8908 response (where the OS opens the login page).
+    #[serde(default = "default_captive_portal_url")]
+    pub user_portal_url: String,
+}
+
+impl Default for CaptivePortal {
+    fn default() -> Self {
+        Self {
+            user_portal_url: default_captive_portal_url(),
+        }
+    }
+}
+
 fn default_history_retention_days() -> i64 {
     90
 }
@@ -344,6 +366,9 @@ pub struct Config {
     /// work out of the box; override only if the interface/class differ.
     #[serde(default)]
     pub shaping: GlobalShaping,
+    /// Captive-portal RFC 8908 API knobs. Defaults work out of the box.
+    #[serde(default)]
+    pub captive_portal: CaptivePortal,
 }
 
 fn default_dhcp_lease_secs() -> i64 {
@@ -485,6 +510,10 @@ impl Config {
                     lt.window_secs
                 );
             }
+        }
+
+        if self.captive_portal.user_portal_url.trim().is_empty() {
+            anyhow::bail!("captive_portal.user_portal_url must be non-empty");
         }
 
         if let Some(sq) = &self.shaper_quota_reset {

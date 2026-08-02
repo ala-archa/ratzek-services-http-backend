@@ -134,4 +134,21 @@ impl IPSet {
 
         Ok(())
     }
+
+    /// Whether `entry` is currently a member. `ipset test` exits 0 when present and
+    /// non-zero with "... is NOT in set ..." when absent — distinguished from a real
+    /// error (e.g. a missing set), which is propagated.
+    pub fn test(&self, entry: &str) -> Result<bool> {
+        let r = std::process::Command::new("ipset")
+            .args(["test", &self.name, entry])
+            .output()?;
+        if r.status.success() {
+            return Ok(true);
+        }
+        let stderr = String::from_utf8_lossy(&r.stderr);
+        if stderr.to_ascii_lowercase().contains("not in set") {
+            return Ok(false);
+        }
+        bail!("ipset test failed: {}", stderr.trim())
+    }
 }
