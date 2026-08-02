@@ -163,6 +163,7 @@ impl Application {
                         .service(http::admin_devices_disconnect_all)
                         .service(http::admin_device_disconnect)
                         .service(http::admin_device_reset_shaper_counter)
+                        .service(http::admin_shaper_quota)
                         .service(http::admin_shaping_global_set)
                         .service(http::admin_shaping_global_clear)
                         .service(http::admin_shaping_global_status)

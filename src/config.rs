@@ -209,13 +209,21 @@ pub(crate) fn default_shaper_quota_bytes() -> u64 {
     1_073_741_824
 }
 
-/// Optional per-client shaper byte-quota reset. A scheduled in-memory job gives each
-/// client a rolling window: ~`period_secs` after a client is first seen in the shaper
-/// set (and every `period_secs` after), its byte counter is reset with `ipset del`
-/// so it drops back below the iptables `--bytes-gt` throttle threshold. Fixes clients
-/// staying throttled forever because background traffic keeps refreshing the ipset
-/// timeout. Omit the section to disable; `enabled: false` also disables. iptables is
-/// NOT modified. See `src/shaper_quota.rs`.
+fn default_shaper_quota_owner_path() -> String {
+    // File the persist-job owns: durable per-IP owning-MAC, so the inheritance
+    // (MAC-change) reset survives process restarts. Empty string disables persistence.
+    "/var/lib/ala-archa-http-backend/shaper-quota-owners.yaml".to_string()
+}
+
+/// Optional per-client shaper byte-quota reset. A scheduled job gives each client a
+/// rolling window: ~`period_secs` after a client is first seen in the shaper set (and
+/// every `period_secs` after), its byte counter is reset with `ipset del` so it drops
+/// back below the iptables `--bytes-gt` throttle threshold. Fixes clients staying
+/// throttled forever because background traffic keeps refreshing the ipset timeout. The
+/// per-IP owning-MAC (for the inheritance/MAC-change reset) is persisted by a separate
+/// job to `owner_state_path` so it survives restarts (empty path = in-memory only). Omit
+/// the section to disable; `enabled: false` also disables. iptables is NOT modified. See
+/// `src/shaper_quota.rs`.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ShaperQuotaReset {
     /// Enable the job (default true when the section is present).
@@ -233,6 +241,13 @@ pub struct ShaperQuotaReset {
     /// iptables (default 1073741824 = 1 GiB).
     #[serde(default = "default_shaper_quota_bytes")]
     pub quota_bytes: u64,
+    /// File where a separate persist-job durably stores the per-IP owning-MAC, so the
+    /// inheritance (MAC-change) reset survives process restarts and no-lease windows.
+    /// An **empty string disables persistence** (the tracker stays purely in-memory,
+    /// i.e. pre-0.1.38 behavior) — the kill-switch for the flaky USB-SSD. Must be
+    /// absolute and distinct from the other on-disk state files when non-empty.
+    #[serde(default = "default_shaper_quota_owner_path")]
+    pub owner_state_path: String,
 }
 
 fn default_captive_portal_url() -> String {
@@ -525,6 +540,45 @@ impl Config {
                     "shaper_quota_reset.period_secs must be > 0, got {}",
                     sq.period_secs
                 );
+            }
+            // Owner-persistence path (empty = disabled). When set it must be absolute and
+            // distinct from every other backend-owned on-disk state file: the persist-job
+            // writes it via the shared `atomic_write`, whose "one writer per path"
+            // invariant a shared path would break (torn writes / corrupting that file).
+            let owner = sq.owner_state_path.trim();
+            if !owner.is_empty() {
+                let owner_path = std::path::Path::new(owner);
+                if !owner_path.is_absolute() {
+                    anyhow::bail!(
+                        "shaper_quota_reset.owner_state_path must be absolute, got {:?}",
+                        owner
+                    );
+                }
+                let others: [(&str, &std::path::Path); 5] = [
+                    ("persistent_state_path", &self.persistent_state_path),
+                    ("unlimited_clients_path", &self.unlimited_clients_path),
+                    ("blacklist_path", &self.blacklist_path),
+                    (
+                        "history.db_path",
+                        self.history
+                            .as_ref()
+                            .map_or(std::path::Path::new(""), |h| &h.db_path),
+                    ),
+                    (
+                        "device_metrics.db_path",
+                        self.device_metrics
+                            .as_ref()
+                            .map_or(std::path::Path::new(""), |dm| &dm.db_path),
+                    ),
+                ];
+                for (name, other) in others {
+                    if owner_path == other {
+                        anyhow::bail!(
+                            "shaper_quota_reset.owner_state_path must differ from {}",
+                            name
+                        );
+                    }
+                }
             }
         }
 

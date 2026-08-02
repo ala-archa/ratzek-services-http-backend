@@ -35,9 +35,17 @@ per-client tc-полиса:
    намеренный анти-абуз, свежую квоту он получает только по триггеру #1.
 
 Свойства:
-- **In-memory / ephemeral.** Окна живут только в памяти (как `live_traffic`), НЕ на флешке. Любой
-  ребут обнуляет ipset (наследовать нечего); на голом рестарте процесса стор пересевается из текущих
-  лиз (см. §Остаточные). Диск не трогаем (защита от UAS-стопора SSD).
+- **`window_start` в памяти; owning-MAC durable (0.1.38).** Персональное окно (`window_start`) живёт
+  только в памяти — при рестарте пересевается `now − rand(period)` (clock-agnostic, безопасный сброс
+  time-window). А **owning-MAC** каждого IP пишется на диск ОТДЕЛЬНЫМ джобом в `owner_state_path`,
+  чтобы триггер смены MAC переживал рестарты (иначе стор пересевался бы из НОВОЙ лизы и хэндовер, что
+  случился в downtime, не детектился — ровно этот баг чинит 0.1.38). Ребут обнуляет ipset → MAC для
+  IP, которого больше нет в сете, естественно выпадает (наследовать нечего). Пустой `owner_state_path`
+  = персистенция выключена (чистый in-memory, как до 0.1.38) — kill-switch для флаки-SSD.
+- **Персист декуплен от reset-прохода.** Запись на диск делает отдельный scheduled-job (свой
+  overlap-guard, ~2 мин); reset-проход диск НЕ трогает. Поэтому зависший `fsync` на USB-SSD тормозит
+  ТОЛЬКО persist-job (durability деградирует к in-memory/time-window backstop), но НЕ сбросы. Ловится
+  метрикой `owner_persist_age_seconds` (см. §Метрики).
 - **Сбой чтения лиз безопасен.** Не прочитались лизы в тик — mac-логика **полностью пропускается**
   (ноль сбросов от неё), работает только time-window. Отсутствующая/битая лиза для IP из сета =
   «неизвестно», НИКОГДА не смена MAC. Порваный/упавший read не может массово разлочить всех.
@@ -60,11 +68,12 @@ per-client tc-полиса:
 ## Остаточные (приняты; самолечатся ≤ одно `period` через time-window)
 
 Все промахи ниже падают в сторону **un-throttle** (доступность), не throttle:
-- **Handover через голый рестарт процесса** (ipset жив, стор пересевается из НОВОЙ лизы, в т.ч.
-  rollback `enabled:false`+restart) → смена MAC не видна; чистит 3ч-окно. Ребут по питанию обнуляет
-  ipset — там нечего наследовать.
-- **None-learn при пропаже лизы:** IP с живым счётчиком, но без active-лизы на момент seed (лиза
-  отвалилась на слабом LTE), затем новый тенант → learn `None→new` без сброса; чистит 3ч-окно.
+- **Первый хэндовер IP после свежего деплоя** (его owning-MAC ещё не персистнут) → смена MAC не видна;
+  чистит 3ч-окно. В установившемся режиме (стор наполнен и персистнут) хэндоверы ловятся за ≤2 тика
+  даже через рестарты. При выключенной персистенции (`owner_state_path:""`) — как до 0.1.38: любой
+  хэндовер через голый рестарт процесса пропускается, чистит 3ч-окно. Ребут по питанию обнуляет ipset.
+- **Битый-но-валидный YAML owner-файла** (перевёрнутый вручную mac) → максимум один лишний сброс на
+  реальном арендаторе (un-throttle-направление); нормализация на загрузке отсекает явный мусор.
 - **Crash между `del` и записью окна:** следующий тик пере-`del`-ит уже отсутствующий элемент
   (1× `errors_total`/warn), самолечится.
 
@@ -91,8 +100,16 @@ shaper_quota_reset:
   crontab: "0 * * * * *"     # каждые 60с
   period_secs: 10800         # 3ч, matching ipset timeout
   quota_bytes: 1073741824    # зеркало iptables --bytes-gt (только для метрики over-quota)
+  # Durable owning-MAC store (default показан). Отдельный джоб пишет его ~раз в 2 мин, чтобы
+  # mac-change/наследование переживало рестарты. "" ВЫКЛючает персист (чистый in-memory,
+  # kill-switch для флаки-SSD). Непустой — absolute и ОТЛИЧЕН от всех прочих state-файлов
+  # (persistent_state / unlimited-clients / blacklist / history.db / device-metrics.db) —
+  # config validate() это проверяет.
+  owner_state_path: /var/lib/ala-archa-http-backend/shaper-quota-owners.yaml
 ```
-Отсутствие секции или `enabled: false` — джоб не стартует, поведение как раньше.
+Отсутствие секции или `enabled: false` — джоб не стартует, поведение как раньше. Owner-файл — 0600
+(содержит mac↔ip, PII), лежит на диске рядом с прочими state-файлами, самоочищается (пишется только
+пруненая проекция текущих членов сета).
 
 ## Метрики (`/metrics`) и алерт
 
@@ -108,37 +125,57 @@ shaper_quota_reset:
   — переименована; старой больше нет.
 - `ratzek_shaper_quota_leases_read_failures_total` — тики, где lease-файл не прочитался (mac-детект
   пропущен, работает только time-window). Хронический рост = mac-триггер молча выключен.
+- `ratzek_shaper_quota_owner_persist_failures_total` — fail-fast ошибки записи owner-файла (ENOSPC /
+  RO / EACCES). Рост = durability деградирует, наследование вернётся после следующего рестарта.
+- `ratzek_shaper_quota_owners_persisted` — сколько owning-MAC сейчас на диске (gauge).
+- `ratzek_shaper_quota_owner_persist_age_seconds` — секунд с последнего ЗДОРОВОГО прохода персиста
+  (запись ИЛИ no-op). Эмитится ТОЛЬКО когда персист включён и был ≥1 здоровый проход → отсутствие
+  серии само гасит Stalled-алерт при выключенной/невыполненной персистенции. Растущий age = зависший
+  писатель (D-state fsync, который counter выше НЕ ловит — он не возвращает ошибку).
 
-Алерты `RatzekShaperQuotaStalled`, `RatzekShaperQuotaMacResetSpike`
-(`rate(mac_change_resets_total[10m]) > 0.05` — всплеск/битые лизы) и `RatzekShaperQuotaLeasesUnreadable`
-(`rate(leases_read_failures_total[10m]) > 0` — обратная беда: лизы не читаются, mac-детект off)
-(`doc/ratzek-site.rules`, деплой в
-`/etc/prometheus/rules/ratzek-site.rules`): `age_seconds > 600` for 5m.
+Алерты (`doc/ratzek-site.rules` → `/etc/prometheus/rules/ratzek-site.rules`):
+- `RatzekShaperQuotaStalled` — `age_seconds > 600` for 5m (сам reset-джоб завис).
+- `RatzekShaperQuotaMacResetSpike` — `rate(mac_change_resets_total[10m]) > 0.05` (всплеск/битые лизы).
+- `RatzekShaperQuotaLeasesUnreadable` — `rate(leases_read_failures_total[10m]) > 0` (лизы не читаются).
+- `RatzekShaperQuotaOwnerPersistFailing` — `rate(owner_persist_failures_total[10m]) > 0` for 15m
+  (запись owner-файла падает fail-fast).
+- `RatzekShaperQuotaOwnerPersistStalled` — `owner_persist_age_seconds > 600` for 15m (persist-писатель
+  завис в D-state на SSD).
 
 ## Деплой (фазовый — сайт доступен только через тот самый LTE-канал, авто-отката нет)
 
-**Фаза A — бинарь с выключенной фичей:**
+**Фаза A — бинарь 0.1.38 с ВЫКЛЮЧЕННОЙ персистенцией** (свап бинаря отделён от включения SSD-записи):
 1. Зафиксировать `iptables -S FORWARD` (см. инвариант выше).
-2. `scripts/deploy.sh root@www.ratzek` с конфигом БЕЗ секции `shaper_quota_reset`
-   (или `enabled: false`). Поведение идентично текущему.
-3. Проверить живость: `systemctl is-active ratzek-services-http-backend` +
-   `curl -s 127.0.0.1:8888/metrics | head`.
+2. `scripts/deploy.sh root@www.ratzek` с `shaper_quota_reset.owner_state_path: ""` (reset-джоб работает
+   как 0.1.37, персист-джоб НЕ стартует, диск не трогается).
+3. Проверить живость + новый эндпоинт:
+   `curl -s --cookie <admin> 127.0.0.1:8888/api/v1/admin/shaper-quota` (снимок), и
+   `curl -s 127.0.0.1:8888/metrics | grep owner_persist` → `owner_persist_failures_total 0`,
+   age-серии НЕТ (персист выкл).
 
-**Фаза B — включение и проверка на коротком периоде:**
-4. Добавить секцию с `period_secs: 120` → `systemctl restart ratzek-services-http-backend`.
+**Фаза B — включение персистенции + короткий период:**
+4. Прописать `owner_state_path: /var/lib/ala-archa-http-backend/shaper-quota-owners.yaml` и
+   `period_secs: 120` → `systemctl restart ratzek-services-http-backend`.
 5. На хосте выбрать активного клиента и убедиться:
    - `ipset list shaper` — его счётчик обнуляется ~каждые 2 мин;
    - `ping` у клиента **без разрывов** за ≥3 цикла;
-   - если был >1 ГБ — метка снимается: считать пакеты на правиле `--bytes-gt`
-     `iptables -vnL FORWARD | grep -A0 0x14d` (счётчик перестаёт расти после сброса);
-   - `curl -s 127.0.0.1:8888/metrics | grep shaper_quota` — `age_seconds` свежий, `resets_total` растёт.
-6. Вернуть `period_secs: 10800` → `systemctl restart`.
-7. Задеплоить правило Prometheus: обновить `/etc/prometheus/rules/ratzek-site.rules` из
+   - если был >1 ГБ — метка снимается (`iptables -vnL FORWARD | grep 0x14d` перестаёт расти);
+   - `curl -s 127.0.0.1:8888/metrics | grep shaper_quota` — `age_seconds` свежий, `resets_total` растёт,
+     `owners_persisted` > 0, `owner_persist_failures_total 0`, `owner_persist_age_seconds` свежий;
+   - owner-файл создан `0600`: `ls -l /var/lib/ala-archa-http-backend/shaper-quota-owners.yaml`.
+6. **Durable-тест:** снять снимок эндпоинта → `systemctl restart` → снова снимок: stored-MAC уцелели
+   (не пересеялись текущими лизами).
+7. Вернуть `period_secs: 10800` → `systemctl restart`.
+8. Задеплоить правила Prometheus: обновить `/etc/prometheus/rules/ratzek-site.rules` из
    `doc/ratzek-site.rules` → `promtool check rules` → `systemctl reload prometheus`.
 
 ## Rollback
 
-`enabled: false` в `/etc/ala-archa-http-backend.yaml` → `systemctl restart ratzek-services-http-backend`
-(по ssh, без пересборки — конфиг читается только на старте, live-reload нет). iptables/ipset не
-менялись, откатывать нечего. Экстренно вернуть клиента: ручной
-`POST /api/v1/admin/devices/{mac}/reset-shaper-counter` или `ipset del shaper <ip>`.
+- **Отключить только персистенцию** (напр. SSD залип, `RatzekShaperQuotaOwnerPersist*` стреляет):
+  `owner_state_path: ""` → `systemctl restart` — reset-джоб продолжает работать, диск не трогается
+  (поведение 0.1.37). Owner-файл можно удалить (стор пересоздастся).
+- **Отключить джоб целиком:** `enabled: false` → `systemctl restart` (конфиг читается только на старте,
+  live-reload нет). iptables/ipset не менялись, откатывать нечего.
+- **Полный откат бинаря:** редеплой предыдущего из `/usr/bin/ratzek-services-http-backend.bak-*`.
+- Экстренно вернуть клиента: `POST /api/v1/admin/devices/{mac}/reset-shaper-counter` или
+  `ipset del shaper <ip>`.

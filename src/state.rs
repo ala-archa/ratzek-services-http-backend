@@ -538,6 +538,44 @@ impl State {
                         })
                     })?)
                     .await?;
+
+                // Owner-MAC persist job — SEPARATE from the reset job (own overlap guard).
+                // Decoupling is deliberate: a wedged `fsync` on the flaky USB-SSD stalls
+                // only this job (durability degrades to the in-memory/time-window backstop),
+                // never the resets. Gated on a non-empty owner_state_path (kill-switch).
+                if !sq_cfg.owner_state_path.trim().is_empty() {
+                    // 6-field cron: every 2 minutes. This cadence IS the write coalescing —
+                    // no manual timestamp (so no clock-jump sensitivity); a no-op tick is
+                    // near-free (a lock + a BTreeMap compare).
+                    const PERSIST_CRONTAB: &str = "0 */2 * * * *";
+                    let state2 = state.clone();
+                    let persist_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    info!(
+                        "Starting shaper-quota owner-persist job ({})",
+                        sq_cfg.owner_state_path.trim()
+                    );
+                    state_guard
+                        .scheduler
+                        .add(Job::new_async(PERSIST_CRONTAB, move |_uuid, _l| {
+                            let state2 = state2.clone();
+                            let persist_running = persist_running.clone();
+                            Box::pin(async move {
+                                if persist_running.swap(true, Ordering::SeqCst) {
+                                    warn!("shaper-quota: previous persist still running, skipping tick");
+                                    return;
+                                }
+                                let quota = state2.lock().await.shaper_quota();
+                                let join = tokio::task::spawn_blocking(move || {
+                                    let _guard = RunningGuard(persist_running);
+                                    quota.persist_once();
+                                });
+                                if let Err(err) = join.await {
+                                    error!("shaper-quota persist task panicked: {err}");
+                                }
+                            })
+                        })?)
+                        .await?;
+                }
             } else {
                 info!("shaper-quota reset job disabled (enabled=false)");
             }
@@ -644,6 +682,13 @@ impl State {
         // enabled.
         let shaper_quota = {
             let sq = config.shaper_quota_reset.as_ref();
+            // Owner-persistence path: `None` when the section is absent or the path is
+            // empty (kill-switch → pure in-memory, pre-0.1.38 behavior). Validated
+            // absolute + distinct-from-other-state-files by `config::validate()`.
+            let owner_path = sq.and_then(|c| {
+                let p = c.owner_state_path.trim();
+                (!p.is_empty()).then(|| std::path::PathBuf::from(p))
+            });
             Arc::new(crate::shaper_quota::ShaperQuota::new(
                 config.ipset_shaper_name.clone(),
                 sq.map(|c| c.period_secs)
@@ -654,6 +699,7 @@ impl State {
                 crate::dhcp::DhcpParams {
                     lease_secs: config.dhcp_lease_secs,
                 },
+                owner_path,
             ))
         };
 
