@@ -110,8 +110,9 @@ blacklist_path: /var/lib/ala-archa-http-backend/blacklist.yaml
 # so the inheritance (IP hand-over) reset survives process restarts. iptables is NOT
 # modified. Omit or set enabled: false to disable.
 # Exposes ratzek_shaper_quota_{enabled,age_seconds,resets_total,errors_total,
-# mac_change_resets_total,leases_read_failures_total,owner_persist_failures_total,
-# owners_persisted,owner_persist_age_seconds} and ratzek_shaper_clients_over_quota.
+# mac_change_resets_total,inheritance_resets_total,leases_read_failures_total,
+# owner_persist_failures_total,owners_persisted,owner_persist_age_seconds} and
+# ratzek_shaper_clients_over_quota.
 # shaper_quota_reset:
 #   enabled: true                # default true when the section is present
 #   crontab: "0 * * * * *"       # 6-field cron; every 60s (default)

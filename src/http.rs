@@ -669,6 +669,7 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
         sq_errors,
         sq_over_quota,
         sq_mac_change_resets,
+        sq_inheritance_resets,
         sq_leases_fail,
         sq_persist_enabled,
         sq_persist_failures,
@@ -687,6 +688,7 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
             errors,
             over_quota,
             sq.mac_change_resets(),
+            sq.inheritance_resets(),
             sq.leases_read_failures(),
             persist_enabled,
             persist_failures,
@@ -726,6 +728,12 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
         "ratzek_shaper_quota_mac_change_resets_total",
         "Shaper byte-counter resets on IP hand-over (DHCP lease MAC changed for the IP)",
         sq_mac_change_resets as f64,
+    );
+    out += &counter(
+        "ratzek_shaper_quota_inheritance_resets_total",
+        "Shaper byte-counter resets on None-learn inheritance (new tenant of an IP whose \
+         counter was already large; previous owner never known)",
+        sq_inheritance_resets as f64,
     );
     out += &counter(
         "ratzek_shaper_quota_leases_read_failures_total",

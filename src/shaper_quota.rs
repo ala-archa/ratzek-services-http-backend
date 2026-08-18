@@ -10,7 +10,7 @@
 //! traffic. A device with background traffic never goes idle for 3h, so its counter
 //! stays above the quota and it is throttled indefinitely.
 //!
-//! **Two reset triggers (both in this scheduled job).**
+//! **Three reset triggers (all in this scheduled job).**
 //! 1. *Time-window:* ~`period` after a client is first seen in the set (and every
 //!    `period` after), its counter is reset with `ipset del shaper <ip>` — the entry
 //!    is re-created from zero by the next packet (the `SET --add-set` rule precedes the
@@ -24,6 +24,14 @@
 //!    request), so it can't be spoofed; a same-MAC client (e.g. a heavy user re-login)
 //!    is NOT reset — that is the intended anti-bypass, they get fresh quota only via
 //!    trigger #1.
+//! 3. *None-learn inheritance (0.1.39):* trigger #2 only fires when the PREVIOUS owner is
+//!    known (`Some(old) → Some(new)`). When the tracked owner is `None` (never learned —
+//!    the IP took a live counter while no attributable lease existed) and a lease appears,
+//!    the store would otherwise silently learn the new tenant onto the inherited counter.
+//!    Instead, if that counter already exceeds `quota_bytes / INHERIT_THRESHOLD_DIVISOR`
+//!    (a just-learned owner can't have earned it — see [`is_inherit_suspect`]), it is
+//!    reset. This is gated on a present lease (`Some(new)`) — both in the new-member seed
+//!    and the `(None, Some)` learn arm — so a leases-read failure can never trigger it.
 //!
 //! **Design notes.**
 //! - **`window_start` in-memory; owning-MAC durable.** The per-IP `window_start` lives
@@ -52,11 +60,14 @@
 //!   `persist_once` (its own overlap-guard) — the reset pass (`run_pass`) never touches
 //!   the disk. So a wedged `fsync` on the flaky USB-SSD can stall only the persist job
 //!   (durability degrades to the in-memory/time-window backstop), never the resets.
-//! - **Residual (accepted, self-heals ≤ one `period` via the time-window):** only the
-//!   FIRST hand-over of an IP after a fresh deploy (its owning-MAC not yet persisted) is
-//!   missed as a MAC change; the time-window clears it. Once the store is populated and
-//!   persisted, later hand-overs are caught in ≤2 ticks even across restarts. All
-//!   residual misses fail in the un-throttle (availability-safe) direction.
+//! - **Residual (accepted, self-heals ≤ one `period` via the time-window).** The FIRST
+//!   hand-over of an IP after a fresh deploy (owning-MAC not yet persisted) is missed as a
+//!   MAC change; the time-window clears it. The 0.1.39 None-learn trigger (#3) now also
+//!   catches such a hand-over immediately once the inherited counter exceeds the threshold,
+//!   so the only remaining misses are sub-threshold inherited counters and, after a bare
+//!   restart with a correlated owner-file + leases read failure, a batch un-throttle of
+//!   heavy users (a *reboot* wipes the ipset → counters 0 → not affected). All residual
+//!   misses fail in the un-throttle (availability-safe) direction.
 
 use crate::ipset::IPSet;
 use rand::Rng;
@@ -111,6 +122,29 @@ struct MacChange {
     new: String,
 }
 
+/// A None-owner learn on an IP whose counter is already too large to be the new tenant's
+/// own traffic → treated as inheritance: the counter is reset and `new` recorded as owner.
+/// Unlike [`MacChange`] there is no `old` (the previous owner was never learned). This is
+/// the residual the durable-MAC (0.1.38) fix left open — see the module doc.
+#[derive(Debug, PartialEq)]
+struct InheritReset {
+    ip: String,
+    new: String,
+}
+
+/// Divisor for the inheritance-reset threshold: `quota_bytes / INHERIT_THRESHOLD_DIVISOR`.
+/// On the ~15 Mbit uplink a client transfers at most ~107 MiB in one 60s tick, so `/4`
+/// (256 MiB at the 1 GiB quota) sits well above a single tick's worth yet below the quota.
+const INHERIT_THRESHOLD_DIVISOR: u64 = 4;
+
+/// Whether a shaper counter is too large to plausibly be a just-learned owner's own
+/// traffic (so it must be inherited). `threshold` = [`ShaperQuota::inherit_threshold`]; a
+/// freshly-learned owner already past it can't have earned it. A counter-less entry is
+/// never suspect.
+fn is_inherit_suspect(bytes: Option<usize>, threshold: u64) -> bool {
+    bytes.is_some_and(|b| b as u64 > threshold)
+}
+
 /// Classify shaper members against the tracked windows for one pass; also applies the
 /// no-I/O mutations (seed new members, learn a MAC for a `None` window, prune stale)
 /// and returns the IPs whose counter must be `ipset del`-reset (done OUTSIDE the lock
@@ -119,31 +153,49 @@ struct MacChange {
 ///
 /// `leases` is `None` when the leases file couldn't be read this tick → MAC logic is
 /// skipped (only the time-window path runs). `over_quota_ips` is used only to emit a
-/// "why NOT reset" debug line for a same-MAC over-quota client.
-// 7 params: all are genuinely-needed pure inputs (this is the unit-tested seam); grouping
-// them buys nothing and the `over_quota_ips` param exists for a forensic debug line.
+/// "why NOT reset" debug line for a same-MAC over-quota client. `inherit_reset_ips` are
+/// members whose counter is inheritance-suspect (see [`is_inherit_suspect`]) — consulted
+/// only where a lease is present (`Some(new)`): both the new-member seed and the `(None,
+/// Some)` learn arm, so a leases-read failure can never trigger an inheritance reset.
+// 8 params: all are genuinely-needed pure inputs (this is the unit-tested seam); grouping
+// them buys nothing. The two IP sets drive distinct branches (forensic debug / inherit-reset).
 #[allow(clippy::too_many_arguments)]
 fn plan_and_prepare(
     windows: &mut HashMap<String, Window>,
     members: &HashSet<&str>,
     leases: Option<&HashMap<String, String>>,
     over_quota_ips: &HashSet<String>,
+    inherit_reset_ips: &HashSet<String>,
     now: i64,
     period: i64,
     mut seed: impl FnMut() -> i64,
-) -> (Vec<String>, Vec<MacChange>) {
+) -> (Vec<String>, Vec<MacChange>, Vec<InheritReset>) {
     let mut time_expired: Vec<String> = Vec::new();
     let mut mac_changed: Vec<MacChange> = Vec::new();
+    let mut inherited: Vec<InheritReset> = Vec::new();
 
     for &ip in members {
         let lease_mac: Option<&str> = leases.and_then(|m| m.get(ip)).map(String::as_str);
         let Some(w) = windows.get_mut(ip) else {
-            // New member: seed with the lease MAC if known (else None → learn later).
+            // New member. A brand-new member already carrying an inheritance-suspect counter
+            // (with a lease) must have inherited it → reset, like the `(None, Some(new))` arm
+            // below (owner adopted in phase 3 after a successful del; `mac = None` until then).
+            // Otherwise seed with the lease MAC if known (else None → learn later).
+            let seed_mac = match lease_mac {
+                Some(new) if inherit_reset_ips.contains(ip) => {
+                    inherited.push(InheritReset {
+                        ip: ip.to_string(),
+                        new: new.to_string(),
+                    });
+                    None
+                }
+                other => other.map(str::to_string),
+            };
             windows.insert(
                 ip.to_string(),
                 Window {
                     window_start: seed(),
-                    mac: lease_mac.map(str::to_string),
+                    mac: seed_mac,
                 },
             );
             continue;
@@ -158,7 +210,15 @@ fn plan_and_prepare(
                 });
                 // NB: mac/window_start updated in phase 3, only after a successful del.
             }
-            // Unknown previous MAC → learn it (no reset).
+            // Unknown previous owner + already-large counter → the counter predates this
+            // tenant → inheritance → reset (mac recorded in phase 3, after a successful del).
+            (None, Some(new)) if inherit_reset_ips.contains(ip) => {
+                inherited.push(InheritReset {
+                    ip: ip.to_string(),
+                    new: new.to_string(),
+                });
+            }
+            // Unknown previous MAC, small counter → just learn it (no reset).
             (None, Some(new)) => {
                 debug!("shaper-quota learn mac: ip={} mac={}", ip, new);
                 w.mac = Some(new.to_string());
@@ -177,7 +237,7 @@ fn plan_and_prepare(
     // Prune tracked IPs no longer in the set (their counter is gone → nothing to keep).
     windows.retain(|ip, _| members.contains(ip.as_str()));
 
-    (time_expired, mac_changed)
+    (time_expired, mac_changed, inherited)
 }
 
 /// Phase 3 (under lock): advance the window of time-window-reset IPs, KEEPING the mac.
@@ -271,6 +331,10 @@ pub struct QuotaDump {
     pub last_run: i64,
     pub resets_total: i64,
     pub mac_change_resets_total: i64,
+    pub inheritance_resets_total: i64,
+    /// Effective inheritance-reset threshold (`quota_bytes / 4`) of the RUNNING binary —
+    /// for incident forensics (confirm the threshold without reading the source).
+    pub inherit_threshold_bytes: u64,
     pub errors_total: i64,
     /// Count of members past the byte quota at the last pass (mirrors the
     /// `ratzek_shaper_clients_over_quota` gauge) — distinct from `QuotaClient.over_quota`.
@@ -293,6 +357,8 @@ struct PassStats {
     time_resets: u64,
     /// MAC-change resets (successful `ipset del`).
     mac_resets: u64,
+    /// None-learn inheritance resets (successful `ipset del`).
+    inherit_resets: u64,
     /// Per-IP `ipset del` failures (retried next tick).
     errors: u64,
     /// Members past the byte quota at this pass (gauge).
@@ -313,8 +379,11 @@ pub struct ShaperQuota {
     last_run: AtomicI64,
     /// Monotonic count of time-window resets.
     resets_total: AtomicI64,
-    /// Monotonic count of MAC-change (inheritance) resets.
+    /// Monotonic count of MAC-change (known-old → new) resets.
     mac_change_resets: AtomicI64,
+    /// Monotonic count of None-learn inheritance resets (unknown previous owner + large
+    /// counter). Separate from `mac_change_resets` so a runaway is visible on its own alert.
+    inheritance_resets: AtomicI64,
     /// Monotonic count of per-IP `ipset del` failures.
     errors_total: AtomicI64,
     /// Members past the byte quota at the last pass (gauge).
@@ -407,6 +476,7 @@ impl ShaperQuota {
             last_run: AtomicI64::new(0),
             resets_total: AtomicI64::new(0),
             mac_change_resets: AtomicI64::new(0),
+            inheritance_resets: AtomicI64::new(0),
             errors_total: AtomicI64::new(0),
             over_quota: AtomicI64::new(0),
             leases_read_failures: AtomicI64::new(0),
@@ -432,13 +502,15 @@ impl ShaperQuota {
                     .fetch_add(s.time_resets as i64, Ordering::Relaxed);
                 self.mac_change_resets
                     .fetch_add(s.mac_resets as i64, Ordering::Relaxed);
+                self.inheritance_resets
+                    .fetch_add(s.inherit_resets as i64, Ordering::Relaxed);
                 self.errors_total.fetch_add(s.errors as i64, Ordering::Relaxed);
                 self.over_quota.store(s.over_quota as i64, Ordering::Relaxed);
                 self.last_run.store(now, Ordering::Relaxed);
-                if s.time_resets > 0 || s.mac_resets > 0 || s.errors > 0 {
+                if s.time_resets > 0 || s.mac_resets > 0 || s.inherit_resets > 0 || s.errors > 0 {
                     info!(
-                        "shaper-quota pass: {} members, {} time-resets, {} mac-resets, {} errors, {} over quota",
-                        s.members, s.time_resets, s.mac_resets, s.errors, s.over_quota
+                        "shaper-quota pass: {} members, {} time-resets, {} mac-resets, {} inherit-resets, {} errors, {} over quota",
+                        s.members, s.time_resets, s.mac_resets, s.inherit_resets, s.errors, s.over_quota
                     );
                 } else {
                     debug!(
@@ -461,9 +533,20 @@ impl ShaperQuota {
         )
     }
 
-    /// Total MAC-change (inheritance) resets performed.
+    /// Total MAC-change (known-old → new) resets performed.
     pub fn mac_change_resets(&self) -> i64 {
         self.mac_change_resets.load(Ordering::Relaxed)
+    }
+
+    /// Total None-learn inheritance resets performed (unknown previous owner + large counter).
+    pub fn inheritance_resets(&self) -> i64 {
+        self.inheritance_resets.load(Ordering::Relaxed)
+    }
+
+    /// Effective inheritance-reset threshold: a None-owner IP past this counter is treated
+    /// as inherited (see [`is_inherit_suspect`]). Single source for both `run_pass` and `dump`.
+    fn inherit_threshold(&self) -> u64 {
+        self.quota_bytes / INHERIT_THRESHOLD_DIVISOR
     }
 
     /// Total leases-read failures (each disabled the MAC trigger for that tick).
@@ -593,6 +676,8 @@ impl ShaperQuota {
             last_run: self.last_run.load(Ordering::Relaxed),
             resets_total: self.resets_total.load(Ordering::Relaxed),
             mac_change_resets_total: self.mac_change_resets.load(Ordering::Relaxed),
+            inheritance_resets_total: self.inheritance_resets.load(Ordering::Relaxed),
+            inherit_threshold_bytes: self.inherit_threshold(),
             errors_total: self.errors_total.load(Ordering::Relaxed),
             clients_over_quota: self.over_quota.load(Ordering::Relaxed),
             leases_read_failures: self.leases_read_failures.load(Ordering::Relaxed),
@@ -618,11 +703,18 @@ impl ShaperQuota {
     fn run_pass(&self, now: i64) -> anyhow::Result<PassStats> {
         let set = IPSet::new(&self.shaper_set);
         let entries = set.entries()?;
+        // Past this a just-learned owner can't have earned the counter (see
+        // `is_inherit_suspect`) → the counter is inherited and must be reset, not learned.
+        let inherit_threshold = self.inherit_threshold();
         let mut over_quota_ips: HashSet<String> = HashSet::new();
+        let mut inherit_reset_ips: HashSet<String> = HashSet::new();
         let mut member_ips: Vec<String> = Vec::with_capacity(entries.len());
         for e in entries {
             if e.bytes.is_some_and(|b| b as u64 > self.quota_bytes) {
                 over_quota_ips.insert(e.ip.clone());
+            }
+            if is_inherit_suspect(e.bytes, inherit_threshold) {
+                inherit_reset_ips.insert(e.ip.clone());
             }
             member_ips.push(e.ip);
         }
@@ -656,13 +748,14 @@ impl ShaperQuota {
         };
 
         // Phase 1 (short lock): classify, seed/learn/prune, collect resets. No ipset I/O.
-        let (time_expired, mac_changed) = {
+        let (time_expired, mac_changed, inherited) = {
             let mut windows = self.windows.write().unwrap_or_else(|e| e.into_inner());
             plan_and_prepare(
                 &mut windows,
                 &members,
                 leases.as_ref(),
                 &over_quota_ips,
+                &inherit_reset_ips,
                 now,
                 period,
                 || now - jitter(period),
@@ -697,19 +790,40 @@ impl ShaperQuota {
                 }
             }
         }
+        // None-learn inheritance resets: same reset+adopt flow as mac-change, but the
+        // previous owner was never known (learned owner inherited a large counter).
+        let mut inherited_ok: Vec<(String, String)> = Vec::new();
+        for InheritReset { ip, new } in inherited {
+            match set.del(&ip) {
+                Ok(()) => {
+                    info!(
+                        "shaper-quota inheritance reset: ip={} learned={} bytes>{}",
+                        ip, new, inherit_threshold
+                    );
+                    inherited_ok.push((ip, new));
+                }
+                Err(err) => {
+                    warn!("shaper-quota: ipset del {} (inheritance) failed: {:#}", ip, err);
+                    errors += 1;
+                }
+            }
+        }
 
-        // Phase 3 (short lock): advance windows we actually reset (mac-change overwrites
-        // the mac; time-window keeps it). Failed dels are excluded → retried next tick.
+        // Phase 3 (short lock): advance windows we actually reset (mac-change and
+        // inheritance overwrite the mac; time-window keeps it). Failed dels are excluded →
+        // retried next tick.
         {
             let mut windows = self.windows.write().unwrap_or_else(|e| e.into_inner());
             advance_time(&mut windows, &time_ok, now);
             advance_mac(&mut windows, &mac_ok, now);
+            advance_mac(&mut windows, &inherited_ok, now);
         }
 
         Ok(PassStats {
             members: member_ips.len(),
             time_resets: time_ok.len() as u64,
             mac_resets: mac_ok.len() as u64,
+            inherit_resets: inherited_ok.len() as u64,
             errors,
             over_quota,
         })
@@ -747,7 +861,9 @@ mod tests {
             .collect()
     }
 
-    /// Run phase-1 classification with a fixed seed and no over-quota set.
+    /// Run phase-1 classification with a fixed seed, no over-quota and no inherit-reset set.
+    /// Absorbs the (unused here) `inherited` return so all existing call sites keep the
+    /// original 2-tuple shape; inheritance behavior is exercised via [`prep_inherit`].
     fn prep(
         windows: &mut HashMap<String, Window>,
         members: &HashSet<&str>,
@@ -755,7 +871,39 @@ mod tests {
         now: i64,
         period: i64,
     ) -> (Vec<String>, Vec<MacChange>) {
-        plan_and_prepare(windows, members, lease, &HashSet::new(), now, period, || 0)
+        let (time, mac, _inherited) = plan_and_prepare(
+            windows,
+            members,
+            lease,
+            &HashSet::new(),
+            &HashSet::new(),
+            now,
+            period,
+            || 0,
+        );
+        (time, mac)
+    }
+
+    /// Like [`prep`] but with an explicit `inherit_reset_ips` set and returning the
+    /// `inherited` bucket, for the None-learn inheritance tests.
+    fn prep_inherit(
+        windows: &mut HashMap<String, Window>,
+        members: &HashSet<&str>,
+        lease: Option<&HashMap<String, String>>,
+        inherit_reset_ips: &HashSet<String>,
+        now: i64,
+        period: i64,
+    ) -> (Vec<String>, Vec<MacChange>, Vec<InheritReset>) {
+        plan_and_prepare(
+            windows,
+            members,
+            lease,
+            &HashSet::new(),
+            inherit_reset_ips,
+            now,
+            period,
+            || 0,
+        )
     }
 
     #[test]
@@ -1104,6 +1252,8 @@ mod tests {
             last_run: 0,
             resets_total: 0,
             mac_change_resets_total: 0,
+            inheritance_resets_total: 0,
+            inherit_threshold_bytes: 1 << 28,
             errors_total: 0,
             clients_over_quota: 0,
             leases_read_failures: 0,
@@ -1125,5 +1275,114 @@ mod tests {
         let j = serde_json::to_string(&dump).unwrap();
         assert!(j.contains("\"mac\":null"));
         assert!(j.contains("\"owner_path\":null"));
+    }
+
+    // --- None-learn inheritance reset ---
+
+    #[test]
+    fn is_inherit_suspect_boundary() {
+        let t = 256 * 1024 * 1024;
+        assert!(is_inherit_suspect(Some(t as usize + 1), t)); // strictly over → suspect
+        assert!(!is_inherit_suspect(Some(t as usize), t)); // exactly at → not suspect
+        assert!(!is_inherit_suspect(Some(0), t));
+        assert!(!is_inherit_suspect(None, t)); // counter-less entry is never suspect
+    }
+
+    #[test]
+    fn none_learn_with_large_counter_is_inheritance_reset() {
+        // Owner unknown (None) + IP flagged inherit-suspect + a lease appears → reset,
+        // NOT a silent learn. mac stays None until phase 3 (after a successful del).
+        let mut w = HashMap::from([("ip".to_string(), win(1000, None))]);
+        let l = leases(&[("ip", "bb")]);
+        let suspect: HashSet<String> = ["ip".to_string()].into_iter().collect();
+        let (time, mac, inherited) =
+            prep_inherit(&mut w, &set(&["ip"]), Some(&l), &suspect, 1500, 10800);
+        assert!(time.is_empty() && mac.is_empty());
+        assert_eq!(
+            inherited,
+            vec![InheritReset {
+                ip: "ip".to_string(),
+                new: "bb".to_string()
+            }]
+        );
+        assert_eq!(w["ip"], win(1000, None)); // not mutated yet
+        // Phase 3 adopts the new owner + re-anchors the window (same helper as mac-change).
+        advance_mac(&mut w, &[("ip".to_string(), "bb".to_string())], 1500);
+        assert_eq!(w["ip"], win(1500, Some("bb")));
+    }
+
+    #[test]
+    fn none_learn_with_small_counter_just_learns() {
+        // Owner unknown + IP NOT suspect (small counter) → learn as before, no reset.
+        let mut w = HashMap::from([("ip".to_string(), win(1000, None))]);
+        let l = leases(&[("ip", "bb")]);
+        let (time, mac, inherited) =
+            prep_inherit(&mut w, &set(&["ip"]), Some(&l), &HashSet::new(), 1500, 10800);
+        assert!(time.is_empty() && mac.is_empty() && inherited.is_empty());
+        assert_eq!(w["ip"], win(1000, Some("bb"))); // learned, no reset
+    }
+
+    #[test]
+    fn leases_none_never_forms_inheritance_reset() {
+        // Safety invariant: a leases-read failure (leases=None) must NEVER trigger an
+        // inheritance reset, even for a suspect IP — the threshold is consulted only under
+        // the Some(new) learn arm. Guards against a refactor moving the check out of it.
+        let mut w = HashMap::from([("ip".to_string(), win(1000, None))]);
+        let suspect: HashSet<String> = ["ip".to_string()].into_iter().collect();
+        let (time, mac, inherited) =
+            prep_inherit(&mut w, &set(&["ip"]), None, &suspect, 1500, 10800);
+        assert!(mac.is_empty() && inherited.is_empty());
+        // window not time-expired (1500 - 1000 < period) → nothing, mac untouched.
+        assert!(time.is_empty());
+        assert_eq!(w["ip"], win(1000, None));
+    }
+
+    #[test]
+    fn suspect_with_known_same_mac_is_not_inheritance_reset() {
+        // Anti-bypass: a heavy user (counter > threshold) whose owner is already KNOWN and
+        // matches the lease must NOT be inheritance-reset (that's for None-owner only). This
+        // guards the `(None, ...)` precondition against a future refactor silently dropping it.
+        let mut w = HashMap::from([("ip".to_string(), win(1000, Some("aa")))]);
+        let l = leases(&[("ip", "aa")]);
+        let suspect: HashSet<String> = ["ip".to_string()].into_iter().collect();
+        let (time, mac, inherited) =
+            prep_inherit(&mut w, &set(&["ip"]), Some(&l), &suspect, 1500, 10800);
+        assert!(time.is_empty() && mac.is_empty() && inherited.is_empty());
+        assert_eq!(w["ip"], win(1000, Some("aa"))); // untouched
+    }
+
+    #[test]
+    fn new_member_with_large_counter_is_inheritance_reset() {
+        // A brand-new member (empty windows) that appears with a lease AND an already-large
+        // (inherited) counter must be reset, NOT silently adopted (the .193 seed-path bug).
+        let mut w = HashMap::new();
+        let l = leases(&[("ip", "bb")]);
+        let suspect: HashSet<String> = ["ip".to_string()].into_iter().collect();
+        let (time, mac, inherited) =
+            prep_inherit(&mut w, &set(&["ip"]), Some(&l), &suspect, 1500, 10800);
+        assert!(time.is_empty() && mac.is_empty());
+        assert_eq!(
+            inherited,
+            vec![InheritReset {
+                ip: "ip".to_string(),
+                new: "bb".to_string()
+            }]
+        );
+        assert_eq!(w["ip"].mac, None); // seeded None; owner adopted only in phase 3
+        // Phase 3 (after a successful del) adopts the new owner + re-anchors the window.
+        advance_mac(&mut w, &[("ip".to_string(), "bb".to_string())], 1500);
+        assert_eq!(w["ip"], win(1500, Some("bb")));
+    }
+
+    #[test]
+    fn new_member_suspect_without_lease_seeds_none_no_reset() {
+        // Guard: the inheritance check is gated on a present lease also in the seed path —
+        // a suspect new member with NO lease is seeded None, never inheritance-reset.
+        let mut w = HashMap::new();
+        let suspect: HashSet<String> = ["ip".to_string()].into_iter().collect();
+        let (time, mac, inherited) =
+            prep_inherit(&mut w, &set(&["ip"]), None, &suspect, 1500, 10800);
+        assert!(time.is_empty() && mac.is_empty() && inherited.is_empty());
+        assert_eq!(w["ip"].mac, None); // seeded None (no lease), not reset
     }
 }

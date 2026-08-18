@@ -226,6 +226,18 @@ groups:
         annotations:
           summary: "Всплеск mac-change сбросов shaper: {{ $value | humanize }}/с (битые lease-файлы? churn?)"
 
+      # None-learn inheritance resets (0.1.39): reset on adopting an owner for an IP whose
+      # counter is already > quota/4 (previous owner never known). Baseline ~0. A sustained
+      # spike means either a real inheritance storm or a mass false-reset after a bare
+      # restart with correlated owner-file + leases IO failure. Separate counter from
+      # mac-change, so it needs its own spike alert. Un-throttle direction → warning.
+      - alert: RatzekShaperQuotaInheritanceResetSpike
+        expr: rate(ratzek_shaper_quota_inheritance_resets_total[10m]) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Всплеск inheritance-сбросов shaper: {{ $value | humanize }}/с (масс-наследование? двойной IO-отказ после рестарта?)"
+
       # The opposite failure: a chronically unreadable leases file silently disables the
       # MAC-change trigger (mac resets fall to ~0 → invisible to the spike alert above).
       - alert: RatzekShaperQuotaLeasesUnreadable
