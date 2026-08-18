@@ -30,8 +30,8 @@
 //!    the store would otherwise silently learn the new tenant onto the inherited counter.
 //!    Instead, if that counter already exceeds `quota_bytes / INHERIT_THRESHOLD_DIVISOR`
 //!    (a just-learned owner can't have earned it — see [`is_inherit_suspect`]), it is
-//!    reset. This is consulted ONLY under the `Some(new)` learn arm, so a leases-read
-//!    failure can never trigger it.
+//!    reset. This is gated on a present lease (`Some(new)`) — both in the new-member seed
+//!    and the `(None, Some)` learn arm — so a leases-read failure can never trigger it.
 //!
 //! **Design notes.**
 //! - **`window_start` in-memory; owning-MAC durable.** The per-IP `window_start` lives
@@ -155,8 +155,8 @@ fn is_inherit_suspect(bytes: Option<usize>, threshold: u64) -> bool {
 /// skipped (only the time-window path runs). `over_quota_ips` is used only to emit a
 /// "why NOT reset" debug line for a same-MAC over-quota client. `inherit_reset_ips` are
 /// members whose counter is inheritance-suspect (see [`is_inherit_suspect`]) — consulted
-/// ONLY under the `Some(new)` learn arm, so a leases-read failure can never trigger an
-/// inheritance reset.
+/// only where a lease is present (`Some(new)`): both the new-member seed and the `(None,
+/// Some)` learn arm, so a leases-read failure can never trigger an inheritance reset.
 // 8 params: all are genuinely-needed pure inputs (this is the unit-tested seam); grouping
 // them buys nothing. The two IP sets drive distinct branches (forensic debug / inherit-reset).
 #[allow(clippy::too_many_arguments)]
@@ -177,12 +177,25 @@ fn plan_and_prepare(
     for &ip in members {
         let lease_mac: Option<&str> = leases.and_then(|m| m.get(ip)).map(String::as_str);
         let Some(w) = windows.get_mut(ip) else {
-            // New member: seed with the lease MAC if known (else None → learn later).
+            // New member. A brand-new member already carrying an inheritance-suspect counter
+            // (with a lease) must have inherited it → reset, like the `(None, Some(new))` arm
+            // below (owner adopted in phase 3 after a successful del; `mac = None` until then).
+            // Otherwise seed with the lease MAC if known (else None → learn later).
+            let seed_mac = match lease_mac {
+                Some(new) if inherit_reset_ips.contains(ip) => {
+                    inherited.push(InheritReset {
+                        ip: ip.to_string(),
+                        new: new.to_string(),
+                    });
+                    None
+                }
+                other => other.map(str::to_string),
+            };
             windows.insert(
                 ip.to_string(),
                 Window {
                     window_start: seed(),
-                    mac: lease_mac.map(str::to_string),
+                    mac: seed_mac,
                 },
             );
             continue;
@@ -1336,5 +1349,40 @@ mod tests {
             prep_inherit(&mut w, &set(&["ip"]), Some(&l), &suspect, 1500, 10800);
         assert!(time.is_empty() && mac.is_empty() && inherited.is_empty());
         assert_eq!(w["ip"], win(1000, Some("aa"))); // untouched
+    }
+
+    #[test]
+    fn new_member_with_large_counter_is_inheritance_reset() {
+        // A brand-new member (empty windows) that appears with a lease AND an already-large
+        // (inherited) counter must be reset, NOT silently adopted (the .193 seed-path bug).
+        let mut w = HashMap::new();
+        let l = leases(&[("ip", "bb")]);
+        let suspect: HashSet<String> = ["ip".to_string()].into_iter().collect();
+        let (time, mac, inherited) =
+            prep_inherit(&mut w, &set(&["ip"]), Some(&l), &suspect, 1500, 10800);
+        assert!(time.is_empty() && mac.is_empty());
+        assert_eq!(
+            inherited,
+            vec![InheritReset {
+                ip: "ip".to_string(),
+                new: "bb".to_string()
+            }]
+        );
+        assert_eq!(w["ip"].mac, None); // seeded None; owner adopted only in phase 3
+        // Phase 3 (after a successful del) adopts the new owner + re-anchors the window.
+        advance_mac(&mut w, &[("ip".to_string(), "bb".to_string())], 1500);
+        assert_eq!(w["ip"], win(1500, Some("bb")));
+    }
+
+    #[test]
+    fn new_member_suspect_without_lease_seeds_none_no_reset() {
+        // Guard: the inheritance check is gated on a present lease also in the seed path —
+        // a suspect new member with NO lease is seeded None, never inheritance-reset.
+        let mut w = HashMap::new();
+        let suspect: HashSet<String> = ["ip".to_string()].into_iter().collect();
+        let (time, mac, inherited) =
+            prep_inherit(&mut w, &set(&["ip"]), None, &suspect, 1500, 10800);
+        assert!(time.is_empty() && mac.is_empty() && inherited.is_empty());
+        assert_eq!(w["ip"].mac, None); // seeded None (no lease), not reset
     }
 }
