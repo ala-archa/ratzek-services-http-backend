@@ -1,0 +1,28 @@
+# Canonical copy of /etc/udev/rules.d/99-ratzek-ssd.rules on ratzek (the Pi).
+# Deployed BY HAND: scp here -> /etc/udev/rules.d/, then `udevadm control --reload &&
+# udevadm trigger --subsystem-match=scsi --action=change`.
+#
+# Root lives on a HIKVISION ESSD-T200N behind a VIA Labs VL716 bridge (usb 2109:0716) driven by
+# uas. That bridge wedges: userspace stopped writing on 2026-06-30 and again on 2026-08-30 (45h),
+# while the kernel kept forwarding packets.
+#
+# Bound how long the SCSI error handler waits on a command before giving up, instead of the 30s
+# default. When the bridge stops answering it is the recovery path itself that hangs, and every
+# second here is a second the whole rootfs is frozen.
+# Rollback: echo 30 > /sys/block/sda/device/timeout
+ACTION=="add|change", SUBSYSTEM=="scsi", KERNEL=="0:0:0:0", ATTR{timeout}="15"
+
+# NOT SET, and this is a finding rather than an omission — both were tried on the live host and
+# rejected by the kernel:
+#
+#   ATTR{queue_depth}="1"     -> /sys/block/sda/device/queue_depth is mode 0444 under uas; udev
+#                                logs "Failed to write ATTR{...}/queue_depth: Permission denied".
+#                                The uas driver fixes the depth; it is not tunable at runtime.
+#   ATTR{eh_deadline}="20"    -> write to /sys/class/scsi_host/host0/eh_deadline is refused for
+#                                this transport as well.
+#
+# Consequence for the recovery plan: there is NO reversible way to disable UAS command queueing on
+# this host. The only lever that turns it off is usb-storage.quirks=2109:0716:u in cmdline.txt,
+# which drops the device to bulk-only transport — a boot-path edit on a site with no physical
+# access and no remote power cycle. Any plan that treats "try queue_depth=1 first" as the cheap
+# alternative to that edit is working from an assumption this hardware does not support.
