@@ -18,18 +18,33 @@
 # state and documents the same reasoning.
 set -eu
 
+# cron runs with PATH=/usr/bin:/bin, and ipset lives in /usr/sbin. Without this the script dies
+# with 127 "ipset: not found" on every tick — and because the crontab entry redirects to
+# /dev/null, it dies silently, leaving ipset persistence entirely broken while looking healthy.
+# (Observed exactly that on the first deploy.) The stock plugin sets PATH for the same reason.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
 DEST=/etc/iptables/ipsets
 TMP="$DEST.tmp.$$"
 
 trap 'rm -f "$TMP"' EXIT
 
-ipset save > "$TMP"
+# Failures go to syslog, not just stderr: cron discards stderr here, and a persistence job that
+# fails quietly is worse than no job at all.
+fail() {
+    logger -t ipset-save-atomic -p daemon.err "$1"
+    echo "ipset-save-atomic: $1" >&2
+    exit 1
+}
+
+ipset save > "$TMP" || fail "ipset save failed, keeping previous $DEST"
 
 # A truncated save is worse than a stale one, so refuse to publish anything that does not look like
 # a complete dump. `create` is the first thing ipset emits for every set; no `create` line means we
 # caught a partial write or an ipset error that `set -e` did not surface.
-[ -s "$TMP" ] || { echo "ipset-save-atomic: empty dump, keeping previous $DEST" >&2; exit 1; }
-grep -q '^create ' "$TMP" || { echo "ipset-save-atomic: no create lines, keeping previous $DEST" >&2; exit 1; }
+[ -s "$TMP" ] || fail "empty dump, keeping previous $DEST"
+grep -q '^create ' "$TMP" || fail "no create lines, keeping previous $DEST"
 
 chmod 0640 "$TMP"
 
