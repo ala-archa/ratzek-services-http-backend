@@ -135,7 +135,10 @@ blacklist_path: /var/lib/ala-archa-http-backend/blacklist.yaml
 telegram:
   bot_token: "123456:ABC-asdasdasdasd"
   retry_crontab: "30 */5 * * * *"
-  message_timeout: 24h
+  # Queued alerts older than this are dropped instead of sent. 72h, not 24h: the site has gone
+  # dark for 45h at a stretch (2026-08-30), and a 24h bound silently discarded exactly the
+  # backlog describing that outage.
+  message_timeout: 72h
 
 # alerting: optional Alertmanager→Telegram sink. Alertmanager (on this host) POSTs its
 # webhook to POST /alertmanager/webhook; the handler checks the Bearer token, formats the

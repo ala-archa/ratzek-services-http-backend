@@ -10,6 +10,22 @@ pub struct Telegram {
     pub retry_crontab: String,
 }
 
+/// Whether a queued message stamped at `stamped_at` is older than `timeout`.
+///
+/// A timestamp in the *future* is never expiry. The host has no RTC: after a hard reset
+/// fake-hwclock restores the time saved at the last hourly tick, so `now` can be up to an hour
+/// behind messages queued just before the reset. Converting that negative age with
+/// `Duration::to_std().unwrap()` used to panic, and `process_queue` clears and persists the queue
+/// before iterating it — so the panic destroyed every pending alert, precisely the ones describing
+/// the outage that caused the reset.
+fn is_expired(
+    now: chrono::DateTime<chrono::Local>,
+    stamped_at: chrono::DateTime<chrono::Local>,
+    timeout: std::time::Duration,
+) -> bool {
+    (now - stamped_at).to_std().is_ok_and(|age| age > timeout)
+}
+
 impl Telegram {
     async fn try_send_message(&self, chat_id: &str, text: &str) -> Result<()> {
         slog_scope::info!("Sending message to telegram chat {}: {}", chat_id, text);
@@ -89,7 +105,7 @@ impl Telegram {
         let mut new_queue = Vec::new();
         while let Some(message) = queue.pop() {
             info!("Processing message: {}", message.text);
-            if (chrono::Local::now() - message.timestamp).to_std().unwrap() > self.message_timeout {
+            if is_expired(chrono::Local::now(), message.timestamp, self.message_timeout) {
                 info!("Dropping message due to timeout: {}", message.text);
                 continue;
             }
@@ -110,5 +126,50 @@ impl Telegram {
             })
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Local> {
+        use chrono::TimeZone;
+        let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+            .expect("valid timestamp");
+        chrono::Local
+            .from_local_datetime(&naive)
+            .single()
+            .expect("unambiguous local time")
+    }
+
+    #[test]
+    fn older_than_timeout_expires() {
+        assert!(is_expired(
+            at("2026-08-30 13:00:00"),
+            at("2026-08-29 12:00:00"),
+            TIMEOUT
+        ));
+    }
+
+    #[test]
+    fn within_timeout_is_kept() {
+        assert!(!is_expired(
+            at("2026-08-30 12:00:00"),
+            at("2026-08-30 11:00:00"),
+            TIMEOUT
+        ));
+    }
+
+    #[test]
+    fn timestamp_from_the_future_is_kept_not_panicking() {
+        // fake-hwclock rolled the clock back an hour after a hard reset.
+        assert!(!is_expired(
+            at("2026-08-30 12:00:00"),
+            at("2026-08-30 13:00:00"),
+            TIMEOUT
+        ));
     }
 }
