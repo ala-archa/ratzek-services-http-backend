@@ -3,7 +3,7 @@
 # manual first rotation and verification.
 #
 # `create` is mandatory: dnsmasq reopens the log on SIGUSR2 after dropping root, so it
-# cannot create the new file in /var/log itself. `--kill-whom=main` signals dnsmasq only,
+# cannot create the new file in /var/log itself. `--kill-who=main` signals dnsmasq only,
 # not other processes of the unit. A failed signal is logged instead of hidden: otherwise
 # dnsmasq keeps writing to the rotated file, which is later compressed and deleted.
 /var/log/ratzek-dnsmasq.log {
@@ -15,7 +15,7 @@
     notifempty
     create 0640 nobody root
     postrotate
-        systemctl kill --kill-whom=main -s USR2 dnsmasq-ratzek.service \
+        systemctl kill --kill-who=main -s USR2 dnsmasq-ratzek.service \
           || logger -t logrotate -p daemon.err "ratzek-dnsmasq: USR2 failed, dnsmasq still writes the rotated file"
     endscript
 }

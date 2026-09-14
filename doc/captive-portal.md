@@ -148,7 +148,7 @@ iptables -I FORWARD <поз-перед-DROP> -s 10.11.5.0/24 -p tcp -m tcp --dpo
 df -h /var/log
 mv /var/log/ratzek-dnsmasq.log /var/log/ratzek-dnsmasq.log.1
 install -m0640 -o nobody -g root /dev/null /var/log/ratzek-dnsmasq.log
-systemctl kill --kill-whom=main -s USR2 dnsmasq-ratzek.service
+systemctl kill --kill-who=main -s USR2 dnsmasq-ratzek.service
 # дождаться DHCP-события и убедиться, что новый файл растёт
 nice -n19 ionice -c3 gzip /var/log/ratzek-dnsmasq.log.1
 ```
@@ -156,7 +156,7 @@ nice -n19 ionice -c3 gzip /var/log/ratzek-dnsmasq.log.1
 
 - `create 0640 nobody root` обязателен: dnsmasq переоткрывает лог по SIGUSR2 уже без root и сам создать
   файл в `/var/log` не может.
-- `--kill-whom=main` — сигнал только самому dnsmasq; сбой пишется в syslog (`journalctl -t logrotate`).
+- `--kill-who=main` — сигнал только самому dnsmasq; сбой пишется в syslog (`journalctl -t logrotate`).
 - Проверка, что dnsmasq не пишет в удалённый файл:
   `ls -l /proc/$(systemctl show -p MainPID --value dnsmasq-ratzek)/fd | grep ratzek-dnsmasq` — без `(deleted)`.
 - Окно гонки: если ротация совпадёт с reload резерваций, `dhcp_hosts::scrape_reload_log` прочитает
