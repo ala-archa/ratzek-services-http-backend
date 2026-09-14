@@ -139,6 +139,23 @@
         { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "mikrotik_lte_interface_sinr", "legendFormat": "SINR", "refId": "C" },
         { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "mikrotik_lte_interface_cqi", "legendFormat": "CQI", "refId": "D" }
       ]
+    },
+    { "type": "row", "id": 103, "title": "Портал: определение MAC клиента", "collapsed": false, "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 }, "panels": [] },
+    {
+      "type": "timeseries", "id": 11, "title": "Результаты определения MAC (в минуту)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 44 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never", "stacking": { "mode": "normal", "group": "A" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (result) (rate(ratzek_client_mac_lookup_total[5m])) * 60", "legendFormat": "{{result}}", "refId": "A" } ]
+    },
+    {
+      "type": "timeseries", "id": 12, "title": "Сбои чтения источников MAC (за 1ч)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 44 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 40, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "increase(ratzek_client_mac_lookup_errors_total[1h])", "legendFormat": "{{stage}}", "refId": "A" } ]
     }
   ]
 }
