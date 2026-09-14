@@ -6,6 +6,7 @@ use slog_scope::error;
 
 mod alertmanager;
 mod blacklist;
+mod client_mac;
 mod config;
 mod device_metrics;
 mod dhcp;

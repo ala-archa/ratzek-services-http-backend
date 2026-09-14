@@ -65,6 +65,104 @@ iptables -I FORWARD <поз-перед-DROP> -s 10.11.5.0/24 -p tcp -m tcp --dpo
 - dnsmasq: восстановить конфиг из бэкапа → `dnsmasq --test` → restart.
 - backend: редеплой предыдущего бинаря из `/usr/bin/ratzek-services-http-backend.bak-*`.
 
+## Определение MAC клиента (0.1.42)
+
+### Проблема
+`GET/POST /api/v1/client` искал MAC клиента только в лизах dnsmasq и при промахе отдавал **500**
+(пользователи называли это «505»). За 14 дней — 39× 500, все из `DHCP lease not found`:
+- **Устаревший IP до DHCP.** Телефон возвращается с закэшированным (истёкшим) IP, особенно после
+  перезагрузки хоста, и открывает портал раньше, чем делает DHCP. В 5 из 7 эпизодов DHCP был через
+  6–34 с, в 2 из 7 — через 27 мин и через 16 ч.
+- **Гонка с файлом лизов.** dnsmasq переписывает файл на месте (`rewind` + `ftruncate`), и чтение
+  может увидеть пустой или обрезанный файл.
+- **VPN (`10.8.0.1`).** Лиза нет никогда.
+
+### Как теперь (`src/client_mac.rs`)
+1. **ARP-таблица ядра (`/proc/net/arp`) — первой.** Запрос пришёл по установленному TCP от L2-соседа,
+   значит Pi уже разрезолвил MAC отправителя. Берутся только записи с флагом `ATF_COM` (`0x2`):
+   FAILED-записи хранят **старый** MAC с `0x0`.
+2. **Активный лиз** (`dhcp::active_ip_to_mac`) — фолбэк и сверка.
+3. **Повтор чтения лизов через 50 мс** — только если ARP и лиз пусты И чтение лизов похоже на гонку
+   (ошибка или ноль активных лизов). Иначе без задержки.
+4. Никто не знает клиента → **503 + `Retry-After: 5`** (фронтенд показывает «Подключаем вас к сети…»,
+   через ~1 мин — «Не удаётся определить устройство»).
+
+| ARP | лиз | MAC | `result` |
+|---|---|---|---|
+| есть | тот же | ARP | `agree` |
+| есть | другой | **ARP** | `mismatch` |
+| есть | нет | ARP | `arp_only` |
+| нет | есть | лиз | `lease_only` |
+| — | найден при повторе | лиз | `lease_retry` |
+| нет | нет | — | `not_found` → 503 |
+
+Парсер лизов (`dhcp::parse_dnsmasq`) дополнительно отбрасывает незавершённую последнюю строку, строки
+короче 5 полей и не-IPv4, чтобы обрезанный файл не давал ложное попадание с чужим MAC.
+
+Заблокированный клиент при регистрации теперь получает **403** (было 500).
+
+### Метрики
+- `ratzek_client_mac_lookup_total{result="agree|arp_only|mismatch|lease_only|lease_retry|whitelist|not_found"}`
+- `ratzek_client_mac_lookup_errors_total{stage="leases|arp|join"}` — сбои чтения источников.
+
+Логи: `client-mac: ip=… result=… arp_mac=… lease_mac=…` на warn — при смене результата для IP или не
+чаще раза в 10 минут, иначе debug. Алерта пока нет; панель — `doc/grafana/network-health.json`.
+
+### Принятые ограничения
+- **Регистрация без лиза.** Клиент, известный только по ARP (в том числе устройство со статическим IP
+  вне DHCP), может зарегистрироваться. Доступ и так выдаётся по IP, блэклист остаётся «мягким»
+  (по MAC). Это осознанное расширение модели угроз.
+- **Блэклист судит по MAC из ARP**, если он расходится с лизом.
+- **VPN/L3-клиенты** (нет ARP-записи, нет лиза) получают 503.
+- Пока у клиента нет лиза, shaper-quota и device-metrics его MAC не видят (см. `doc/shaper-quota.md`).
+
+### Деплой
+0. Baseline: `zcat -f /var/log/nginx/access.log* | awk '$7 ~ "^/api/v1/client" {print $9}' | sort | uniq -c`.
+1. `scripts/deploy.sh` (0.1.42) → бэкап `/usr/bin/ratzek-services-http-backend.bak-<ts>`.
+2. Фронтенд: `make dry-run` → `make deploy` (в `ratzek-services-frontend`). Совместим со старым
+   бэкендом; старый фронтенд обрабатывает 503 как 500 (`connection_error`).
+
+### Verification
+- `curl -s 127.0.0.1:8888/metrics | grep client_mac_lookup` — счётчики есть, `agree` растёт.
+- ARP-only: взять IP с флагом `0x2` из `/proc/net/arp`, которого нет в `dnsmasq.leases`;
+  `curl -si -H 'X-Real-IP: <ip>' http://127.0.0.1:8888/api/v1/client` → 200 (`Inactive`/`Connected`),
+  в журнале `result=arp_only`. **Только GET** — не регистрировать чужое устройство.
+- Через nginx: `curl -si -H 'Host: www.ratzek' http://127.0.0.1/api/v1/client` (X-Real-IP 127.0.0.1,
+  ARP-записи нет) → **503 + `Retry-After: 5`**.
+- После ближайшей перезагрузки: warn `arp_only`/`mismatch` для вернувшихся телефонов, 500 на
+  `/api/v1/client` нет.
+- 7 дней против baseline: 500 → 0; доля 503 и `not_found` ≈ только VPN; `errors_total` → 0.
+
+### Rollback
+- backend: `install -m0755 /usr/bin/ratzek-services-http-backend.bak-<ts> /usr/bin/ratzek-services-http-backend && systemctl restart ratzek-services-http-backend`.
+- frontend: `git revert` + `make deploy`.
+
+## Ротация лога dnsmasq (host, 0.1.42)
+
+`/var/log/ratzek-dnsmasq.log` не ротировался со 2 июля (2,1 ГБ). Конфиг — `doc/logrotate-ratzek-dnsmasq`
+→ `/etc/logrotate.d/ratzek-dnsmasq`.
+
+**Первая ротация — вручную, в тихое время** (с `delaycompress` принудительный `logrotate -f` только
+переименует файл, а gzip 2,1 ГБ уйдёт на неконтролируемый ночной запуск):
+```
+df -h /var/log
+mv /var/log/ratzek-dnsmasq.log /var/log/ratzek-dnsmasq.log.1
+install -m0640 -o nobody -g root /dev/null /var/log/ratzek-dnsmasq.log
+systemctl kill --kill-whom=main -s USR2 dnsmasq-ratzek.service
+# дождаться DHCP-события и убедиться, что новый файл растёт
+nice -n19 ionice -c3 gzip /var/log/ratzek-dnsmasq.log.1
+```
+Затем установить конфиг и проверить `logrotate -d /etc/logrotate.d/ratzek-dnsmasq`.
+
+- `create 0640 nobody root` обязателен: dnsmasq переоткрывает лог по SIGUSR2 уже без root и сам создать
+  файл в `/var/log` не может.
+- `--kill-whom=main` — сигнал только самому dnsmasq; сбой пишется в syslog (`journalctl -t logrotate`).
+- Проверка, что dnsmasq не пишет в удалённый файл:
+  `ls -l /proc/$(systemctl show -p MainPID --value dnsmasq-ratzek)/fd | grep ratzek-dnsmasq` — без `(deleted)`.
+- Окно гонки: если ротация совпадёт с reload резерваций, `dhcp_hosts::scrape_reload_log` прочитает
+  пустой хвост и не заметит отклонённую резервацию (fail-open). Редко, принято.
+- Rollback: `rm /etc/logrotate.d/ratzek-dnsmasq`.
+
 ## Границы / дальше
 - Порт-80 DNAT + nginx:81 `302` не тронуты (фолбэк для HTTP-проб).
 - Фундаментальный предел: клиент только-HTTPS + без option 114 + без OS-пробы — не заставить.

@@ -124,38 +124,30 @@ where
 
     info!("Request from {}: {}", client_ip, req.uri());
 
-    let is_no_shape = {
+    let (is_no_shape, leases_path, dhcp_params) = {
         let state = state.lock().await;
         // The unlimited-clients store is the single source of truth (legacy
         // config.no_shaping_ips is no longer consulted; migrated into the store).
-        state.unlimited_clients().contains_ip(&client_ip).await
+        (
+            state.unlimited_clients().contains_ip(&client_ip).await,
+            state.config().dhcpd_leases.clone(),
+            state.dhcp_params(),
+        )
     };
     if is_no_shape {
         info!("Client is in no_shape list");
+        crate::client_mac::record(crate::client_mac::LookupResult::Whitelist);
         return cb(client_ip, Client::Whitelist).await;
     }
 
-    let dhcp_lease = {
-        let state = state.lock().await;
-        match crate::dhcp::Dhcp::of_ip(
-            &state.config().dhcpd_leases,
-            state.dhcp_params(),
-            &client_ip,
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                error!("{}", err);
-                return Err(APIError::InternalError);
-            }
-        }
-    };
-
-    let client_mac = match dhcp_lease.mac {
-        Some(v) => v.to_lowercase(),
-        None => {
-            error!("Client's MAC not defined in DHCP leases file");
-            return Err(APIError::InternalError);
-        }
+    // Resolved without the state lock: ARP table first, dnsmasq lease as fallback.
+    // A client we can't identify yet (e.g. before DHCP) gets 503, not 500.
+    let client_mac = match crate::client_mac::resolve(leases_path, dhcp_params, client_ip.clone())
+        .await
+        .mac
+    {
+        Some(v) => v,
+        None => return Err(APIError::ServiceUnavailable),
     };
 
     slog_scope::scope(
@@ -270,8 +262,8 @@ async fn client_register(
                 }
                 Client::Mac(mac) => {
                     if state.is_blacklisted(&mac).await {
-                        error!("Blacklisted client attempted to register");
-                        return Err(APIError::InternalError);
+                        warn!("Blacklisted client attempted to register");
+                        return Err(APIError::Forbidden);
                     }
                     // Inherited-counter reset on IP hand-over is done by the shaper-quota
                     // job (MAC-change trigger in src/shaper_quota.rs), not here — doing it
@@ -554,6 +546,24 @@ fn counter(name: &str, help: &str, value: f64) -> String {
         .render()
 }
 
+/// Counter with one instance per `(label value, count)` pair under a single label name.
+fn labeled_counter(name: &str, help: &str, label: &str, values: &[(&'static str, u64)]) -> String {
+    use prometheus_exporter_base::prelude::*;
+    let mut metric = PrometheusMetric::build()
+        .with_name(name)
+        .with_metric_type(MetricType::Counter)
+        .with_help(help)
+        .build();
+    for (label_value, count) in values {
+        metric.render_and_append_instance(
+            &PrometheusInstance::new()
+                .with_label(label, *label_value)
+                .with_value(*count as f64),
+        );
+    }
+    metric.render()
+}
+
 // Process-global counters for the Alertmanager webhook (single-process exporter,
 // so plain statics are sufficient). Atomic ordering is aliased to `AtomicOrdering`
 // at the use sites to disambiguate from `std::cmp::Ordering` (imported at the top).
@@ -772,6 +782,20 @@ async fn prometheus_exporter(state: Data<Arc<Mutex<State>>>) -> Result<String, A
         "ratzek_alert_webhook_errors_total",
         "Alertmanager webhook processing errors (bad payload / enqueue failure)",
         ALERT_WEBHOOK_ERRORS.load(AtomicOrdering::Relaxed) as f64,
+    );
+    // Portal client MAC resolution (/api/v1/client). Outcome labels only — no per-IP/MAC
+    // labels (network PII).
+    out += &labeled_counter(
+        "ratzek_client_mac_lookup_total",
+        "Portal client MAC resolutions by outcome (ARP table vs DHCP lease)",
+        "result",
+        &crate::client_mac::lookup_counts(),
+    );
+    out += &labeled_counter(
+        "ratzek_client_mac_lookup_errors_total",
+        "Portal client MAC lookup source read failures by stage",
+        "stage",
+        &crate::client_mac::error_counts(),
     );
     let queue_len = state.lock().await.persistent_state().await.telegram_queue.len();
     out += &gauge(
