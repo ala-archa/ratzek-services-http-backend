@@ -128,7 +128,11 @@ pub(crate) fn active_ip_to_mac(
 fn parse_dnsmasq(s: &str, lease_secs: i64, now: i64) -> Vec<Lease> {
     let mut out = Vec::new();
     let mut malformed = 0usize;
-    for line in s.lines() {
+    // A read racing dnsmasq's in-place rewrite (rewind + ftruncate + rewrite) can end
+    // mid-line. dnsmasq always terminates lines, so an unterminated tail is dropped
+    // rather than parsed into a lease with a truncated IP (`10.11.5.213` -> `10.11.5.21`).
+    let complete = s.rfind('\n').map_or("", |end| &s[..=end]);
+    for line in complete.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
         // `duid <hex>` header and blank lines are legitimate, not corruption.
         if f.is_empty() || f[0] == "duid" {
@@ -143,6 +147,12 @@ fn parse_dnsmasq(s: &str, lease_secs: i64, now: i64) -> Vec<Lease> {
                 continue;
             }
         };
+        // `<expiry> <mac> <ip> <hostname> <clientid>`: a shorter line or a non-IPv4
+        // address is a damaged record, not a lease.
+        if f.len() < 5 || ip.parse::<std::net::Ipv4Addr>().is_err() {
+            malformed += 1;
+            continue;
+        }
         let expiry: i64 = match f[0].parse() {
             Ok(v) => v,
             Err(_) => {
@@ -229,13 +239,30 @@ notanumber aa:bb:cc:dd:ee:09 10.11.5.70 name *
     }
 
     #[test]
+    fn dnsmasq_parse_drops_truncated_and_damaged_records() {
+        let s = "\
+1000043200 aa:bb:cc:dd:ee:01 10.11.5.60 laptop *
+1000043200 aa:bb:cc:dd:ee:02 10.11.5.61 short
+1000043200 aa:bb:cc:dd:ee:03 10.11.5.999 bad *
+1000043200 aa:bb:cc:dd:ee:04 10.11.5.21";
+        let v = parse_dnsmasq(s, 43_200, 1_000_000_000);
+        assert_eq!(
+            v.len(),
+            1,
+            "4-field, invalid IPv4 and unterminated tail dropped"
+        );
+        assert_eq!(v[0].ip, "10.11.5.60");
+        assert!(parse_dnsmasq("1000043200 aa:bb:cc:dd:ee:01 10.11.5.60 x *", 43_200, 1).is_empty());
+    }
+
+    #[test]
     fn leases_of_ip_hit_and_miss() {
-        let v = parse_dnsmasq("1000043200 aa:bb:cc:dd:ee:01 10.11.5.60 x *", 43_200, 1);
+        let v = parse_dnsmasq("1000043200 aa:bb:cc:dd:ee:01 10.11.5.60 x *\n", 43_200, 1);
         let leases = Leases(v);
         // consuming of_ip: build twice to test hit then miss.
         assert!(leases.of_ip("10.11.5.60").is_some());
         let leases2 = Leases(parse_dnsmasq(
-            "1000043200 aa:bb:cc:dd:ee:01 10.11.5.60 x *",
+            "1000043200 aa:bb:cc:dd:ee:01 10.11.5.60 x *\n",
             43_200,
             1,
         ));
