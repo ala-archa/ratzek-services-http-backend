@@ -5,8 +5,11 @@ Deployed by hand to /usr/local/bin/disk-canary.py, run by disk-canary.service
 (see doc/disk-canary.service). This file in ratzek-services-http-backend/doc/ is
 the source of truth; the Ansible roles for this host are stale.
 
-Why it exists: the USB-SSD (VIA Labs 2109:0716 on the `uas` driver) stalls
-spontaneously. In that state the kernel keeps forwarding traffic and PID 1 keeps
+Why it exists: the USB-SSD (VIA Labs 2109:0716 bridge) stalled spontaneously
+under the `uas` driver; since 2026-09-16 it runs on plain usb-storage
+(`usb-storage.quirks=2109:0716:u` in /boot/cmdline.txt, doc/boot-cmdline.txt)
+and the canary stays as the safety net in case the bridge wedges anyway. In the
+stalled state the kernel keeps forwarding traffic and PID 1 keeps
 petting the hardware watchdog, so RuntimeWatchdogSec never fires, while every
 process that touches the disk wedges in D-state: journald, Prometheus, the
 backend, dnsmasq, sshd logins. Night of 2026-09-13: 12 hours down until a manual

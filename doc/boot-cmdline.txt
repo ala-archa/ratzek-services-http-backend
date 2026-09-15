@@ -1,0 +1,1 @@
+console=serial0,115200 console=tty1 root=PARTUUID=11ad52e7-02 rootfstype=ext4 fsck.repair=yes rootdelay=30 panic=10 usb-storage.quirks=2109:0716:u

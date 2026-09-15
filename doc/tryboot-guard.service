@@ -1,0 +1,35 @@
+# Guard for a one-shot `reboot '0 tryboot'` trial of a new kernel cmdline on the Pi.
+# Deployed by hand to /etc/systemd/system/tryboot-guard.service (Ansible is stale).
+#
+# The firmware's tryboot flag is cleared before the firmware starts, so a kernel that
+# panics or a watchdog reset already falls back to config.txt on its own. The hole this
+# unit closes: the trial boot *succeeds* but the host is unreachable (no VPN, no route),
+# so nobody can trigger the reboot that would fall back. It arms only when the running
+# cmdline carries the trial marker and /boot/cmdline.txt does not (= we are in a trial),
+# waits long enough for the OpenVPN client to come up (5–8 min after boot on this LTE
+# link) plus time for a human to inspect, then reboots unless the trial was promoted by
+# copying the trial cmdline over /boot/cmdline.txt.
+#
+# Trial procedure (2026-09-16, UAS → usb-storage for the VIA 2109:0716 SSD bridge):
+#   /boot/tryboot.txt        = config.txt + `cmdline=cmdline-quirk.txt`
+#   /boot/cmdline-quirk.txt  = cmdline.txt with `usb-storage.quirks=2109:0716:u`
+#                              and `rootdelay=30 panic=10` instead of `rootwait`
+#                              (a missing root then panics and resets instead of hanging)
+#   reboot '0 tryboot'
+#   ... ssh back, check /proc/cmdline and /sys/block/sda/device/../../driver ...
+#   promote: cp /boot/cmdline-quirk.txt /boot/cmdline.txt   (before the deadline!)
+# Outcome: done 2026-09-16 00:34, host back on the VPN after 75 s, promoted at 00:36.
+# The live /boot/cmdline.txt is mirrored in doc/boot-cmdline.txt; the pre-trial line is
+# kept on the host as /boot/cmdline.txt.bak-uas-20260916. The unit stays enabled: its
+# ExecCondition keeps it idle until the next trial reuses the same marker.
+[Unit]
+Description=tryboot guard: fall back to config.txt unless the trial cmdline is promoted
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecCondition=/bin/sh -c 'grep -q "usb-storage.quirks=2109:0716:u" /proc/cmdline && ! grep -q "usb-storage.quirks=2109:0716:u" /boot/cmdline.txt'
+ExecStart=/bin/sh -c 'echo "trial cmdline active, reverting in 25 min unless promoted"; sleep 1500; if grep -q "usb-storage.quirks=2109:0716:u" /boot/cmdline.txt; then echo "promoted, nothing to do"; exit 0; fi; echo "not promoted, rebooting into config.txt"; systemctl reboot'
+
+[Install]
+WantedBy=multi-user.target
