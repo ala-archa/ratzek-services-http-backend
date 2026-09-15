@@ -1,0 +1,37 @@
+# Root-SSD write canary — see doc/disk-canary.py for the rationale.
+# Deployed by hand to /etc/systemd/system/disk-canary.service (Ansible is stale).
+#
+# Failure-mode design, read before touching:
+#  * Only a WATCHDOG timeout may trigger FailureAction. The script runs under
+#    `sh -c '...; exit 0'`, so a crash, a syntax error or an OOM kill ends the unit
+#    as inactive (success) and Restart= brings it back after 30 s — never a
+#    reboot loop on a broken script. Type=simple keeps startup from counting as a
+#    protocol failure; WATCHDOG=1 pings are honoured with NotifyAccess=all.
+#  * reboot-immediate is reboot(2) from PID 1: no unit teardown, no unmount,
+#    nothing executed from disk. Equivalent to the hardware-watchdog reset we
+#    already accept, and the only kind of reboot that works with a wedged rootfs.
+#  * TimeoutStopSec/TimeoutAbortSec are short because the process we are aborting
+#    is, by construction, stuck in D-state and cannot die; systemd gives up after
+#    these timeouts and proceeds to the failed state.
+#  * WatchdogSec=90 vs a 10 s write cadence: an fsync that takes more than
+#    ~80 s on an idle SSD is a stall, not load. kernel.hung_task_panic (60 s,
+#    doc/sysctl-90-ratzek-forensics.conf) is the independent second net.
+[Unit]
+Description=root-SSD write canary (hard reboot on a wedged disk)
+After=local-fs.target
+
+[Service]
+Type=simple
+NotifyAccess=all
+ExecStart=/bin/sh -c '/usr/bin/python3 /usr/local/bin/disk-canary.py; exit 0'
+WatchdogSec=90
+FailureAction=reboot-immediate
+Restart=always
+RestartSec=30
+TimeoutStopSec=15
+TimeoutAbortSec=15
+# Never OOM-kill the canary in preference to something else.
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target
