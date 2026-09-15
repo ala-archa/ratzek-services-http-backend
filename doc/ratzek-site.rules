@@ -4,54 +4,13 @@
 groups:
   - name: ratzek-site
     rules:
-      - alert: RatzekBatteryDeepDischarge
-        expr: daly_bms_pack_voltage_volts * daly_bms_current_amperes < -150
-        for: 5m
-        labels: { severity: warning }
-        annotations:
-          summary: "Глубокий разряд АКБ: {{ $value | humanize }} Вт"
-
-      # RatzekSolarNotChargingDaytime УДАЛЁН (2026-07-12): надёжно не реализуется на этом хосте —
-      # глубокий суточный цикл SOC (±30%), сезонность заряда (зимой ~2ч) и дырявая телеметрия
-      # (25 ребутов/7д + отключения) ломают любой порог (окна 6–36ч, нетто-разряд SOC, отсутствие
-      # роста SOC — все дают ложняки). Реальный сигнал «солнце/батарея в беде» = пороги SOC ниже
-      # (Low<35 / Critical<20): за 30д 0 ложных, min SOC 50% — если солнце откажет, SOC поедет вниз
-      # и они сработают.
-
-      - alert: RatzekBatterySOCLow
-        expr: daly_bms_soc_percent < 35
-        for: 15m
-        labels: { severity: warning }
-        annotations:
-          summary: "Заряд АКБ низкий: {{ $value | humanize }}%"
-
-      - alert: RatzekBatterySOCCritical
-        expr: daly_bms_soc_percent < 20
-        for: 5m
-        labels: { severity: critical }
-        annotations:
-          summary: "Заряд АКБ КРИТИЧЕСКИЙ: {{ $value | humanize }}% — скоро полное отключение"
-
-      - alert: RatzekBatteryVoltageLow
-        expr: daly_bms_pack_voltage_volts < 22.5
-        for: 10m
-        labels: { severity: critical }
-        annotations:
-          summary: "Напряжение АКБ {{ $value | humanize }} В — пустая батарея / близко отсечка"
-
-      - alert: RatzekBMSAlarm
-        expr: daly_bms_alarm != 0
-        for: 5m
-        labels: { severity: warning }
-        annotations:
-          summary: "Сработала защита BMS: {{ $labels.type }}"
-
-      - alert: RatzekBMSCommsLost
-        expr: time() - daly_bms_last_frame_timestamp_seconds > 3600
-        for: 5m
-        labels: { severity: warning }
-        annotations:
-          summary: "Нет телеметрии BMS уже {{ $value | humanize }}с — слепы по питанию"
+      # Battery / BMS alerts (RatzekBatteryDeepDischarge, RatzekBatteryVoltageLow, RatzekBMSAlarm,
+      # RatzekBMSCommsLost, RatzekBMSCellImbalance, ...) MOVED 2026-08-12 to the daly-bms-exporter
+      # repo: doc/ratzek-bms.rules there is canonical, deployed to /etc/prometheus/rules/ratzek-bms.rules.
+      # RatzekBatterySOCLow/SOCCritical and RatzekBMSChargingCold were dropped on purpose (BMS SOC is
+      # unreliable; the pack is LTO, not LFP — cold charging is fine). Do not re-add them here:
+      # the same alert name in two files pages twice. (RatzekSolarNotChargingDaytime was removed
+      # even earlier, 2026-07-12: no reliable threshold on this host.)
 
       - alert: RatzekPoEPortDown
         # group_left(comment): poe_current не несёт подпись порта — подтягиваем её из _running
@@ -105,13 +64,6 @@ groups:
         annotations:
           summary: "Температура Pi {{ $value | humanize }}°C — близко к троттлингу"
 
-      - alert: RatzekBMSChargingCold
-        expr: daly_bms_temperature_min_celsius < 1 and on(instance) daly_bms_current_amperes > 1
-        for: 5m
-        labels: { severity: warning }
-        annotations:
-          summary: "Заряд АКБ при {{ $value | humanize }}°C — заряд LFP на морозе повреждает ячейки"
-
       - alert: RatzekACLMassDrop
         expr: delta(ratzek_clients_in_acl[15m]) < -30
         for: 1m
@@ -145,12 +97,17 @@ groups:
         annotations:
           summary: "Камера не обновляет снимок уже {{ $value | humanize }}с (зависла / нет непустых кадров)"
 
-      - alert: RatzekBMSCellImbalance
-        expr: daly_bms_cell_voltage_delta_volts > 0.2
-        for: 30m
+      # RatzekDiskCanaryDead requires the textfile metric ratzek_disk_canary_timestamp_seconds,
+      # produced by doc/disk-canary.py (disk-canary.service, every 10 s). A wedged SSD does not
+      # page here — it hard-reboots the host (FailureAction=reboot-immediate). This alert catches the
+      # canary itself being dead (crash-restart loop, disabled, metric dir gone), i.e. the host
+      # running unprotected. Grouped with the boot gap: 5 min stale + 10 min for = no boot-time noise.
+      - alert: RatzekDiskCanaryDead
+        expr: time() - ratzek_disk_canary_timestamp_seconds > 300 or absent(ratzek_disk_canary_timestamp_seconds)
+        for: 10m
         labels: { severity: warning }
         annotations:
-          summary: "Разбаланс ячеек АКБ: разброс {{ $value | humanize }} В (слабая/деградирующая ячейка)"
+          summary: "disk-canary не пишет heartbeat (сервис мёртв?) — хост без защиты от зависания SSD"
 
       - alert: RatzekMikrotikHighCPU
         expr: mikrotik_system_cpu_load > 90
@@ -270,3 +227,17 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "shaper-quota owner-persist завис: {{ $value | humanize }}с без здорового прохода (SSD wedge?)"
+
+      # --- Tier 3 (added 2026-08-04, public webcam frame on the forecast page) ---
+      # Deployed by hand on 2026-08-04; copied back into this canonical file on 2026-09-16.
+      # The archive can keep growing while the copy the web page reads is stuck
+      # (missing directory, permissions, a failure between the archive write and
+      # the hardlink). RatzekWebcamStale above would stay green through that,
+      # and the public page would show a frozen frame indefinitely.
+      # Metrics come from webcam-freshness-metric.sh (same cron */5).
+      - alert: RatzekWebcamLatestStale
+        expr: time() - ratzek_webcam_latest_mtime_seconds > 1200 or ratzek_webcam_latest_json_ok == 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Публикуемый кадр не обновляется: страница прогноза показывает застывшую картинку"
